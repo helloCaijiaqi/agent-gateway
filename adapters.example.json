@@ -1,0 +1,20 @@
+{
+  "//": "复制到 state/gateway/adapters.json 后按需改。secretFile 相对 state/gateway/ 解析；两个适配器密钥必须不同。capabilities 必须与适配器真正实现的动作一致（qq：send_text/reply/mark_read；wx：send_text/reply/send_media/send_file），由 scripts/test-adapter-conformance.mjs 比对，多声明等于让模型以为能戳一戳。",
+  "adapters": [
+    {
+      "id": "qq-main",
+      "platform": "qq",
+      "secretFile": "qq-main.secret",
+      "callbackBase": "http://127.0.0.1:3100",
+      "capabilities": ["send_text", "reply", "mark_read"]
+    },
+    {
+      "id": "wx-main",
+      "platform": "wx",
+      "enabled": false,
+      "secretFile": "wx-main.secret",
+      "callbackBase": "http://127.0.0.1:7192",
+      "capabilities": ["send_text", "reply", "send_media", "send_file"]
+    }
+  ]
+}

@@ -1,0 +1,409 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-bs-theme="dark">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>agent-gateway 控制台</title>
+<link rel="stylesheet" href="/console/vendor/bootstrap.min.css">
+<link rel="stylesheet" href="/console/style.css">
+<script defer src="/console/vendor/bootstrap.bundle.min.js"></script>
+<script defer src="/console/app.js"></script>
+</head>
+<body>
+<div id="app" class="app-shell d-flex">
+  <aside class="nav sidebar flex-shrink-0 d-flex flex-column p-3">
+    <div class="brand d-flex align-items-center gap-2 mb-3">
+      <div class="brand-mark">GW</div>
+      <div class="brand-text d-flex flex-column">
+        <strong>agent-gateway</strong>
+        <span>operator 控制台</span>
+      </div>
+    </div>
+    <nav id="nav-items" class="nav nav-pills flex-column gap-1">
+      <button class="nav-item nav-link text-start" data-view="services">服务注册</button>
+      <button class="nav-item nav-link text-start" data-view="pipelines">通路编排</button>
+      <button class="nav-item nav-link text-start" data-view="ledger">注册台账</button>
+      <button class="nav-item nav-link text-start" data-view="presets">预设提示词</button>
+      <button class="nav-item nav-link text-start" data-view="sessions">模型与会话</button>
+      <button class="nav-item nav-link text-start" data-view="pending">未决提问</button>
+      <button class="nav-item nav-link text-start" data-view="usage">用量计费</button>
+      <button class="nav-item nav-link text-start" data-view="adapters">消费端总览</button>
+      <button class="nav-item nav-link text-start" id="btn-logout">登出</button>
+    </nav>
+    <div class="nav-foot mt-auto d-flex align-items-center gap-2">
+      <span class="dot" id="session-dot"></span>
+      <span id="session-hint">未登录</span>
+    </div>
+  </aside>
+
+  <main class="main flex-grow-1 p-4">
+    <div class="container-fluid p-0">
+    <!-- ── 登录视图 ─────────────────────────────────────────────────────── -->
+    <section id="view-login" class="view hidden">
+      <div class="card login-card mx-auto">
+        <div class="card-body">
+          <h1 class="h4 mb-1">登录控制台</h1>
+          <p class="muted">输入长期 operator token 换发会话 Cookie（HttpOnly · SameSite=Strict）。</p>
+          <form id="login-form">
+            <div class="mb-3">
+              <label class="form-label" for="login-token">operator token</label>
+              <input class="form-control" id="login-token" type="password" autocomplete="current-password" placeholder="state/operator-token 或 GATEWAY_OPERATOR_TOKEN" required>
+            </div>
+            <button type="submit" class="btn btn-primary w-100">登录</button>
+            <p id="login-error" class="error text-danger mt-2 mb-0 hidden"></p>
+          </form>
+        </div>
+      </div>
+    </section>
+
+    <!-- ── 服务注册视图 ─────────────────────────────────────────────────── -->
+    <section id="view-services" class="view hidden">
+      <div class="row g-4">
+        <div class="col-12 col-xl-6">
+          <div class="card h-100">
+            <div class="card-body">
+              <h2 class="h5 mb-1">注册新服务</h2>
+              <p class="muted">文件即登记：注册写 <code>&lt;hash&gt;.json</code> 进登记目录，卸载即删文件。secret 单次提交、服务端落盘 0600、永不明文回显。</p>
+              <form id="register-form">
+                <div class="row g-3">
+                  <div class="col-md-6">
+                    <label class="form-label" for="reg-name">展示名 name *</label>
+                    <input class="form-control" id="reg-name" maxlength="64" required placeholder="memory-mcp">
+                  </div>
+                  <div class="col-md-6">
+                    <label class="form-label" for="reg-kind">kind *</label>
+                    <select class="form-select" id="reg-kind">
+                      <option value="decorator">decorator（装饰器）</option>
+                      <option value="filter">filter（过滤器）</option>
+                      <option value="shadow">shadow（灰度对账：只记 diff 不生效）</option>
+                      <option value="consumer">consumer（消费端）</option>
+                    </select>
+                  </div>
+                  <div class="col-md-6">
+                    <label class="form-label" for="reg-transport">transport *</label>
+                    <select class="form-select" id="reg-transport">
+                      <option value="ws">ws（长连）</option>
+                      <option value="http">http（回环）</option>
+                      <option value="auto">auto</option>
+                    </select>
+                  </div>
+                  <div class="col-md-6">
+                    <label class="form-label" for="reg-url">url（http/auto 必填，仅回环）</label>
+                    <input class="form-control" id="reg-url" placeholder="http://127.0.0.1:9101">
+                  </div>
+                  <div class="col-md-6">
+                    <label class="form-label" for="reg-timeout">timeoutMs（1000–60000）</label>
+                    <input class="form-control" id="reg-timeout" type="number" min="1000" max="60000" step="500" placeholder="8000">
+                  </div>
+                  <div class="col-md-6">
+                    <label class="form-label" for="reg-secret-env">secretEnv（与 secret 二选一，必填）</label>
+                    <input class="form-control" id="reg-secret-env" placeholder="MEMORY_MCP_SECRET">
+                  </div>
+                  <div class="col-12">
+                    <label class="form-label" for="reg-secret">secret（必填二选一，≥16 字符；提交后落 secrets/&lt;id&gt;.secret，永不明文回显）</label>
+                    <textarea class="form-control" id="reg-secret" rows="2" placeholder="留空则必须填 secretEnv（服务与网关之间是 HMAC）"></textarea>
+                  </div>
+                </div>
+
+                <h3 class="h6 mt-4 mb-2">自有工具声明（可选，≤32 条）</h3>
+                <div id="tools-editor" class="d-flex flex-column gap-2"></div>
+                <button type="button" class="btn btn-outline-secondary btn-sm mt-2" id="btn-add-tool">+ 添加工具</button>
+
+                <div class="d-flex gap-2 mt-3">
+                  <button type="submit" class="btn btn-primary">注册</button>
+                  <button type="reset" class="btn btn-outline-secondary">清空</button>
+                </div>
+                <p id="register-error" class="error text-danger mt-2 mb-0 hidden"></p>
+              </form>
+            </div>
+          </div>
+        </div>
+
+        <div class="col-12 col-xl-6">
+          <div class="card h-100">
+            <div class="card-body">
+              <div class="d-flex justify-content-between align-items-center gap-2 mb-2">
+                <h2 class="h5 mb-0">已注册服务</h2>
+                <button class="btn btn-outline-secondary btn-sm" id="btn-refresh-services">刷新</button>
+              </div>
+              <div id="services-list" class="list"></div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ── 通路/回路编排视图 ────────────────────────────────────────────── -->
+    <section id="view-pipelines" class="view hidden">
+      <div class="card">
+        <div class="card-body">
+          <div class="d-flex justify-content-between align-items-center gap-2 flex-wrap mb-2">
+            <h2 class="h5 mb-0">通路 / 回路编排</h2>
+            <span id="pipeline-mode" class="badge text-bg-secondary">—</span>
+          </div>
+          <p class="muted">步骤三级解析：内置 <code>protocol</code> → 登记服务 id → 装饰器/过滤器角色的登记工具名。每个步骤可展开「规则」配置注入方式：once（仅会话首轮，进缓存前缀省 token）· 前缀/后缀 · 正则替换（<code>{extra}</code> 占位）· 自定义拼接函数（<code>(message, extra) =&gt; string</code>，强制 return）· 本地静态文本（零服务调用）。通路作用于入站 prompt；回路（P5 已生效）作用于发送动作的外发文本——<code>filter drop</code> 拦截投递、改写替换外发内容，<code>GATEWAY_PIPELINE=off</code> 时双向透传。空编排 = 透传。</p>
+          <button class="btn btn-outline-secondary btn-sm" id="btn-refresh-pipelines">刷新</button>
+          <div id="pipelines-list" class="list mt-3"></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ── 台账视图 ─────────────────────────────────────────────────────── -->
+    <section id="view-ledger" class="view hidden">
+      <div class="card">
+        <div class="card-body">
+          <div class="d-flex justify-content-between align-items-center gap-2 flex-wrap mb-2">
+            <h2 class="h5 mb-0">注册台账（append-only）</h2>
+            <div class="d-flex align-items-center gap-2">
+              <label class="muted d-flex align-items-center gap-1">条数
+                <select class="form-select form-select-sm w-auto" id="ledger-limit"><option>50</option><option selected>100</option><option>500</option></select>
+              </label>
+              <button class="btn btn-outline-secondary btn-sm" id="btn-refresh-ledger">刷新</button>
+            </div>
+          </div>
+          <div id="ledger-summary" class="muted"></div>
+          <div class="table-responsive"><table class="table table-sm table-hover align-middle" id="ledger-table">
+            <thead><tr><th>时间</th><th>服务</th><th>动作</th><th>来源</th><th>说明 / 快照</th></tr></thead>
+            <tbody></tbody>
+          </table></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ── DSH 预设与仿真提示词视图 ─────────────────────────────────────── -->
+    <section id="view-presets" class="view hidden">
+      <div class="row g-4">
+        <div class="col-12 col-xl-5">
+          <div class="card h-100">
+            <div class="card-body">
+              <div class="d-flex justify-content-between align-items-center gap-2 flex-wrap mb-2">
+                <h2 class="h5 mb-0">预设与仿真提示词</h2>
+                <div class="d-flex align-items-center gap-2">
+                  <span id="presets-source" class="badge text-bg-secondary">—</span>
+                  <button class="btn btn-outline-secondary btn-sm" id="btn-refresh-presets">刷新</button>
+                </div>
+              </div>
+              <p class="muted">清单来自活 DSH（<code>agentPresets.list</code>）。编辑直接改
+                <code>agent-presets/&lt;id&gt;/agent.cordis.yml</code> 的 <code>persona.prefix</code>，
+                保存后需重启 DSH 生效；内容未变不会落盘，写入前自动备份。</p>
+              <div id="presets-list" class="list"></div>
+            </div>
+          </div>
+        </div>
+        <div class="col-12 col-xl-7">
+          <div class="card h-100">
+            <div class="card-body">
+              <div class="d-flex justify-content-between align-items-center gap-2 flex-wrap mb-2">
+                <h3 class="h6 mb-0">仿真提示词 <code id="preset-id-label">—</code></h3>
+                <span id="preset-meta" class="muted"></span>
+              </div>
+              <p id="preset-warnings" class="warn-strip hidden"></p>
+              <textarea class="form-control font-monospace" id="preset-content" rows="18" placeholder="从左侧选择一个可编辑预设"></textarea>
+              <div class="d-flex gap-2 mt-3">
+                <button class="btn btn-primary" id="btn-save-preset" disabled>保存</button>
+              </div>
+              <div class="d-flex gap-2 mt-2">
+                <select class="form-select form-select-sm" id="preset-backups"><option value="">备份（还原用）…</option></select>
+                <button class="btn btn-outline-danger btn-sm flex-shrink-0" id="btn-restore-preset" disabled>还原选中备份</button>
+              </div>
+              <p class="muted mt-2 mb-0">还原只允许选本预设的备份清单；旧备份同样要过安全不变量校验，还原前会自动备份当前版本。</p>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ── DSH 模型与会话视图 ───────────────────────────────────────────── -->
+    <section id="view-sessions" class="view hidden">
+      <div class="card mb-4">
+        <div class="card-body">
+          <div class="d-flex justify-content-between align-items-center gap-2 flex-wrap mb-2">
+            <h2 class="h5 mb-0">模型与思考强度</h2>
+            <div class="d-flex align-items-center gap-2">
+              <span id="model-source" class="badge text-bg-secondary">—</span>
+              <button class="btn btn-outline-secondary btn-sm" id="btn-refresh-model">刷新</button>
+            </div>
+          </div>
+          <p id="model-sideeffects" class="warn-strip hidden"></p>
+          <div class="row g-3">
+            <div class="col-md-6">
+              <label class="form-label" for="model-select">模型</label>
+              <select class="form-select" id="model-select"></select>
+            </div>
+            <div class="col-md-6">
+              <label class="form-label" for="effort-select">思考强度</label>
+              <select class="form-select" id="effort-select"></select>
+            </div>
+          </div>
+          <div class="d-flex align-items-center gap-3 mt-3">
+            <button class="btn btn-primary" id="btn-save-model">保存模型设置</button>
+            <span class="muted" id="model-current"></span>
+          </div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-body">
+          <div class="d-flex justify-content-between align-items-center gap-2 mb-2">
+            <h2 class="h5 mb-0">DSH 会话</h2>
+            <button class="btn btn-outline-secondary btn-sm" id="btn-refresh-sessions">刷新</button>
+          </div>
+          <div class="table-responsive"><table class="table table-sm table-hover align-middle" id="sessions-table">
+            <thead><tr><th>会话 key</th><th>sessionId</th><th>预设</th><th>创建时间</th><th>最近活跃</th></tr></thead>
+            <tbody></tbody>
+          </table></div>
+          <div id="sessions-summary" class="muted"></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ── DSH 未决提问 / 审批视图（只读） ──────────────────────────────── -->
+    <section id="view-pending" class="view hidden">
+      <div class="card">
+        <div class="card-body">
+          <div class="d-flex justify-content-between align-items-center gap-2 flex-wrap mb-2">
+            <h2 class="h5 mb-0">未决提问 / 审批（只读）</h2>
+            <div class="d-flex align-items-center gap-2">
+              <span id="pending-forward" class="badge text-bg-secondary">—</span>
+              <select class="form-select form-select-sm w-auto" id="pending-kind">
+                <option value="">全部类型</option>
+                <option value="question">提问</option>
+                <option value="approval">审批</option>
+              </select>
+              <button class="btn btn-outline-secondary btn-sm" id="btn-refresh-pending">刷新</button>
+            </div>
+          </div>
+          <p class="muted">数据源是网关进程内暂存（重启清空，容量 100 条、溢出淘汰最旧）。
+            审批可「通过（allowed-once）/拒绝」、提问可逐题作答——均为 operator 显式处置，
+            经 <code>$events/result</code> 应答 DSH；平台群里的回复不算应答。</p>
+          <p id="pending-capacity" class="warn-strip hidden"></p>
+          <div class="table-responsive"><table class="table table-sm table-hover align-middle" id="pending-table">
+            <thead><tr><th>类型</th><th>会话</th><th>内容</th><th>等待</th><th>eventId</th></tr></thead>
+            <tbody></tbody>
+          </table></div>
+          <div id="pending-summary" class="muted"></div>
+        </div>
+      </div>
+    </section>
+    <!-- ── 用量与计费视图 ───────────────────────────────────────────────── -->
+    <section id="view-usage" class="view hidden">
+      <div class="card mb-4">
+        <div class="card-body">
+          <div class="d-flex justify-content-between align-items-center gap-2 flex-wrap mb-2">
+            <h2 class="h5 mb-0">用量计费</h2>
+            <div class="d-flex align-items-center gap-2">
+              <span id="usage-price-version" class="badge text-bg-secondary">—</span>
+              <select class="form-select form-select-sm w-auto" id="usage-hours">
+                <option value="6">最近 6 小时</option>
+                <option value="24" selected>最近 24 小时</option>
+                <option value="72">最近 72 小时</option>
+              </select>
+              <button class="btn btn-outline-secondary btn-sm" id="btn-refresh-usage">刷新</button>
+            </div>
+          </div>
+          <div id="usage-stats" class="row g-3"></div>
+          <div id="usage-chart" class="mt-3"></div>
+          <div id="usage-chart-note" class="muted small mt-1"></div>
+        </div>
+      </div>
+      <div class="row g-4">
+        <div class="col-12 col-xl-7">
+          <div class="card h-100">
+            <div class="card-body">
+              <h3 class="h6 mb-2">会话消费排行（点击载入逐轮明细）</h3>
+              <div class="table-responsive"><table class="table table-sm table-hover align-middle" id="usage-conv-table">
+                <thead><tr><th>会话</th><th>花费</th><th>tokens</th><th>轮/步</th><th>缓存命中</th><th>最近活跃</th></tr></thead>
+                <tbody></tbody>
+              </table></div>
+              <div id="usage-conv-summary" class="muted"></div>
+            </div>
+          </div>
+        </div>
+        <div class="col-12 col-xl-5">
+          <div class="card mb-4">
+            <div class="card-body">
+              <div class="d-flex justify-content-between align-items-center gap-2 mb-2">
+                <h3 class="h6 mb-0">逐轮明细 <code id="usage-conv-key">—</code></h3>
+              </div>
+              <div class="table-responsive turns-scroll"><table class="table table-sm align-middle" id="usage-turns-table">
+                <thead><tr><th>时间</th><th>模型</th><th>tokens</th><th>花费</th></tr></thead>
+                <tbody></tbody>
+              </table></div>
+            </div>
+          </div>
+          <div class="card">
+            <div class="card-body">
+              <div class="d-flex justify-content-between align-items-center gap-2 flex-wrap mb-2">
+                <h3 class="h6 mb-0">价目快照</h3>
+                <button class="btn btn-outline-danger btn-sm" id="btn-usage-reset">重置账本…</button>
+              </div>
+              <div id="usage-prices" class="muted small"></div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ── 消费端总览视图（流量 + 消费） ─────────────────────────────────── -->
+    <section id="view-adapters" class="view hidden">
+      <div class="card mb-4">
+        <div class="card-body">
+          <div class="d-flex justify-content-between align-items-center gap-2 flex-wrap mb-2">
+            <h2 class="h5 mb-0">消费端总览</h2>
+            <div class="d-flex align-items-center gap-2">
+              <select class="form-select form-select-sm w-auto" id="adapters-window">
+                <option value="24h" selected>窗口 24h</option>
+                <option value="72h">窗口 72h</option>
+                <option value="168h">窗口 7 天</option>
+              </select>
+              <button class="btn btn-outline-secondary btn-sm" id="btn-refresh-adapters">刷新</button>
+            </div>
+          </div>
+          <p class="muted">消费端 = adapters.json 适配器 ∪ 登记目录 kind=consumer（统一总览）；未注册但出现在 turn 记录里的 id 以 unregistered 徽标列出（幽灵适配器可发现）。点击行载入单消费端走势。</p>
+          <div id="adapters-platforms" class="d-flex gap-2 flex-wrap mb-2"></div>
+          <div class="table-responsive"><table class="table table-sm table-hover align-middle" id="adapters-table">
+            <thead><tr><th>消费端</th><th>平台</th><th>来源</th><th>状态</th><th>turns / 错误</th><th>tokens</th><th>花费</th><th>最近活跃</th></tr></thead>
+            <tbody></tbody>
+          </table></div>
+          <div id="adapters-summary" class="muted"></div>
+        </div>
+      </div>
+      <div class="card">
+        <div class="card-body">
+          <div class="d-flex justify-content-between align-items-center gap-2 flex-wrap mb-2">
+            <h3 class="h6 mb-0">单消费端走势 <code id="adapter-chart-id">—</code></h3>
+            <div id="adapter-chart-meta" class="muted small"></div>
+          </div>
+          <div id="adapter-chart"></div>
+        </div>
+      </div>
+    </section>
+    </div>
+  </main>
+</div>
+
+<!-- 全局提示（Bootstrap Toast） -->
+<div class="toast-container position-fixed bottom-0 end-0 p-3">
+  <div id="toast" class="toast" role="status" aria-live="polite" aria-atomic="true">
+    <div class="toast-body" id="toast-body"></div>
+  </div>
+</div>
+
+<!-- 通用二次确认（Bootstrap Modal），app.js 的 confirmDialog() 使用 -->
+<div class="modal fade" id="confirm-modal" tabindex="-1" aria-labelledby="confirm-title" aria-hidden="true">
+  <div class="modal-dialog modal-dialog-centered">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h5 class="modal-title" id="confirm-title">确认操作</h5>
+        <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="关闭"></button>
+      </div>
+      <div class="modal-body"><p id="confirm-text" class="mb-0 confirm-text"></p></div>
+      <div class="modal-footer">
+        <button type="button" class="btn btn-outline-secondary" data-bs-dismiss="modal">取消</button>
+        <button type="button" class="btn btn-danger" id="confirm-ok">确认</button>
+      </div>
+    </div>
+  </div>
+</div>
+</body>
+</html>

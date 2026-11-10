@@ -1,0 +1,18 @@
+- generic [ref=e2]:
+  - complementary [ref=e3]:
+    - generic [ref=e4]:
+      - generic [ref=e5]: GW
+      - generic [ref=e6]:
+        - strong [ref=e7]: agent-gateway
+        - generic [ref=e8]: operator 控制台
+    - generic [ref=e9]: 未登录
+  - main [ref=e12]:
+    - generic [ref=e16]:
+      - heading "登录控制台" [level=1] [ref=e17]
+      - paragraph [ref=e18]: 输入长期 operator token 换发会话 Cookie（HttpOnly · SameSite=Strict）。
+      - generic [ref=e19]:
+        - generic [ref=e20]:
+          - generic [ref=e21]: operator token
+          - textbox "operator token" [ref=e22]:
+            - /placeholder: state/operator-token 或 GATEWAY_OPERATOR_TOKEN
+        - button "登录" [ref=e23] [cursor=pointer]

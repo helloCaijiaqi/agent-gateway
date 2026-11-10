@@ -1,0 +1,34 @@
+{
+  "_comment": [
+    "pipelines.json 示例（编排配置硬切后的唯一形态）。复制到 <stateDir>/pipelines.json",
+    "（默认 agent-gateway/state/gateway/pipelines.json），或用 GATEWAY_PIPELINES_FILE 指定路径。",
+    "文件缺失 = 没有编排 = 管线只剩 protocol 令牌注入（prompt 透传）。",
+
+    "本文件只有两块，键一律是消费端（adapters.json 的消费端 id，或登记目录里",
+    "kind=consumer 的服务 id；\"default\" 为兜底编排）。非消费端键在启动、热加载、",
+    "控制台保存三处都会被拒（fail-closed）。",
+
+    "1. pipelines：per-consumer 通路编排。步骤名可以是：登记装饰器/过滤器服务的 id、",
+    "   装饰器角色的登记工具名（如 chat_memory_recall / chat_role_render）、",
+    "   或内置 protocol（protocol 强制注入、不可移除，写进编排会被忽略）。",
+    "   空键/default 缺失 = 透传。可用控制台 UI 维护（/console/，保存即热加载生效）。",
+    "2. returnPipelines：per-consumer 回路编排（形状同 pipelines）。作用于发送动作的",
+    "   外发文本（deliverAction 在 POST /v1/actions 前拦截）：filter 判 drop = 拦截投递；",
+    "   decorator 改写/join 规则 = 替换外发内容。protocol 禁入回路（令牌只在入站方向",
+    "   有意义，配置即启动失败）。GATEWAY_PIPELINE=off 时双向透传（同一回滚开关）。",
+
+    "【服务登记不在这里】服务身份/工具面/roles 由登记目录承载：把各仓提供的",
+    "gateway-registration.example.json 复制为 <stateDir>/services/<hash>.json",
+    "（登记目录默认 state/gateway/services/，id 是 32 位随机 hash，文件名即身份），",
+    "并给服务进程配对应 secretEnv。出现 \"services\" 键会直接启动失败——那是旧",
+    "services.json 的残留，迁移三步：① 内联服务逐个挪进登记目录；② pipelines/",
+    "returnPipelines 搬进本文件；③ 删除旧 services.json 与 GATEWAY_SERVICES_FILE。"
+  ],
+  "pipelines": {
+    "qq-main": ["safety-filter", "chat_memory_recall", "chat_role_render"],
+    "default": ["chat_memory_recall", "chat_role_render"]
+  },
+  "returnPipelines": {
+    "qq-main": ["safety-filter"]
+  }
+}

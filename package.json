@@ -1,0 +1,23 @@
+{
+  "name": "agent-gateway",
+  "version": "0.1.0",
+  "private": true,
+  "description": "上下文编排 + DSH 网关：唯一的 DSH 会话/事件消费者。不是消息中间件。",
+  "type": "module",
+  "engines": {
+    "node": ">=22.13"
+  },
+  "scripts": {
+    "start": "node src/main.mjs",
+    "test": "node --test scripts/test-gateway-contracts.mjs scripts/test-executor-contract.mjs scripts/test-runtime-turn.mjs scripts/test-memory-ingest.mjs scripts/test-pending-forwarder.mjs scripts/test-http-client.mjs scripts/test-metrics.mjs scripts/test-registration-dir.mjs scripts/test-pipelines-migration.mjs scripts/test-pipeline.mjs scripts/test-block-cache.mjs scripts/test-return-pipeline.mjs scripts/test-tool-host.mjs scripts/test-state-store.mjs scripts/test-adapter-conformance.mjs scripts/test-layering.mjs scripts/test-secrets.mjs scripts/test-actions-manifest.mjs scripts/test-qq-tools.mjs scripts/test-web-search.mjs scripts/test-ws-hub.mjs scripts/test-config.mjs scripts/test-console-auth.mjs scripts/test-console-services.mjs scripts/test-console-dsh.mjs scripts/test-console-pending.mjs scripts/test-usage-billing.mjs",
+    "secrets:gen": "node scripts/gen-secret.mjs",
+    "verify:shadow": "node scripts/verify-shadow.mjs",
+    "verify:rollback": "node scripts/verify-rollback.mjs"
+  },
+  "dependencies": {
+    "axios": "^1.7.9",
+    "js-yaml": "^4.1.0",
+    "ws": "^8.18.0",
+    "zod": "^4.4.3"
+  }
+}
