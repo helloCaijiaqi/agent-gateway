@@ -21,6 +21,7 @@
     </div>
     <nav id="nav-items" class="nav nav-pills flex-column gap-1">
       <button class="nav-item nav-link text-start" data-view="services">服务注册</button>
+<button class="nav-item nav-link text-start" data-view="rolecards">角色卡</button>
       <button class="nav-item nav-link text-start" data-view="pipelines">通路编排</button>
       <button class="nav-item nav-link text-start" data-view="ledger">注册台账</button>
       <button class="nav-item nav-link text-start" data-view="presets">预设提示词</button>
@@ -30,6 +31,19 @@
       <button class="nav-item nav-link text-start" data-view="adapters">消费端总览</button>
       <button class="nav-item nav-link text-start" id="btn-logout">登出</button>
     </nav>
+    <div class="mode-switch mt-3 hidden">
+      <div class="gw-switch">
+        <input type="checkbox" role="switch" class="gw-switch-input" id="mode-switch" aria-checked="false"
+               aria-labelledby="mode-switch-label" aria-describedby="mode-switch-hint"
+               title="GATEWAY_DATA_PLANE：off = 消息面关闭（入站 503 / WS 帧 E_DISABLED）；on = 消息面放行。拨动即时生效、零重启，并写回启动时装载的 env 文件保持重启后不变。">
+        <label class="gw-switch-track" for="mode-switch" aria-hidden="true"></label>
+        <span class="small text-secondary" id="mode-switch-label">消息面 —</span>
+      </div>
+      <p class="mode-switch-hint" id="mode-switch-hint">
+        消息面开关：开启后入站消息进入处理链路；关闭后入站请求与 WS 帧一律拒绝（E_DISABLED）。
+        拨动即时生效、无需重启，并写回 .env 保持重启后不变。
+      </p>
+    </div>
     <div class="nav-foot mt-auto d-flex align-items-center gap-2">
       <span class="dot" id="session-dot"></span>
       <span id="session-hint">未登录</span>
@@ -47,7 +61,7 @@
           <form id="login-form">
             <div class="mb-3">
               <label class="form-label" for="login-token">operator token</label>
-              <input class="form-control" id="login-token" type="password" autocomplete="current-password" placeholder="state/operator-token 或 GATEWAY_OPERATOR_TOKEN" required>
+              <input class="form-control" id="login-token" type="password" autocomplete="current-password" placeholder="state/operator-token（凭据文件单源）" required>
             </div>
             <button type="submit" class="btn btn-primary w-100">登录</button>
             <p id="login-error" class="error text-danger mt-2 mb-0 hidden"></p>
@@ -63,7 +77,7 @@
           <div class="card h-100">
             <div class="card-body">
               <h2 class="h5 mb-1">注册新服务</h2>
-              <p class="muted">文件即登记：注册写 <code>&lt;hash&gt;.json</code> 进登记目录，卸载即删文件。secret 单次提交、服务端落盘 0600、永不明文回显。</p>
+              <p class="muted">文件即登记：注册写 <code>&lt;hash&gt;.json</code> 进登记目录，卸载即删文件。secret 可留空——网关自动生成（0600 落盘，回执一次性显示）；显式提交的 secret 永不明文回显。</p>
               <form id="register-form">
                 <div class="row g-3">
                   <div class="col-md-6">
@@ -73,22 +87,20 @@
                   <div class="col-md-6">
                     <label class="form-label" for="reg-kind">kind *</label>
                     <select class="form-select" id="reg-kind">
-                      <option value="decorator">decorator（装饰器）</option>
-                      <option value="filter">filter（过滤器）</option>
-                      <option value="shadow">shadow（灰度对账：只记 diff 不生效）</option>
-                      <option value="consumer">consumer（消费端）</option>
+                      <option value="consumer">consumer（消费端：消息来源 + 动作下行）</option>
+                      <option value="resource">resource（资源服务：被动被调，如记忆/角色卡）</option>
                     </select>
                   </div>
                   <div class="col-md-6">
-                    <label class="form-label" for="reg-transport">transport *</label>
+                    <label class="form-label" for="reg-transport">transport *（resource 固定 http）</label>
                     <select class="form-select" id="reg-transport">
                       <option value="ws">ws（长连）</option>
                       <option value="http">http（回环）</option>
-                      <option value="auto">auto</option>
+                      <option value="auto">auto（WS 优先，失败回落 HTTP）</option>
                     </select>
                   </div>
                   <div class="col-md-6">
-                    <label class="form-label" for="reg-url">url（http/auto 必填，仅回环）</label>
+                    <label class="form-label" for="reg-url" id="reg-url-label">url（http/auto 必填，仅回环）</label>
                     <input class="form-control" id="reg-url" placeholder="http://127.0.0.1:9101">
                   </div>
                   <div class="col-md-6">
@@ -96,16 +108,25 @@
                     <input class="form-control" id="reg-timeout" type="number" min="1000" max="60000" step="500" placeholder="8000">
                   </div>
                   <div class="col-md-6">
-                    <label class="form-label" for="reg-secret-env">secretEnv（与 secret 二选一，必填）</label>
+                    <label class="form-label" for="reg-platform">platform（consumer 必填：动作会话定位 + 入站验签）</label>
+                    <input class="form-control" id="reg-platform" placeholder="qq" pattern="[a-z][a-z0-9-]{0,31}">
+                  </div>
+                  <div class="col-md-6">
+                    <label class="form-label" for="reg-preset">DSH 预设（可选，留空用内置 minimal；只是名字，内容在 qq-bridge 编辑安装）</label>
+                    <input class="form-control" id="reg-preset" placeholder="qq-chat" pattern="[a-z][a-z0-9-]{0,63}">
+                  </div>
+                  <div class="col-md-6">
+                    <label class="form-label" for="reg-secret-env">secretEnv（与 secret 二选一，可留空）</label>
                     <input class="form-control" id="reg-secret-env" placeholder="MEMORY_MCP_SECRET">
                   </div>
                   <div class="col-12">
-                    <label class="form-label" for="reg-secret">secret（必填二选一，≥16 字符；提交后落 secrets/&lt;id&gt;.secret，永不明文回显）</label>
-                    <textarea class="form-control" id="reg-secret" rows="2" placeholder="留空则必须填 secretEnv（服务与网关之间是 HMAC）"></textarea>
+                    <label class="form-label" for="reg-secret">secret（可留空自动生成，≥16 字符；提交后落 secrets/&lt;id&gt;.secret；显式提交的值永不明文回显）</label>
+                    <textarea class="form-control" id="reg-secret" rows="2" placeholder="留空 = 网关自动生成随机密钥（登记回执一次性显示，交接文件内嵌同一值）"></textarea>
                   </div>
                 </div>
 
                 <h3 class="h6 mt-4 mb-2">自有工具声明（可选，≤32 条）</h3>
+                <p id="tools-hint" class="muted small mb-2">resource 可声明 tool / decorator / filter；consumer 能力走 manifest 现拉清单。</p>
                 <div id="tools-editor" class="d-flex flex-column gap-2"></div>
                 <button type="button" class="btn btn-outline-secondary btn-sm mt-2" id="btn-add-tool">+ 添加工具</button>
 
@@ -113,7 +134,8 @@
                   <button type="submit" class="btn btn-primary">注册</button>
                   <button type="reset" class="btn btn-outline-secondary">清空</button>
                 </div>
-                <p id="register-error" class="error text-danger mt-2 mb-0 hidden"></p>
+                <div id="register-result" class="alert alert-success mt-2 mb-0 hidden"></div>
+          <p id="register-error" class="error text-danger mt-2 mb-0 hidden"></p>
               </form>
             </div>
           </div>
@@ -141,9 +163,32 @@
             <h2 class="h5 mb-0">通路 / 回路编排</h2>
             <span id="pipeline-mode" class="badge text-bg-secondary">—</span>
           </div>
-          <p class="muted">步骤三级解析：内置 <code>protocol</code> → 登记服务 id → 装饰器/过滤器角色的登记工具名。每个步骤可展开「规则」配置注入方式：once（仅会话首轮，进缓存前缀省 token）· 前缀/后缀 · 正则替换（<code>{extra}</code> 占位）· 自定义拼接函数（<code>(message, extra) =&gt; string</code>，强制 return）· 本地静态文本（零服务调用）。通路作用于入站 prompt；回路（P5 已生效）作用于发送动作的外发文本——<code>filter drop</code> 拦截投递、改写替换外发内容，<code>GATEWAY_PIPELINE=off</code> 时双向透传。空编排 = 透传。</p>
+          <p class="muted">步骤两级解析：内置 <code>protocol</code> → 装饰器/过滤器角色（单值 role）的登记工具名（服务 id 直接当步骤已不合法）。每个步骤可展开「规则」配置注入方式：once（仅会话首轮，进缓存前缀省 token）· 前缀/后缀 · 正则替换（<code>{extra}</code> 占位）· 自定义拼接函数（<code>(message, extra) =&gt; string</code>，强制 return）· 本地静态文本（零服务调用）。通路作用于入站 prompt；回路（P5 已生效）作用于发送动作的外发文本——filter 产出空串拦截投递、非空替换外发内容，<code>GATEWAY_PIPELINE=off</code> 时双向透传。空编排 = 透传。</p>
           <button class="btn btn-outline-secondary btn-sm" id="btn-refresh-pipelines">刷新</button>
           <div id="pipelines-list" class="list mt-3"></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ── 角色卡视图（2026-11-20）：人格唯一来源 = rolecard-mcp，DSH 插件
+         每 step 实时拉渲染——改卡下一回合生效；切卡必须联动会话退役（apply
+         端点清 sessions 映射），否则旧会话历史与新人格矛盾。 ─────────────── -->
+    <section id="view-rolecards" class="view hidden">
+      <div class="card">
+        <div class="card-body">
+          <div class="d-flex justify-content-between align-items-center gap-2 flex-wrap mb-2">
+            <h2 class="h5 mb-0">角色卡</h2>
+            <span id="rolecard-current" class="badge text-bg-primary">当前：—</span>
+          </div>
+          <p class="muted">人格唯一来源（DSH 侧 rolecard-persona 插件直连渲染注入）。本视图负责「切换应用角色」（会退役全部存量 DSH 会话，下一条消息从全新会话开始）；<strong>查看与编辑内容已迁至 rolecard 服务管理页</strong>——点「编辑角色卡内容」在新标签打开。</p>
+          <div class="d-flex gap-2 align-items-center flex-wrap mb-2">
+            <select class="form-select form-select-sm w-auto" id="rolecard-select" aria-label="选择角色卡"></select>
+            <button class="btn btn-outline-secondary btn-sm" id="btn-rolecard-refresh">刷新</button>
+            <button class="btn btn-outline-primary btn-sm" id="btn-rolecard-edit">编辑角色卡内容 ↗</button>
+            <button class="btn btn-warning btn-sm" id="btn-rolecard-apply">应用此角色（切卡 + 会话退役）</button>
+          </div>
+          <div id="rolecard-hint" class="muted small mt-2">选择角色后点「应用此角色」执行切换（含会话退役确认）。</div>
+          <div id="rolecard-preview" class="mt-2"></div>
         </div>
       </div>
     </section>
@@ -170,45 +215,22 @@
       </div>
     </section>
 
-    <!-- ── DSH 预设与仿真提示词视图 ─────────────────────────────────────── -->
+    <!-- ── DSH 预设视图（只读清单）───────────────────────────────────────── -->
     <section id="view-presets" class="view hidden">
-      <div class="row g-4">
-        <div class="col-12 col-xl-5">
-          <div class="card h-100">
-            <div class="card-body">
-              <div class="d-flex justify-content-between align-items-center gap-2 flex-wrap mb-2">
-                <h2 class="h5 mb-0">预设与仿真提示词</h2>
-                <div class="d-flex align-items-center gap-2">
-                  <span id="presets-source" class="badge text-bg-secondary">—</span>
-                  <button class="btn btn-outline-secondary btn-sm" id="btn-refresh-presets">刷新</button>
-                </div>
-              </div>
-              <p class="muted">清单来自活 DSH（<code>agentPresets.list</code>）。编辑直接改
-                <code>agent-presets/&lt;id&gt;/agent.cordis.yml</code> 的 <code>persona.prefix</code>，
-                保存后需重启 DSH 生效；内容未变不会落盘，写入前自动备份。</p>
-              <div id="presets-list" class="list"></div>
+      <div class="card">
+        <div class="card-body">
+          <div class="d-flex justify-content-between align-items-center gap-2 flex-wrap mb-2">
+            <h2 class="h5 mb-0">DSH 预设清单</h2>
+            <div class="d-flex align-items-center gap-2">
+              <span id="presets-source" class="badge text-bg-secondary">—</span>
+              <button class="btn btn-outline-secondary btn-sm" id="btn-refresh-presets">刷新</button>
             </div>
           </div>
-        </div>
-        <div class="col-12 col-xl-7">
-          <div class="card h-100">
-            <div class="card-body">
-              <div class="d-flex justify-content-between align-items-center gap-2 flex-wrap mb-2">
-                <h3 class="h6 mb-0">仿真提示词 <code id="preset-id-label">—</code></h3>
-                <span id="preset-meta" class="muted"></span>
-              </div>
-              <p id="preset-warnings" class="warn-strip hidden"></p>
-              <textarea class="form-control font-monospace" id="preset-content" rows="18" placeholder="从左侧选择一个可编辑预设"></textarea>
-              <div class="d-flex gap-2 mt-3">
-                <button class="btn btn-primary" id="btn-save-preset" disabled>保存</button>
-              </div>
-              <div class="d-flex gap-2 mt-2">
-                <select class="form-select form-select-sm" id="preset-backups"><option value="">备份（还原用）…</option></select>
-                <button class="btn btn-outline-danger btn-sm flex-shrink-0" id="btn-restore-preset" disabled>还原选中备份</button>
-              </div>
-              <p class="muted mt-2 mb-0">还原只允许选本预设的备份清单；旧备份同样要过安全不变量校验，还原前会自动备份当前版本。</p>
-            </div>
-          </div>
+          <p class="muted">清单来自活 DSH（<code>agentPresets.list</code>），网关只回显名字。
+            预设<b>内容</b>的编辑与安装归各消费端（qq-bridge：<code>dsh/qq/agent-presets/*</code>
+            + <code>npm run install:preset</code>）；本控制台的「服务」页可在消费端登记上声明
+            用哪个预设（非必填，未声明用内置 <code>minimal</code>）。</p>
+          <div id="presets-list" class="list"></div>
         </div>
       </div>
     </section>
@@ -359,7 +381,7 @@
               <button class="btn btn-outline-secondary btn-sm" id="btn-refresh-adapters">刷新</button>
             </div>
           </div>
-          <p class="muted">消费端 = adapters.json 适配器 ∪ 登记目录 kind=consumer（统一总览）；未注册但出现在 turn 记录里的 id 以 unregistered 徽标列出（幽灵适配器可发现）。点击行载入单消费端走势。</p>
+          <p class="muted">消费端 = 登记目录 kind=consumer（唯一来源）；未注册但出现在 turn 记录里的 id 以 unregistered 徽标列出（幽灵适配器可发现）。点击行载入单消费端走势。</p>
           <div id="adapters-platforms" class="d-flex gap-2 flex-wrap mb-2"></div>
           <div class="table-responsive"><table class="table table-sm table-hover align-middle" id="adapters-table">
             <thead><tr><th>消费端</th><th>平台</th><th>来源</th><th>状态</th><th>turns / 错误</th><th>tokens</th><th>花费</th><th>最近活跃</th></tr></thead>
@@ -401,6 +423,26 @@
       <div class="modal-footer">
         <button type="button" class="btn btn-outline-secondary" data-bs-dismiss="modal">取消</button>
         <button type="button" class="btn btn-danger" id="confirm-ok">确认</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- 工具清单编辑器（Bootstrap Modal），app.js 的 manifestEditorDialog() 使用 -->
+<div class="modal fade" id="manifest-modal" tabindex="-1" aria-labelledby="manifest-title" aria-hidden="true">
+  <div class="modal-dialog modal-dialog-centered modal-lg">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h5 class="modal-title" id="manifest-title">工具清单编辑</h5>
+        <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="关闭"></button>
+      </div>
+      <div class="modal-body">
+        <p class="muted small mb-2">name 由服务定义（只读）；role 与 description 可改，写回后热生效。role 语义：tool=被动调用、decorator=可进管线改写 prompt、filter=可改写或丢弃消息。</p>
+        <div id="manifest-rows"></div>
+      </div>
+      <div class="modal-footer">
+        <button type="button" class="btn btn-outline-secondary" data-bs-dismiss="modal">取消</button>
+        <button type="button" class="btn btn-primary" id="manifest-ok">写回登记</button>
       </div>
     </div>
   </div>

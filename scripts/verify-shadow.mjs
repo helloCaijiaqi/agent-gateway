@@ -18,14 +18,17 @@ import path from 'node:path';
 
 const { createTurnRunner } = await import(new URL('../src/runtime/turn-runner.mjs', import.meta.url).href);
 const { createSessionRegistry } = await import(new URL('../src/runtime/session-registry.mjs', import.meta.url).href);
+// 建会话需要适配器声明「平台→preset」：测试里用一个最小的声明表顶替登记文件。
+const PRESETS_FOR = () => ({ qq: 'qq-chat', wx: 'wx-chat' });
 const { createDshGateway } = await import(new URL('../src/runtime/dsh-gateway.mjs', import.meta.url).href);
 const { createPromptQueue } = await import(new URL('../src/runtime/prompt-queue.mjs', import.meta.url).href);
 const { createTurnStore } = await import(new URL('../src/core/turn-store.mjs', import.meta.url).href);
 const { createServiceRegistry } = await import(new URL('../src/core/service-registry.mjs', import.meta.url).href);
+const { seedConsumer } = await import(new URL('./support/consumer-registration.mjs', import.meta.url).href);
 const { createPipeline, protocolTokenLine } = await import(new URL('../src/core/pipeline.mjs', import.meta.url).href);
 
 const CHAT = {
-  preset: 'qq-chat-v2',
+  preset: 'qq-chat',
   provider: 'deepseek-official',
   model: 'deepseek-flash',
   reasoningEffort: 'max',
@@ -52,7 +55,7 @@ function createFakeDsh() {
       });
       client.emit({ type: 'session/event', sessionId, event: { type: 'turn/end', data: { turn, reason: { kind: 'completed' } } } });
     },
-    async listPresets() { return ['qq-chat-v2']; },
+    async listPresets() { return ['qq-chat', 'minimal']; },
     async ensureWorkspace() { return 'ws-shadow'; },
     async createSession() {
       const sessionId = `sess-${++seq}`;
@@ -159,16 +162,16 @@ async function runCase({ withShadow, fixture, index, shadowUrl }) {
       transport: 'http', url: shadowUrl, secret: 's'.repeat(20), enabled: true,
     }));
   }
+  // 编排权限门禁要求编排键背后有登记消费端（消费端身份唯一来源 = 登记目录）。
+  seedConsumer(dir, { id: ADAPTER_ID, platform: 'qq', secret: 'shadow-consumer-secret-0123456' });
   const registry = createServiceRegistry({
     pipelinesFile,
     stateDir: dir,
-    // 过渡期消费端身份（adapters.json id）：编排权限门禁要求消费端有身份。
-    consumerIds: [ADAPTER_ID],
     registrations: { dir: regDir, ledgerFile: path.join(dir, 'ledger.jsonl'), reloadMs: 0 },
     logger: () => {},
   });
   const dsh = createFakeDsh();
-  const sessionRegistry = createSessionRegistry({ dsh, chat: CHAT, file: null });
+  const sessionRegistry = createSessionRegistry({ presetsFor: PRESETS_FOR, dsh, chat: CHAT, file: null });
   const gateway = createDshGateway({ dsh, turnTimeoutMs: CHAT.turnTimeoutMs });
   const turns = createTurnStore({ file: null });
   const pipeline = createPipeline({ registry, builtinSteps, budgetChars: 6000, logger: () => {} });

@@ -1,170 +1,211 @@
-// §6 记忆落库调度器测试（raw-only 会话纪元模型）：双向观察、msgId 去重、
-// 防抖聚合（窗口/批量冲刷）、在途上限 FIFO、失败重试本地缓冲、放弃上限。
-// 全离线：deliver 用假注入，无真 memory-mcp。
-import assert from 'node:assert/strict';
+// session-save 运行时专项（tool.call 统一改造：会话缓冲上移网关）。
+//
+// 取代旧 memory-ingest 调度器测试（service.call step=ingest + 窗口批量语义已删）。
+// 覆盖：观察归一（入站 sender.names / 出站 assistant 无 senderId）、缺 msgId 跳过、
+// 缓冲内去重、触顶分段（maxMessages/maxChars → partial save）、closeSession 收尾、
+// flushAll 关停补发、崩溃恢复（撕裂行跳过 + 定时器恢复）、失败退避重试缓冲保留。
+// 全离线：deliver 用假实现（等价于 tool.call chat_memory_save 的网关侧桩）。
 import test from 'node:test';
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 
-const { createMemoryIngest } = await import(new URL('../src/runtime/memory-ingest.mjs', import.meta.url).href);
+const { createSessionSave, encodeSessionKey } = await import(new URL('../src/runtime/memory-ingest.mjs', import.meta.url).href);
 
-test('ingest: 入站/出站观察归一为 raw 记录（msgId + senderId + 文本折叠）；无文本跳过', async () => {
-  const sent = [];
-  const ingest = createMemoryIngest({ deliver: async (record) => { sent.push(record); }, windowMs: 60_000 });
-  ingest.observeInbound({
-    sessionKey: 'qq:group:123',
-    envelope: { message: { id: 'm-1', text: '  今天\n天气不错 ', sender: { id: '10001', name: '张三' }, createdAt: 1234 } },
-  });
-  ingest.observeInbound({ sessionKey: 'qq:group:123', envelope: { wake: { kind: 'cron' } } }); // 合成事件无文本 → 跳过
-  ingest.observeOutbound({
-    sessionKey: 'qq:group:123', tool: 'chat_qq_send_text', args: { content: '好的，明天见' },
-    msgId: 'out:turn-1:call-1',
-  });
-  ingest.observeOutbound({ sessionKey: 'qq:group:123', tool: 'chat_qq_send_text', args: {}, msgId: 'out:turn-1:call-2' }); // 无文本 → 跳过
-  assert.equal(ingest.stats().buffered, 2, '空文本不进缓冲');
-  await ingest.flushAll();
-  assert.deepEqual(sent.map((r) => [r.sessionId, r.msgId, r.text, r.kind, r.senderId]), [
-    ['qq:group:123', 'm-1', '今天 天气不错', 'episodic', '10001'], // 空白折叠
-    ['qq:group:123', 'out:turn-1:call-1', '好的，明天见', 'episodic', 'assistant'], // 出站合成 id
-  ]);
+const SESSION = 'qq:group:123';
+const INBOUND = (msgId, text, extra = {}) => ({
+  sessionKey: SESSION,
+  envelope: { message: { id: msgId, text, sender: { id: '10001', name: 'Card', names: { nickname: '小明', card: '小明哥' }, ...extra.sender } }, receivedAt: 1_700_000_000_000, ...extra.envelope },
 });
 
-test('ingest: 缺 msgId 只记日志不投递（raw 唯一键必须有 msgId）', async () => {
-  const logs = [];
-  const sent = [];
-  const ingest = createMemoryIngest({
-    deliver: async (record) => { sent.push(record); },
-    windowMs: 60_000,
-    logger: (msg) => logs.push(msg),
+test('ingest: 入站/出站观察归一为 save 记录（sender.names 拆分；出站 assistant 无 senderId）；无文本跳过', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ss-run-'));
+  const delivered = [];
+  const ss = createSessionSave({
+    deliver: async (payload) => delivered.push(payload),
+    bufferDir: dir, idleMs: 60_000, maxMessages: 500, maxChars: 100_000,
   });
-  ingest.observeInbound({ sessionKey: 's1', envelope: { message: { text: '没有 id', sender: { id: 'u' } } } });
-  ingest.observeOutbound({ sessionKey: 's1', tool: 't', args: { content: '没有合成 id' } });
-  await ingest.flushAll();
-  assert.equal(sent.length, 0);
-  assert.equal(logs.length, 2);
-  assert.match(logs[0], /missing msgId/);
-});
-
-test('ingest: 攒满 maxBatch 提前冲刷；同 msgId 重复观察去重（重放/多拦截点）', async () => {
-  const sent = [];
-  const ingest = createMemoryIngest({ deliver: async (record) => { sent.push(record); }, windowMs: 60_000, maxBatch: 3 });
-  const msg = (id, text) => ({ message: { id, text, sender: { id: 'u' } } });
-  for (const [id, text] of [['m1', 'a'], ['m2', 'b'], ['m2', 'b'], ['m3', 'c']]) {
-    ingest.observeInbound({ sessionKey: 's1', envelope: msg(id, text) });
+  try {
+    ss.start();
+    ss.observeInbound(INBOUND('in:1', '今天部署了网关'));
+    ss.observeInbound({ sessionKey: SESSION, envelope: { message: { id: 'in:2', text: '   ' } } }); // 空白跳过
+    ss.observeInbound({ sessionKey: SESSION, envelope: { message: { id: 'in:3' } } }); // 无文本跳过
+    ss.observeOutbound({ sessionKey: SESSION, tool: 'send_text', args: { content: '收到，已部署' }, msgId: 'out:t1:c1' });
+    await ss.closeSession(SESSION);
+    assert.equal(delivered.length, 1);
+    const { messages, partial } = delivered[0];
+    assert.equal(partial, false, 'closeSession = 会话收尾 save');
+    assert.equal(messages.length, 2);
+    const inbound = messages[0];
+    assert.equal(inbound.msgId, 'in:1');
+    assert.equal(inbound.senderId, '10001');
+    assert.equal(inbound.nickname, '小明');
+    assert.equal(inbound.card, '小明哥');
+    assert.equal(inbound.text, '今天部署了网关');
+    assert.equal(inbound.createdAt, 1_700_000_000_000);
+    const outbound = messages[1];
+    assert.equal(outbound.msgId, 'out:t1:c1');
+    assert.equal(outbound.senderId, undefined, '出站是机器人自己发的：无 senderId');
+    assert.equal(outbound.name, 'assistant');
+    assert.equal(outbound.kind, 'assistant');
+  } finally {
+    ss.stop();
   }
-  assert.equal(ingest.stats().buffered, 0, '第 3 条（m3）触发批量冲刷；m2 重放被去重');
-  await new Promise((r) => setImmediate(r));
-  assert.deepEqual(sent.map((r) => r.msgId), ['m1', 'm2', 'm3']);
-  assert.equal(ingest.stats().flushed, 3);
 });
 
-test('ingest: 同 msgId 但内容不同 = 去重命中（幂等键是会话+msgId，不是内容）', async () => {
-  const sent = [];
-  const ingest = createMemoryIngest({ deliver: async (record) => { sent.push(record); }, windowMs: 60_000 });
-  ingest.observeInbound({ sessionKey: 's1', envelope: { message: { id: 'm1', text: '第一次', sender: { id: 'u' } } } });
-  ingest.observeInbound({ sessionKey: 's1', envelope: { message: { id: 'm1', text: '适配器重试时内容重渲染', sender: { id: 'u' } } } });
-  await ingest.flushAll();
-  assert.equal(sent.length, 1, '同 msgId 只落一次，服务端 UNIQUE 兜底');
+test('ingest: 缺 msgId 跳过；同 msgId 重复观察去重（重放/多拦截点）', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ss-run-'));
+  const delivered = [];
+  const ss = createSessionSave({
+    deliver: async (payload) => delivered.push(payload),
+    bufferDir: dir, idleMs: 60_000, maxMessages: 500, maxChars: 100_000,
+  });
+  try {
+    ss.start();
+    ss.observeInbound({ sessionKey: SESSION, envelope: { message: { text: 'no msgId' } } });
+    ss.observeInbound(INBOUND('in:1', '第一条'));
+    ss.observeInbound(INBOUND('in:1', '第二条不同内容')); // 同 msgId → 去重命中
+    await ss.closeSession(SESSION);
+    assert.equal(delivered[0].messages.length, 1, '去重按 (sessionKey, msgId)');
+    assert.equal(delivered[0].messages[0].text, '第一条');
+  } finally {
+    ss.stop();
+  }
 });
 
-test('ingest: 窗口到期自动冲刷（windowMs 兜底）', async () => {
-  const sent = [];
-  const ingest = createMemoryIngest({ deliver: async (record) => { sent.push(record); }, windowMs: 1000 });
-  ingest.observeInbound({ sessionKey: 's1', envelope: { message: { id: 'm1', text: '窗口冲刷', sender: { id: 'u' } } } });
-  assert.equal(sent.length, 0);
-  await new Promise((r) => setTimeout(r, 1200));
-  assert.equal(sent.length, 1);
-  assert.equal(ingest.stats().buffered, 0);
+test('ingest: 触顶分段（maxMessages / maxChars）→ partial save，缓冲清空继续累积', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ss-run-'));
+  const delivered = [];
+  const ss = createSessionSave({
+    deliver: async (payload) => delivered.push(payload),
+    bufferDir: dir, idleMs: 60_000, maxMessages: 3, maxChars: 100_000,
+  });
+  try {
+    ss.start();
+    for (let i = 1; i <= 4; i += 1) ss.observeInbound(INBOUND(`in:${i}`, `消息${i}`));
+    await ss.flushAll();
+    assert.equal(delivered.length, 2, '第 3 条触发分段 save（partial），第 4 条随 flushAll 落地');
+    assert.equal(delivered[0].partial, true, '触顶分段标记 partial');
+    assert.equal(delivered[0].messages.length, 3);
+    assert.equal(delivered[1].messages.length, 1);
+  } finally {
+    ss.stop();
+  }
 });
 
-test('ingest: 在途上限 maxConcurrent——窗口吐 50 条时最多 4 个并发（防尖峰）', async () => {
-  let active = 0;
-  let peak = 0;
-  const ingest = createMemoryIngest({
-    deliver: async () => {
-      active += 1;
-      peak = Math.max(peak, active);
-      await new Promise((r) => setTimeout(r, 5));
-      active -= 1;
+test('ingest: save 成功后缓冲文件清理；save 失败缓冲保留（内存 + 磁盘）并退避重试', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ss-run-'));
+  const file = path.join(dir, `${encodeSessionKey(SESSION)}.jsonl`);
+  let failFirst = true;
+  const delivered = [];
+  const ss = createSessionSave({
+    deliver: async (payload) => {
+      if (failFirst) throw new Error('memory service unavailable');
+      delivered.push(payload);
     },
-    windowMs: 60_000,
-    maxConcurrent: 4,
+    bufferDir: dir, idleMs: 60_000, maxMessages: 500, maxChars: 100_000,
   });
-  for (let i = 0; i < 30; i += 1) {
-    ingest.observeInbound({ sessionKey: 's1', envelope: { message: { id: `m${i}`, text: `t${i}`, sender: { id: 'u' } } } });
+  try {
+    ss.start();
+    ss.observeInbound(INBOUND('in:1', '第一条'));
+    await ss.closeSession(SESSION);
+    assert.equal(delivered.length, 0, '失败不产生成功计数');
+    assert.ok(fs.existsSync(file), '失败后缓冲文件保留');
+
+    failFirst = false;
+    ss.retryDue(); // 手动触发重试兜底（运行时由 30s 轮询）
+    await ss.flushAll();
+    assert.equal(delivered.length, 1, '缓冲保留 → 重试成功');
+    assert.equal(fs.existsSync(file), false, '成功后文件清理');
+  } finally {
+    ss.stop();
   }
-  await ingest.flushAll();
-  assert.equal(peak, 4, `并发峰值应恰为上限，实际 ${peak}`);
-  assert.equal(ingest.stats().flushed, 30);
-  assert.equal(ingest.stats().inflight, 0);
-  assert.equal(ingest.stats().queued, 0);
 });
 
-test('ingest: deliver 失败进重试缓冲（指数退避），flushAll(force) 立即重试成功', async () => {
-  let fail = true;
-  const attempts = [];
-  const ingest = createMemoryIngest({
-    deliver: async (record) => {
-      attempts.push(record.msgId);
-      if (fail) throw new Error('memory-mcp unreachable');
-    },
-    windowMs: 60_000,
-  });
-  ingest.observeInbound({ sessionKey: 's1', envelope: { message: { id: 'm1', text: '会失败的一条', sender: { id: 'u' } } } });
-  await ingest.flushAll();
-  assert.equal(ingest.stats().retrying, 1);
-  assert.equal(ingest.stats().flushed, 0);
-  fail = false;
-  await ingest.flushAll(true);
-  assert.equal(ingest.stats().retrying, 0);
-  assert.equal(ingest.stats().flushed, 1);
-  assert.equal(attempts.length, 2, '第一次失败 + 强制重试成功');
-});
+test('ingest: 崩溃恢复——残留缓冲（含撕裂行）加载进内存并按空闲定时器补发', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ss-run-'));
+  const file = path.join(dir, `${encodeSessionKey('qq:group:777')}.jsonl`);
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(file, [
+    JSON.stringify({ type: 'meta', v: 1, sessionKey: 'qq:group:777' }),
+    JSON.stringify({ msgId: 'in:1', senderId: '10001', text: '崩溃前第一条', createdAt: 1_700_000_000_000, kind: 'episodic' }),
+    '{"msgId":"in:2","text":"撕裂行', // 进程崩溃的半行：跳过并计数
+    '',
+  ].join('\n'));
 
-test('ingest: 超过 maxAttempts 丢弃并计数（宁丢不阻塞主链路）', async () => {
-  const ingest = createMemoryIngest({
-    deliver: async () => { throw new Error('down'); },
-    windowMs: 60_000,
-    maxAttempts: 2,
+  const delivered = [];
+  const ss = createSessionSave({
+    deliver: async (payload) => delivered.push(payload),
+    bufferDir: dir, idleMs: 300, maxMessages: 500, maxChars: 100_000,
   });
-  ingest.observeInbound({ sessionKey: 's1', envelope: { message: { id: 'm1', text: '注定丢失', sender: { id: 'u' } } } });
-  await ingest.flushAll(true); // attempt 1
-  await ingest.flushAll(true); // attempt 2 → 保留
-  assert.equal(ingest.stats().retrying, 1);
-  await ingest.flushAll(true); // attempt 3 > maxAttempts → 丢弃
-  assert.equal(ingest.stats().retrying, 0);
-  assert.equal(ingest.stats().dropped, 1);
-});
-
-test('ingest: 超长文本截断；全局缓冲溢出丢最旧', async () => {
-  const sent = [];
-  const ingest = createMemoryIngest({
-    deliver: async (record) => { sent.push(record); },
-    windowMs: 60_000,
-    maxChars: 10,
-    maxBuffer: 3,
-  });
-  for (let i = 0; i < 5; i += 1) {
-    ingest.observeInbound({ sessionKey: `s${i}`, envelope: { message: { id: `m${i}`, text: `m${i}`, sender: { id: 'u' } } } });
+  try {
+    ss.start();
+    await new Promise((r) => setTimeout(r, 500)); // 恢复定时器到期 → 自动 save
+    assert.equal(delivered.length, 1);
+    assert.equal(delivered[0].sessionKey, 'qq:group:777');
+    assert.equal(delivered[0].messages.length, 1, '撕裂行跳过，有效行全部恢复');
+    assert.equal(delivered[0].messages[0].msgId, 'in:1');
+    assert.ok(fs.existsSync(file) === false, '恢复后 save 成功 → 文件清理');
+  } finally {
+    ss.stop();
   }
-  assert.ok(ingest.stats().dropped >= 2, '溢出丢弃');
-  ingest.observeInbound({ sessionKey: 'long', envelope: { message: { id: 'mx', text: 'x'.repeat(50), sender: { id: 'u' } } } });
-  await ingest.flushAll(true);
-  const truncated = sent.find((r) => r.text.startsWith('x'));
-  assert.equal(truncated.text.length, 11, '截断到 maxChars + 省略号');
 });
 
-test('ingest: deliver 同步抛错不打断主链路（收敛为 rejected promise 后进重试）', async () => {
-  const ingest = createMemoryIngest({
-    // 同步抛错的实现（旧代码直接在 observe 的调用栈里抛出，会把入站处理一起打断）。
-    deliver: () => { throw new Error('sync boom'); },
-    windowMs: 60_000,
-    maxAttempts: 1,
+test('ingest: 超长文本截断（maxChars/条）；observe 永不抛错、flushAll 等待在途 save', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ss-run-'));
+  const delivered = [];
+  const ss = createSessionSave({
+    deliver: async (payload) => delivered.push(payload),
+    bufferDir: dir, idleMs: 60_000, maxMessages: 500, maxChars: 200, maxMessageChars: 50,
   });
-  assert.doesNotThrow(() => {
-    ingest.observeInbound({ sessionKey: 's1', envelope: { message: { id: 'm1', text: '同步炸', sender: { id: 'u' } } } });
+  try {
+    ss.start();
+    ss.observeInbound(INBOUND('in:1', 'x'.repeat(120)));
+    await ss.closeSession(SESSION);
+    const record = delivered[0].messages[0];
+    assert.equal(record.text.length, 51, '单条截断到 maxMessageChars + 省略号');
+    assert.ok(record.text.endsWith('…'));
+  } finally {
+    ss.stop();
+  }
+});
+
+test('ingest: wake synthetic envelope - placeholder skipped, snapshot messages recorded (isSelf skipped / messageId dedupe / hash fallback)', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ss-run-'));
+  const delivered = [];
+  const ss = createSessionSave({
+    deliver: async (payload) => delivered.push(payload),
+    bufferDir: dir, idleMs: 60_000, maxMessages: 500, maxChars: 100_000,
   });
-  await assert.doesNotReject(() => ingest.flushAll(true));
-  assert.equal(ingest.stats().retrying, 1, '第一次失败进重试队列');
-  await ingest.flushAll(true);
-  assert.equal(ingest.stats().retrying, 0, '超过 maxAttempts 后丢弃');
-  assert.equal(ingest.stats().dropped, 1);
+  try {
+    ss.start();
+    const wakeEnvelope = {
+      sessionKey: SESSION,
+      envelope: {
+        message: { id: 'wake-1700000000-1', text: '(placeholder)', sender: { id: '0', name: 'wake-scheduler' } },
+        wake: { kind: 'new-message' },
+        receivedAt: 1_700_000_010_000,
+        snapshot: [
+          { messageId: 'msg-100', userId: '398102999', sender: 'xiaofeiyu', text: 'call me xiaofeiyu', at: '2026-11-18 23:48' },
+          { messageId: null, sender: 'xiaofeiyu', text: 'poke (no message id fallback entry)', userId: '398102999', at: '2026-11-18 23:49' },
+          { messageId: 'msg-102', userId: '398102999', sender: 'xiaofeiyu', text: '(sent by myself)', at: '2026-11-18 23:49', isSelf: true },
+        ],
+      },
+    };
+    ss.observeInbound(wakeEnvelope);
+    ss.observeInbound(wakeEnvelope);
+    await ss.closeSession(SESSION);
+    assert.equal(delivered.length, 1);
+    const { messages } = delivered[0];
+    assert.equal(messages.length, 2, 'placeholder skipped + isSelf skipped + duplicate snapshot deduped -> 2 user messages');
+    assert.equal(messages.every((m) => m.senderId === '398102999'), true, 'senderId is the real QQ id');
+    assert.equal(messages.every((m) => !String(m.msgId).startsWith('wake-')), true, 'placeholder id never recorded');
+    assert.equal(messages[0].msgId, 'qq:msg-100', 'native messageId preferred');
+    assert.equal(messages[1].msgId.startsWith('snap:'), true, 'entries without messageId fall back to content hash');
+    assert.equal(messages[1].msgId.length, 'snap:'.length + 16, 'hash truncated to 16 hex chars');
+    assert.equal(messages[0].name, 'xiaofeiyu', 'snapshot display name becomes name (alias source)');
+  } finally {
+    ss.stop();
+  }
 });

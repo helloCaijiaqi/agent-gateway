@@ -1,12 +1,17 @@
 /**
  * 会话注册表：(platform, kind, conversationId) → DSH sessionId 的唯一权威。
  *
- * fail-closed 规则（从 bridge 的教训继承，见 RULES「无本地工具」）：
- *   - preset 不在 DSH 可用清单时**拒绝建会话**，绝不回退 DSH 默认 preset——
- *     默认 preset（standard）带 bash/文件读写，挂到群聊会话等于把本地工具
- *     暴露给群里任何人。
- *   - DSH 侧会话已不存在（selectModel 返回 not-found）→ 退役本地映射并在
- *     本次调用内重建，否则每条消息都会对着幽灵会话重试。
+ * preset 选择（2026-11-16 起由**适配器登记声明**决定，registration.presets）：
+ *   - 适配器声明了该平台的 preset 且 DSH 清单里有 → 用它。
+ *   - 声明了但未安装 → 回退 DSH 内置 `minimal`。**绝不回退 `standard`**：
+ *     standard 带 bash/文件读写，挂到群聊会话等于把本地工具暴露给群里任何人；
+ *     minimal 没有这些能力，最坏情况只是「QQ 里出现一个不认识 QQ 的助手」。
+ *   - 未声明（或连 minimal 都没有）→ fail-closed 拒绝建会话，
+ *     而不是随便挑一个带本地工具的预设。
+ *   - 回退不是静默的：logger 打 `preset fallback:`，会话记录带 `presetFallback`。
+ *
+ * 另一条 fail-closed 规则：DSH 侧会话已不存在（selectModel 返回 not-found）→
+ * 退役本地映射并在本次调用内重建，否则每条消息都会对着幽灵会话重试。
  *
  * 状态持久化到 state/gateway/sessions.json：网关重启不能丢会话映射，
  * 否则每个灰度会话都会被重建一份（token 成本 + GUI 里一排重复会话）。
@@ -14,14 +19,73 @@
 import fs from 'node:fs';
 import path from 'node:path';
 
-export function createSessionRegistry({ dsh, chat, file, logger = () => {}, now = Date.now } = {}) {
+/**
+ * preset 探测的重试间隔（毫秒）。
+ *
+ * 为什么需要：DSH 重启后 3080 端口先监听、RPC 鉴权与路由后熟，这段窗口里
+ * `agentPresets.list` 会返回 401/纯文本 `unauthorized`（→ JSON 解析失败）。
+ * 实测一条入站消息正好落在窗口里就被 fail-closed 丢掉了（2026-11-16 17:26）。
+ * 两次重试 ≈ 1.6s，足够跨过这个窗口，又不会让真下线的 DSH 拖住太久。
+ */
+export const PRESET_PROBE_RETRY_DELAYS_MS = Object.freeze([400, 1200]);
+
+// 回退目标常量在 contracts（core/server 的回显与这里共用一份）；
+// re-export 保持旧导入路径可用（main.mjs 从这里解构）。
+import { FALLBACK_PRESET } from '../core/contracts.mjs';
+export { FALLBACK_PRESET };
+
+/**
+ * 「DSH 还没就绪」类错误：鉴权未就绪、返回非 JSON、连接被拒/挂断、5xx。
+ *
+ * 这类错误重试几次会自愈；而 schema 不匹配、权限拒绝之类重试多少次都没用，
+ * 必须立刻抛，别把一次配置错误拖成 2 秒的等待 + 同样的结论。
+ */
+export function isTransientProbeError(error) {
+  const message = String(error?.message ?? error);
+  return /unauthorized|not valid JSON|Unexpected token|ECONNREFUSED|ECONNRESET|ETIMEDOUT|EAI_AGAIN|socket hang up|fetch failed|\b50[234]\b/i
+    .test(message);
+}
+
+/** 带错误码的 Error：turn-runner 的 classifyError 会原样采用。 */
+function codedError(code, message, cause) {
+  const error = new Error(`${code}: ${message}`);
+  error.code = code;
+  if (cause !== undefined) error.cause = cause;
+  return error;
+}
+
+/** 可中断的等待（signal abort 时立即返回，避免超时后又白等）。 */
+function sleepFor(ms, signal) {
+  return new Promise((resolve) => {
+    if (signal?.aborted) {
+      resolve();
+      return;
+    }
+    const timer = setTimeout(resolve, ms);
+    if (typeof timer?.unref === 'function') timer.unref();
+    signal?.addEventListener?.('abort', () => {
+      clearTimeout(timer);
+      resolve();
+    }, { once: true });
+  });
+}
+
+/**
+ * @param {object} options
+ * @param {(consumerId: string|null) => (Record<string,string>|null)} [options.presetsFor]
+ *        适配器声明的「平台→preset」查询器（来自登记文件 `presets` 字段）。
+ *        没声明就不建会话——网关不猜平台该用哪个人设。
+ */
+export function createSessionRegistry({
+  dsh, chat, file, logger = () => {}, now = Date.now, presetsFor = null,
+} = {}) {
   /** @type {Map<string, {sessionId: string, generation: number, preset: string, createdAt: number}>} */
   const sessions = new Map();
   /** @type {Map<string, Promise<string>>} 进行中的创建，防并发重复建 */
   const creating = new Map();
   let presetIds = null; // null = 未探测
   let presetProbedAt = 0;
-  // 清单缓存 TTL：setup-dsh.mjs 装完 preset 后，网关一分钟内即可感知，
+  // 清单缓存 TTL：在 DSH 侧装/换 preset 后，网关一分钟内即可感知，
   // 又不至于每个 turn 都打一次 agentPresets.list。
   const PRESET_CACHE_TTL_MS = 60_000;
   let generation = 0;
@@ -60,16 +124,33 @@ export function createSessionRegistry({ dsh, chat, file, logger = () => {}, now 
 
   async function ensurePresetAllowed(signal) {
     if (presetIds !== null && now() - presetProbedAt < PRESET_CACHE_TTL_MS) return presetIds;
-    try {
-      presetIds = await dsh.listPresets(signal);
-      presetProbedAt = now();
-    } catch (error) {
-      // 探测失败 ≠ preset 不存在：DSH 暂时不可用时不该永久拒绝，
-      // 置回 null 让下一次 turn 再试。
-      presetIds = null;
-      throw new Error(`无法确认 DSH preset 清单（fail-closed）：${error?.message ?? error}`);
+    let lastError = null;
+    for (let attempt = 0; attempt <= PRESET_PROBE_RETRY_DELAYS_MS.length; attempt += 1) {
+      try {
+        presetIds = await dsh.listPresets(signal);
+        presetProbedAt = now();
+        return presetIds;
+      } catch (error) {
+        lastError = error;
+        // 不可自愈的错误立刻抛：重试只会把一次配置错误拖成两秒的等待。
+        if (!isTransientProbeError(error)) {
+          presetIds = null;
+          throw codedError('E_PRESET_UNKNOWN',
+            `无法确认 DSH preset 清单（fail-closed）：${error?.message ?? error}`, error);
+        }
+        const delay = PRESET_PROBE_RETRY_DELAYS_MS[attempt];
+        if (delay === undefined) break;
+        logger(`preset probe retry ${attempt + 1}/${PRESET_PROBE_RETRY_DELAYS_MS.length}`
+          + ` in ${delay}ms: ${error?.message ?? error}`);
+        await sleepFor(delay, signal);
+      }
     }
-    return presetIds;
+    // 重试用尽仍是「未就绪」类错误：探测失败 ≠ preset 不存在，置回 null 让下一个 turn 再试，
+    // 但这一条要给出可操作的信息（重发即可），而不是一句笼统的 fail-closed。
+    presetIds = null;
+    throw codedError('E_DSH_NOT_READY',
+      `DSH 未就绪，无法确认 preset 清单（已重试 ${PRESET_PROBE_RETRY_DELAYS_MS.length} 次）：`
+      + `${lastError?.message ?? lastError}。请稍后重发这条消息。`, lastError);
   }
 
   async function applyModel(sessionId, signal) {
@@ -90,14 +171,52 @@ export function createSessionRegistry({ dsh, chat, file, logger = () => {}, now 
     return 'failed';
   }
 
+  /** 会话键的结构知识：`<platform>:<consumerId?>:<kind>:<id>`——只是键格式，不是平台映射表。 */
+  function keyParts(sessionKey) {
+    const parts = String(sessionKey ?? '').split(':');
+    return { platform: parts[0] || null, consumerId: parts.length === 4 ? parts[1] : null };
+  }
+
+  /**
+   * 从适配器声明里取 preset（唯一来源，2026-11-16 起）。
+   * @returns {{platform: string|null, preset: string|null, declared: boolean}}
+   */
+  function declaredPreset(sessionKey) {
+    const { platform, consumerId } = keyParts(sessionKey);
+    const table = typeof presetsFor === 'function' ? presetsFor({ platform, consumerId }) : null;
+    const preset = table && typeof table[platform] === 'string' ? table[platform] : null;
+    return { platform, preset, declared: Boolean(preset) };
+  }
+
   async function create(sessionKey, signal) {
-    const preset = chat.preset;
+    const { platform, preset: declared, declared: hasDeclaration } = declaredPreset(sessionKey);
+    // 未声明也照建（2026-11-17 拍板）：「没有预设就用 DSH 默认的最小预设」。
+    // minimal 无人格、无本地工具，最坏情况只是「群里出现一个不认识 QQ 的助手」，
+    // 比拒聊（旧 E_PRESET_UNDECLARED）友好；想换人设随时在控制台补声明。
     const ids = await ensurePresetAllowed(signal);
-    if (!ids.includes(preset)) {
-      throw new Error(
-        `拒绝为 ${sessionKey} 创建会话：preset "${preset}" 不在 DSH 可用清单（${ids.join(', ') || '未知'}）。`
-        + '回退默认 preset 会把本地工具暴露给群聊；请先运行 qq-bridge 的 node scripts/setup-dsh.mjs。',
-      );
+    // minimal 是一切回退的底座：它都不在清单里说明 DSH 环境坏了，照建只会
+    // 在 createSession 时炸出更难懂的报错。
+    if (!ids.includes(FALLBACK_PRESET)) {
+      throw codedError('E_PRESET_MISSING',
+        `回退 preset "${FALLBACK_PRESET}" 不在 DSH 清单（${ids.join(', ') || '未知'}）；`
+        + '请先在 DSH 侧装好内置预设后重启 DSH');
+    }
+    let preset;
+    let fallback = false;
+    let reason;
+    if (hasDeclaration) {
+      preset = declared;
+      reason = 'declared';
+      if (!ids.includes(declared)) {
+        preset = FALLBACK_PRESET;
+        fallback = true;
+        reason = 'not-installed';
+        logger(`preset fallback: ${sessionKey} platform=${platform} reason=not-installed`
+          + ` 期望=${declared} 实际=${preset}（该预设无人格/无本地工具；装好预设或重启 DSH 后自动恢复）`);
+      }
+    } else {
+      preset = FALLBACK_PRESET;
+      reason = 'default';
     }
     const workspaceId = await dsh.ensureWorkspace(chat.workspaceDir, signal);
     const sessionId = await dsh.createSession({ workspaceId, agentPreset: preset }, signal);
@@ -110,10 +229,12 @@ export function createSessionRegistry({ dsh, chat, file, logger = () => {}, now 
     }
     generation += 1;
     sessions.set(sessionKey, {
-      sessionId, generation, preset, createdAt: now(),
+      sessionId, generation, preset, presetDeclared: hasDeclaration ? declared : null,
+      presetFallback: fallback, presetReason: reason, createdAt: now(),
     });
     persist();
-    logger(`session created: ${sessionKey} -> ${sessionId} (preset=${preset}, model=${chat.provider}/${chat.model})`);
+    logger(`session created: ${sessionKey} -> ${sessionId}`
+      + ` (preset=${preset}${fallback ? ', fallback' : ''}, model=${chat.provider}/${chat.model})`);
     return sessionId;
   }
 
@@ -121,12 +242,42 @@ export function createSessionRegistry({ dsh, chat, file, logger = () => {}, now 
     async getOrCreate(sessionKey, signal) {
       const existing = sessions.get(sessionKey);
       if (existing) {
+        // 声明变更（控制台改了该消费端的 preset）→ 旧会话绑着旧人设，直接退役
+        // 重建。比较的是「声明值」而非最终绑定：声明 qq-chat 但未安装时的回退
+        // 会话（preset=minimal）不能每轮都重建，否则限流会被重建风暴吃光。
+        const { preset: declaredNow, declared: hasDeclaration } = declaredPreset(sessionKey);
+        const declaredNowValue = hasDeclaration ? declaredNow : null;
+        if ((existing.presetDeclared ?? null) !== declaredNowValue) {
+          logger(`session ${sessionKey} 的 preset 声明已变更`
+            + `（${existing.presetDeclared ?? '(未声明)'} -> ${declaredNowValue ?? '(未声明)'}），退役重建`);
+          sessions.delete(sessionKey);
+          persist();
+          return this.getOrCreate(sessionKey, signal);
+        }
+        // 预设被移除/改名时（qq-chat-v2 → qq-chat 就是这种情况），DSH 侧旧会话仍绑着
+        // 已不存在的 preset，resume 会直接失败（实测报 Unknown agent preset）。
+        // 这里先比对清单：绑定的 preset 不在清单里就退役重建，而不是每轮都失败。
+        if (existing.preset) {
+          const ids = await ensurePresetAllowed(signal);
+          if (!ids.includes(existing.preset)) {
+            logger(`session ${sessionKey} 绑定的 preset "${existing.preset}" 已不在 DSH 清单，退役重建`);
+            sessions.delete(sessionKey);
+            persist();
+            return this.getOrCreate(sessionKey, signal);
+          }
+        }
         const applied = await applyModel(existing.sessionId, signal);
         if (applied === 'not-found') {
           logger(`session ${sessionKey} 已在 DSH 侧消失，退役重建`);
           sessions.delete(sessionKey);
           persist();
         } else {
+          // 必须重新 follow：进程重启后 registry 从磁盘恢复会话映射，但 mux 的
+          // 事件订阅是进程内的（_desiredFollows 为空）。不复follow 就没有
+          // session/follow 流 → 回合在 DSH 里跑完也发不出结束帧 →
+          // awaitTurn 静默等到超时（实测：DSH 会话文件已写入，网关日志一片空白）。
+          // follow 幂等：已在 _desiredFollows 里时不会重复开流。
+          dsh.follow(existing.sessionId);
           return existing.sessionId;
         }
       }
@@ -147,6 +298,22 @@ export function createSessionRegistry({ dsh, chat, file, logger = () => {}, now 
       return record.sessionId;
     },
 
+    /**
+     * 全部退役（2026-11-20 角色卡切换联动）：清空整张会话映射并落盘——
+     * 下一个回合每个 sessionKey 都会开全新 DSH 会话。切角色时 system 内容
+     * 突变，旧会话历史与新人格矛盾（精神分裂），必须整体重建。
+     * @returns {number} 退役的会话数（0 = 本来就没有活跃映射）。
+     */
+    retireAll() {
+      const count = sessions.size;
+      if (count > 0) {
+        sessions.clear();
+        persist();
+        logger(`session-registry: retired all ${count} session(s)`);
+      }
+      return count;
+    },
+
     get(sessionKey) { return sessions.get(sessionKey) ?? null; },
     get size() { return sessions.size; },
     get sessionIdSet() { return new Set([...sessions.values()].map((r) => r.sessionId)); },
@@ -157,6 +324,11 @@ export function createSessionRegistry({ dsh, chat, file, logger = () => {}, now 
         sessionKey: key,
         sessionId: record.sessionId,
         preset: record.preset,
+        // 回退标记：控制台一眼能看出「这条会话没跑人设」，排障不用翻日志。
+        presetFallback: record.presetFallback === true,
+        presetReason: record.presetReason ?? null,
+        // 声明值（null=消费端没声明，走 minimal 默认）；控制台排障用。
+        presetDeclared: record.presetDeclared ?? null,
         createdAt: record.createdAt,
         generation: record.generation,
       }));

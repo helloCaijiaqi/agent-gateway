@@ -1,6 +1,7 @@
 // 会话纪元 block 缓存专项（§6.4）：同 epoch 不重发、epoch 变更重发、多 subject
 // 各自去重、无 senderId 退化为会话级、LRU 淘汰后重发幂等、join 规则同样去重、
-// 无 epoch 的旧服务响应不受影响。全部离线：registry 用假实现。
+// 无 epoch 的旧服务响应不受影响。全部离线：registry 用假实现（tool.call 信封——
+// decorator 结果装在 toolResult.data 里）。
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
@@ -10,27 +11,31 @@ const ENVELOPE_U1 = { message: { id: 'm1', text: 'hi', sender: { id: 'u1', name:
 const ENVELOPE_U2 = { message: { id: 'm2', text: 'hi', sender: { id: 'u2', name: '李四' } } };
 
 const IDENTITY_BLOCKS = [
-  { name: '画像', kind: 'identity', text: '【画像】\n- 性格：温和' },
-  { name: '关系', kind: 'identity', text: '【关系】\n- 称呼：老王' },
-  { name: '长期记忆', kind: 'long', text: '【长期记忆】\n- 喜欢火锅' },
+  { name: '画像', text: '【画像】\n- 性格：温和' },
+  { name: '关系', text: '【关系】\n- 称呼：老王' },
+  { name: '长期记忆', text: '【长期记忆】\n- 喜欢火锅' },
 ];
 
-/** 假 registry：一个装饰器服务 chat_memory_recall，返回由用例注入的构造结果。 */
+/** 假 registry：一个 decorator 工具 chat_memory_recall，返回由用例注入的构造结果。 */
 function makeRegistry(responder) {
   let n = 0;
   const calls = [];
   return {
     calls,
     resolveService: (name) => (name === 'chat_memory_recall'
-      ? { id: 'chat_memory_recall', kind: 'decorator', transport: 'ws' }
+      ? { id: 'chat_memory_recall', kind: 'resource', transport: 'ws' }
       : null),
-    resolveToolStep: () => null,
+    resolveToolStep: (name) => (name === 'chat_memory_recall'
+      ? { service: { id: 'chat_memory_recall', kind: 'resource', transport: 'ws' }, kind: 'resource', tool: { name, role: 'decorator' } }
+      : null),
     pipelineFor: () => ['chat_memory_recall'],
     pipelineForReturn: () => (responder?.returnPipeline ? ['chat_memory_recall'] : []),
-    async callService(id, request) {
+    async callServiceTool(id, request) {
       n += 1;
       calls.push(request);
-      return responder.call(request, n);
+      // tool.call 契约：decorator 结果装在 data 里（旧 service.call 的顶层
+      // verdict/epoch/sections 形状已随信封下线）。
+      return { ok: true, data: responder.call(request, n) };
     },
     pipelineKeys: () => [],
     returnPipelineKeys: () => [],
@@ -38,7 +43,7 @@ function makeRegistry(responder) {
 }
 
 test('block cache：同 epoch 的后续轮次不重发（首轮全注入，之后 sections 为空）', async () => {
-  const registry = makeRegistry({ call: () => ({ verdict: 'pass', epoch: 1, sections: IDENTITY_BLOCKS }) });
+  const registry = makeRegistry({ call: () => ({ epoch: 1, sections: IDENTITY_BLOCKS }) });
   const pipeline = createPipeline({ registry, budgetChars: 6000 });
   const input = { consumerId: 'qq-main', sessionKey: 'qq:group:1', text: 'hi', envelope: ENVELOPE_U1 };
 
@@ -54,7 +59,7 @@ test('block cache：同 epoch 的后续轮次不重发（首轮全注入，之�
 
 test('block cache：epoch 推进（静默失活 → 新会话）后全量重发', async () => {
   let epoch = 1;
-  const registry = makeRegistry({ call: () => ({ verdict: 'pass', epoch, sections: IDENTITY_BLOCKS }) });
+  const registry = makeRegistry({ call: () => ({ epoch, sections: IDENTITY_BLOCKS }) });
   const pipeline = createPipeline({ registry, budgetChars: 6000 });
   const input = { consumerId: 'qq-main', sessionKey: 'qq:group:1', text: 'hi', envelope: ENVELOPE_U1 };
 
@@ -67,7 +72,7 @@ test('block cache：epoch 推进（静默失活 → 新会话）后全量重发'
 });
 
 test('block cache：多 subject 各自去重（群聊每人的 identity 独立）', async () => {
-  const registry = makeRegistry({ call: () => ({ verdict: 'pass', epoch: 1, sections: IDENTITY_BLOCKS }) });
+  const registry = makeRegistry({ call: () => ({ epoch: 1, sections: IDENTITY_BLOCKS }) });
   const pipeline = createPipeline({ registry, budgetChars: 6000 });
 
   await pipeline.runForward({ consumerId: 'qq-main', sessionKey: 'qq:group:1', text: 'hi', envelope: ENVELOPE_U1 });
@@ -81,7 +86,7 @@ test('block cache：多 subject 各自去重（群聊每人的 identity 独立�
 });
 
 test('block cache：无 senderId 退化为会话级（subject 键为空串）', async () => {
-  const registry = makeRegistry({ call: () => ({ verdict: 'pass', epoch: 1, sections: IDENTITY_BLOCKS }) });
+  const registry = makeRegistry({ call: () => ({ epoch: 1, sections: IDENTITY_BLOCKS }) });
   const pipeline = createPipeline({ registry, budgetChars: 6000 });
   const input = { consumerId: 'qq-main', sessionKey: 'qq:friend:1', text: 'hi', envelope: { message: { id: 'm', text: 'hi' } } };
 
@@ -89,20 +94,20 @@ test('block cache：无 senderId 退化为会话级（subject 键为空串）', 
   assert.equal((await pipeline.runForward({ ...input })).sections.length, 0);
 });
 
-test('block cache：senderId 透传给服务（请求体带 senderId）', async () => {
-  const registry = makeRegistry({ call: () => ({ verdict: 'pass', epoch: 1, sections: IDENTITY_BLOCKS }) });
+test('block cache：senderId 透传给服务（context.senderId；出站缺省不带字段）', async () => {
+  const registry = makeRegistry({ call: () => ({ epoch: 1, sections: IDENTITY_BLOCKS }) });
   const pipeline = createPipeline({ registry, budgetChars: 6000 });
   await pipeline.runForward({ consumerId: 'qq-main', sessionKey: 'qq:group:1', text: 'hi', envelope: ENVELOPE_U1 });
-  assert.equal(registry.calls[0].senderId, 'u1');
+  assert.equal(registry.calls[0].context.senderId, 'u1');
 
   const noSender = makeRegistry({ call: () => ({ verdict: 'pass', epoch: 1, sections: [] }) });
   const p2 = createPipeline({ registry: noSender, budgetChars: 6000 });
   await p2.runForward({ consumerId: 'qq-main', sessionKey: 'qq:friend:1', text: 'hi', envelope: { message: { id: 'm', text: 'hi' } } });
-  assert.equal(noSender.calls[0].senderId, '', '无发送者 = 空串（会话级）');
+  assert.equal('senderId' in noSender.calls[0].context, false, '无发送者 = context.senderId 缺省（会话级）');
 });
 
 test('block cache：LRU 淘汰后重发幂等（超 256 会话，最旧被重注入）', async () => {
-  const registry = makeRegistry({ call: () => ({ verdict: 'pass', epoch: 1, sections: IDENTITY_BLOCKS }) });
+  const registry = makeRegistry({ call: () => ({ epoch: 1, sections: IDENTITY_BLOCKS }) });
   const pipeline = createPipeline({ registry, budgetChars: 6000 });
   // 257 个会话各注入一次 → 第一个会话的缓存条目被淘汰。
   for (let i = 0; i < 257; i += 1) {
@@ -129,7 +134,7 @@ test('block cache：join 规则路径同样去重；无 epoch 的旧服务响应
   };
   // 供料型规则对象：join 词典是 prefix/suffix/regex/function（entryShape）。
   const joinRegistry = {
-    ...makeRegistry({ call: () => ({ verdict: 'pass', epoch, sections: IDENTITY_BLOCKS }) }),
+    ...makeRegistry({ call: () => ({ epoch, sections: IDENTITY_BLOCKS }) }),
     pipelineFor: () => [{ step: 'chat_memory_recall', join: 'prefix' }],
   };
   const joinPipeline = createPipeline({ registry: joinRegistry, budgetChars: 6000 });
@@ -140,7 +145,7 @@ test('block cache：join 规则路径同样去重；无 epoch 的旧服务响应
   assert.equal(joinedSecond.text, 'hi', '同 epoch 第二轮 join 不再拼接');
 
   // 旧服务（无 epoch 字段）：行为与从前完全一致（不去重、每轮都收集）。
-  const legacy = makeRegistry({ call: () => ({ verdict: 'pass', sections: [{ name: '记忆', text: '【记忆】\n- 旧格式' }] }) });
+  const legacy = makeRegistry({ call: () => ({ sections: [{ name: '记忆', text: '【记忆】\n- 旧格式' }] }) });
   const legacyPipeline = createPipeline({ registry: legacy, budgetChars: 6000 });
   const l1 = await legacyPipeline.runForward({ consumerId: 'qq-main', sessionKey: 's', text: 'hi', envelope: ENVELOPE_U1 });
   const l2 = await legacyPipeline.runForward({ consumerId: 'qq-main', sessionKey: 's', text: 'hi', envelope: ENVELOPE_U1 });

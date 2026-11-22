@@ -3,3 +3,11 @@ state/
 *.log
 .playwright-cli/
 .codebuddy/
+.env
+*.secret
+
+# 设计/评审文档只留本地，不上传远端仓库
+docs/
+
+# 本机调试产物：浏览器控制台快照
+login-snap.yaml

@@ -16,7 +16,8 @@
  * 「每个 chat_* 工具都带 turnToken 参数」——与 bridge 的 agentToken 同模式。
  *
  * 签名：与适配器同一 HMAC 格式（ts \n nonce \n sha256(body)），
- * adapterId 固定 'mcp-bus'，共享密钥 GATEWAY_MCP_TOKEN。
+ * adapterId 固定 'mcp-bus'，共享密钥文件单源 state/gateway/mcp-bus.secret
+ * （网关侧读同一份；本壳经 DSH 条目的 --token-file 读取，env 通道已退役）。
  */
 import readline from 'node:readline';
 import fs from 'node:fs';
@@ -68,7 +69,9 @@ export function withTurnToken(tool) {
 
 export function createMcpBus({ gatewayUrl, secret, requestTimeoutMs = REQUEST_TIMEOUT_MS, logger = () => {} } = {}) {
   const baseUrl = String(gatewayUrl ?? process.env.GATEWAY_URL ?? 'http://127.0.0.1:7190').replace(/\/+$/, '');
-  const sharedSecret = String(secret ?? process.env.GATEWAY_MCP_TOKEN ?? '');
+  // 密钥只经参数注入（CLI --token-file 读文件后传入）；不再有 env 兜底——
+  // 文件单源，env 通道已退役（网关侧读到 GATEWAY_MCP_* env 键即拒载）。
+  const sharedSecret = String(secret ?? '');
   const http = createHttpClient({
     baseUrl,
     timeoutMs: requestTimeoutMs,
@@ -166,20 +169,31 @@ export function createMcpBus({ gatewayUrl, secret, requestTimeoutMs = REQUEST_TI
 
 /** CLI 入口：stdin 逐行读 JSON-RPC，stdout 逐行写响应。 */
 export async function main() {
-  // 配置来源：命令行（dsh-mcp-client 的 args 字段，setup-dsh.mjs 写入）优先，
-  // 环境变量兜底——dsh-mcp-client 不保证透传环境变量，args 是可靠通道。
+  // 配置来源：命令行（dsh-mcp-client 的 args 字段，npm run setup:dsh 写入）——
+  // --token-file 指向 state/gateway/mcp-bus.secret（文件单源，env 通道已退役）。
   const argValue = (name) => {
     const index = process.argv.indexOf(name);
     return index >= 0 ? process.argv[index + 1] : undefined;
   };
+  // env 通道 fail-closed：这些键已整体退役，设了直接报错给迁移文案
+  // （与网关侧 config.mjs 同口径），避免“改了却不生效”。
+  const retiredEnvKeys = ['GATEWAY_MCP_TOKEN', 'GATEWAY_MCP_TOKEN_FILE', 'GATEWAY_MCP_BUS_TOKEN', 'GATEWAY_MCP_BUS_TOKEN_FILE']
+    .filter((key) => process.env[key] !== undefined && String(process.env[key]).trim() !== '');
+  if (retiredEnvKeys.length > 0) {
+    console.error(
+      `[mcp-bus] ${retiredEnvKeys.join('/')} retired — the shared secret now lives ONLY in `
+        + 'state/gateway/mcp-bus.secret; pass --token-file <path> (npm run setup:dsh writes it into the DSH entry).',
+    );
+    process.exit(1);
+  }
   const gatewayUrl = argValue('--gateway-url') ?? process.env.GATEWAY_URL;
-  const tokenFile = argValue('--token-file') ?? process.env.GATEWAY_MCP_TOKEN_FILE;
-  let secret = process.env.GATEWAY_MCP_TOKEN ?? '';
-  if (!secret && tokenFile) {
+  const tokenFile = argValue('--token-file');
+  let secret = '';
+  if (tokenFile) {
     try { secret = fs.readFileSync(tokenFile, 'utf8').trim(); } catch { /* 下面统一报错 */ }
   }
   if (!secret || secret.length < 16) {
-    console.error('[mcp-bus] shared token missing or too short (>=16 chars); pass --token-file <path> or GATEWAY_MCP_TOKEN');
+    console.error(`[mcp-bus] shared token missing or too short (>=16 chars); pass --token-file <path> (default: state/gateway/mcp-bus.secret, run "npm run env:init")`);
     process.exit(1);
   }
   const bus = createMcpBus({ gatewayUrl, secret, logger: (line) => console.error(`[mcp-bus] ${line}`) });

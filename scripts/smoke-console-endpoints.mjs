@@ -12,9 +12,11 @@ import path from 'node:path';
 
 const { loadConfig } = await import(new URL('../src/core/config.mjs', import.meta.url).href);
 const { createGatewayServer } = await import(new URL('../src/core/server.mjs', import.meta.url).href);
+const { seedConsumer, seedOperatorToken, createConsumerRegistry } = await import(
+  new URL('./support/consumer-registration.mjs', import.meta.url).href
+);
 const { createTokenLedger } = await import(new URL('../src/core/usage-ledger.mjs', import.meta.url).href);
 const { createDshGateway } = await import(new URL('../src/runtime/dsh-gateway.mjs', import.meta.url).href);
-const presetFiles = await import(new URL('../src/runtime/preset-files.mjs', import.meta.url).href);
 
 const TOKEN = 'smoke-operator-token-0123456789';
 
@@ -39,10 +41,8 @@ ${PERSONA_BODY.split('\n').map((l) => `      ${l}`).join('\n')}
 const dshHome = mkdtempSync(path.join(os.tmpdir(), 'smoke-dsh-home-'));
 const stateDir = mkdtempSync(path.join(os.tmpdir(), 'smoke-state-'));
 process.env.DSH_HOME = dshHome;
-fs.mkdirSync(path.join(dshHome, 'agent-presets', 'qq-chat-v2'), { recursive: true });
-fs.writeFileSync(path.join(dshHome, 'agent-presets', 'qq-chat-v2', 'agent.cordis.yml'), FIXTURE_YAML, 'utf8');
 
-// ── runtime：真账本 + 真 pending + 真 preset-files；活 DSH 调用 stub ─────────
+// ── runtime：真账本 + 真 pending；活 DSH 调用 stub ─────────
 const ledger = createTokenLedger({ file: path.join(stateDir, 'usage-ledger.jsonl'), logger: () => {} });
 ledger.ingestTurn({
   sessionKey: 'qq:group:42', turnId: 'smoke-turn-1', usage: {
@@ -59,11 +59,14 @@ fakeDsh.emit({ type: 'question/requested', eventId: 'q-2', sessionId: 's-ghost',
 
 const runtime = {
   consoleDsh: {
-    presetsList: async () => ['qq-chat-v2', 'standard'],
+    presetsList: async () => ['qq-chat', 'minimal', 'standard'],
     modelCatalog: async () => { throw new Error('smoke: DSH down (fallback expected)'); },
-    chat: { provider: 'deepseek', model: 'deepseek-chat', reasoningEffort: 'max', preset: 'qq-chat-v2' },
+    chat: { provider: 'deepseek', model: 'deepseek-chat', reasoningEffort: 'max' },
     registry: {
-      list: () => [{ sessionKey: 'qq:group:42', sessionId: 's-1', preset: 'qq-chat-v2', createdAt: 1, generation: 1 }],
+      list: () => [{
+        sessionKey: 'qq:group:42', sessionId: 's-1', preset: 'qq-chat',
+        presetFallback: false, presetReason: 'ok', createdAt: 1, generation: 1,
+      }],
       sessionKeyOf: (id) => (id === 's-1' ? 'qq:group:42' : null),
     },
     fallbackEfforts: ['low', 'high', 'max'],
@@ -72,7 +75,6 @@ const runtime = {
       fs.writeFileSync(path.join(stateDir, 'model-overlay.json'), JSON.stringify(next), 'utf8');
     },
   },
-  presetFiles,
   pending: {
     list: (filter) => dshGateway.listPending(filter),
     capacity: 100,
@@ -81,20 +83,23 @@ const runtime = {
   usageLedger: ledger,
 };
 
+// 消费端身份只认登记目录（env 三元组 / adapters.json 已退役）。
+seedConsumer(stateDir, { id: 'qq-main', platform: 'qq', secret: 'adapter-secret-0123456789' });
+// 控制台凭据文件单源（env 通道已退役）。
+seedOperatorToken(stateDir, TOKEN);
 const config = loadConfig({
   env: {
-    GATEWAY_MODE: 'shadow', GATEWAY_CONSOLE: 'on',
-    GATEWAY_OPERATOR_TOKEN: TOKEN, GATEWAY_PORT: '0',
+    GATEWAY_MODE: 'shadow', GATEWAY_CONSOLE: 'on', GATEWAY_PORT: '0',
   },
-  adapters: [{ id: 'qq-main', platform: 'qq', secret: 'adapter-secret-0123456789' }],
   stateDir,
 });
-const gateway = createGatewayServer({ config, logger: () => {}, runtime });
+const gateway = createGatewayServer({
+  config, logger: () => {}, runtime, services: createConsumerRegistry({ stateDir }),
+});
 await gateway.listen();
 const base = `http://127.0.0.1:${gateway.server.address().port}`;
 
 // ── 探测表 ────────────────────────────────────────────────────────────────────
-const simPrompt = presetFiles.readSimPrompt('qq-chat-v2');
 const auth = { 'x-operator-token': TOKEN };
 const json = { 'content-type': 'application/json' };
 
@@ -103,9 +108,6 @@ const PROBES = [
   ['auth: token 自检', { method: 'GET', path: '/v1/console/session', headers: auth }, 200],
   ['auth: 登录换 Cookie', { method: 'POST', path: '/v1/console/session', headers: json, body: { token: TOKEN } }, 200],
   ['presets: 清单', { method: 'GET', path: '/v1/console/dsh/presets', headers: auth }, 200],
-  ['presets: sim-prompt 读', { method: 'GET', path: '/v1/console/dsh/presets/qq-chat-v2/sim-prompt', headers: auth }, 200],
-  ['presets: 备份列表', { method: 'GET', path: '/v1/console/dsh/presets/qq-chat-v2/sim-prompt/backups', headers: auth }, 200],
-  ['presets: sim-prompt 写（未变不落盘）', { method: 'PUT', path: '/v1/console/dsh/presets/qq-chat-v2/sim-prompt', headers: { ...auth, ...json }, body: { content: simPrompt.content } }, 200],
   ['sessions: 模型目录（DSH down → fallback）', { method: 'GET', path: '/v1/console/dsh/model', headers: auth }, 200],
   ['sessions: 模型设置', { method: 'PUT', path: '/v1/console/dsh/model', headers: { ...auth, ...json }, body: { model: 'deepseek-reasoner', reasoningEffort: 'high' } }, 200],
   ['sessions: 会话列表', { method: 'GET', path: '/v1/console/dsh/sessions', headers: auth }, 200],

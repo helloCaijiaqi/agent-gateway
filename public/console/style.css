@@ -47,6 +47,12 @@ code {
   position: sticky;
   top: 0;
   height: 100vh;
+  /* 错位根因修复（2026-11-21）：aside 同时挂着 Bootstrap 的 .nav 类，其自带的
+   * flex-wrap: wrap 在 flex-column 方向生效——视口偏矮（内容高度超过 100vh，
+   * 100% 缩放的矮窗口正落在临界区）时开关块被「换列」甩到第二列顶部，叠在
+   * brand 区。列布局必须禁换行；内容超高时让侧边栏自己滚动。 */
+  flex-wrap: nowrap;
+  overflow-y: auto;
   background: linear-gradient(180deg, rgba(26, 37, 64, 0.85), rgba(17, 26, 46, 0.92));
   border-right: 1px solid var(--bs-border-color);
   backdrop-filter: blur(8px);
@@ -183,3 +189,78 @@ svg.chart rect { transition: fill 0.15s; }
 #preset-content { min-height: 320px; }
 
 .hidden { display: none !important; }
+
+/* ── GATEWAY_DATA_PLANE 滑动开关 ─────────────────────────────────────────
+ * 结构：视觉化 input（透明覆盖层）+ label 轨道/滑块 + 右侧状态文案。
+ * input 保持可聚焦可点击（键盘 Space 可切），轨道与滑块用 ::after 画，
+ * 勾选态把滑块从左侧平移到右侧，带过渡动画。
+ */
+.gw-switch {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.55em;
+  user-select: none;
+}
+.mode-switch-hint {
+  margin: 0.4em 0 0;
+  font-size: 11px;
+  line-height: 1.45;
+  color: var(--bs-secondary-color);
+  word-break: break-word;
+}
+.gw-switch-input {
+  position: absolute;
+  left: 0;
+  top: 50%;
+  width: 3em;
+  height: 1.6em;
+  margin: 0;
+  transform: translateY(-50%);
+  opacity: 0;
+  cursor: pointer;
+  z-index: 1;
+}
+.gw-switch-track {
+  position: relative;
+  flex: 0 0 auto;
+  width: 3em;
+  height: 1.6em;
+  margin: 0;
+  border-radius: 999px;
+  background: #2a3a5c;
+  border: 1px solid rgba(96, 165, 250, 0.28);
+  transition: background-color 0.18s ease, border-color 0.18s ease;
+  cursor: pointer;
+}
+.gw-switch-track::after {
+  content: "";
+  position: absolute;
+  top: 50%;
+  left: 0.18em;
+  width: 1.16em;
+  height: 1.16em;
+  border-radius: 50%;
+  background: #fff;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.45);
+  transform: translateY(-50%);
+  transition: transform 0.18s ease;
+}
+.gw-switch-input:checked + .gw-switch-track {
+  background: #22c55e;
+  border-color: #22c55e;
+}
+.gw-switch-input:checked + .gw-switch-track::after {
+  transform: translate(1.42em, -50%);
+}
+.gw-switch-input:focus-visible + .gw-switch-track {
+  outline: 2px solid var(--bs-primary);
+  outline-offset: 2px;
+}
+.gw-switch-input:disabled {
+  cursor: not-allowed;
+}
+.gw-switch-input:disabled + .gw-switch-track {
+  opacity: 0.5;
+  cursor: not-allowed;
+}

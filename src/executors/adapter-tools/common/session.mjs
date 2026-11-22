@@ -1,20 +1,21 @@
 /**
- * 会话定位（装配机器）：sessionKey 是 `platform:kind:conversationId`
- * （contracts.sessionKeyOf 的格式）。tool 调用的 ctx 没有 target——会话身份
+ * 会话定位（装配机器）：sessionKey 是 `platform:kind:conversationId`（3 段，旧）
+ * 或 `platform:consumerId:kind:conversationId`（4 段，多消费端收编——会话绑消费
+ * 端，contracts.sessionKeyOf 的格式）。tool 调用的 ctx 没有 target——会话身份
  * 只能从这里派生，模型不需要（也不应该）复述会话标识（tool-host 的设计前提）。
  */
 
 /** 解析 sessionKey；坏格式返回 null，由调用方决定失败语义（绝不猜）。 */
 export function parseSessionKey(sessionKey) {
   const raw = String(sessionKey ?? '');
-  const first = raw.indexOf(':');
-  const second = raw.indexOf(':', first + 1);
-  if (first <= 0 || second <= first + 1 || second >= raw.length - 1) return null;
-  return {
-    platform: raw.slice(0, first),
-    kind: raw.slice(first + 1, second),
-    conversationId: raw.slice(second + 1),
-  };
+  const parts = raw.split(':');
+  if (parts.length === 3 && parts.every((part) => part.length > 0)) {
+    return { platform: parts[0], consumerId: null, kind: parts[1], conversationId: parts[2] };
+  }
+  if (parts.length === 4 && parts.every((part) => part.length > 0)) {
+    return { platform: parts[0], consumerId: parts[1], kind: parts[2], conversationId: parts[3] };
+  }
+  return null;
 }
 
 /**

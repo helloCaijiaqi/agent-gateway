@@ -16,6 +16,8 @@ const { loadConfig } = await import(new URL('../src/core/config.mjs', import.met
 const { createGatewayServer } = await import(new URL('../src/core/server.mjs', import.meta.url).href);
 const { createTurnRunner } = await import(new URL('../src/runtime/turn-runner.mjs', import.meta.url).href);
 const { createSessionRegistry } = await import(new URL('../src/runtime/session-registry.mjs', import.meta.url).href);
+// 建会话需要适配器声明「平台→preset」：测试里用一个最小的声明表顶替登记文件。
+const PRESETS_FOR = () => ({ qq: 'qq-chat', wx: 'wx-chat' });
 const { createPromptQueue } = await import(new URL('../src/runtime/prompt-queue.mjs', import.meta.url).href);
 const { createDshGateway } = await import(new URL('../src/runtime/dsh-gateway.mjs', import.meta.url).href);
 const { createTurnStore } = await import(new URL('../src/core/turn-store.mjs', import.meta.url).href);
@@ -23,7 +25,7 @@ const { createTurnStore } = await import(new URL('../src/core/turn-store.mjs', i
 const { protocolTokenLine } = await import(new URL('../src/core/pipeline.mjs', import.meta.url).href);
 
 const CHAT = {
-  preset: 'qq-chat-v2', provider: 'p', model: 'm', reasoningEffort: 'max',
+  preset: 'qq-chat', provider: 'p', model: 'm', reasoningEffort: 'max',
   workspaceDir: fs.mkdtempSync(path.join(os.tmpdir(), 'gateway-pipeline-')),
   turnTimeoutMs: 2000,
 };
@@ -55,6 +57,8 @@ function writeServices(dir, obj) {
       name: entry.name ?? entry.id,
       kind: entry.kind,
       transport: entry.transport ?? 'auto',
+      ...(entry.platform ? { platform: entry.platform } : {}),
+      ...(entry.memoryService ? { memoryService: entry.memoryService } : {}),
       ...(entry.url ? { url: entry.url } : {}),
       ...(entry.timeoutMs ? { timeoutMs: entry.timeoutMs } : {}),
       ...(entry.secret ? { secret: entry.secret } : {}),
@@ -73,8 +77,6 @@ function makeRegistry(file, overrides = {}) {
   return createServiceRegistry({
     pipelinesFile: file,
     stateDir: overrides.stateDir ?? dir,
-    reservedIds: overrides.reservedIds ?? [],
-    consumerIds: overrides.consumerIds ?? [],
     registrations: overrides.registrations ?? {
       dir: path.join(dir, 'services'),
       ledgerFile: path.join(dir, 'ledger.jsonl'),
@@ -88,11 +90,18 @@ function makeRegistry(file, overrides = {}) {
 function fakeServiceRegistry({ services = {}, pipelines = {}, returnPipelines = {}, failWith = null, results = {}, requests = null } = {}) {
   return {
     resolveService: (id) => services[id] ?? null,
-    async callService(id, request) {
+    // 两级解析（tool.call 统一改造）：步骤名 → decorator/filter 角色的登记工具。
+    // 假实现按条目 role 推（服务 kind=resource，管线角色由 role 声明）。
+    resolveToolStep: (name) => {
+      const svc = services[name];
+      if (!svc || svc.kind === 'consumer' || !svc.role) return null;
+      return { service: svc, kind: svc.kind, tool: { name, role: svc.role } };
+    },
+    async callServiceTool(id, request) {
       requests?.push({ id, request });
       if (failWith) throw failWith;
-      const result = results[id] ?? {};
-      return { v: 1, callId: request.callId, ...result };
+      // tool.call 契约：业务结果装在 data 里（decorator {sections,epoch} / filter {text,reason}）。
+      return { ok: true, data: results[id] ?? {} };
     },
     pipelineFor: (consumerId) => pipelines[consumerId] ?? pipelines.default ?? [],
     pipelineKeys: () => Object.keys(pipelines),
@@ -109,7 +118,7 @@ test('registry: pipelines.json 缺失 = 无编排（管线只剩内置步骤，�
   assert.deepEqual(registry.services(), []);
   assert.deepEqual(registry.pipelineFor('qq-main'), []);
   assert.equal(registry.resolveService('x'), null);
-  assert.deepEqual([...registry.clients().keys()], []);
+  assert.deepEqual(registry.consumers(), []);
 });
 
 test('registry: 文件损坏 / services 残留键 → 启动失败（fail-closed + 迁移三步）', () => {
@@ -125,7 +134,7 @@ test('registry: 文件损坏 / services 残留键 → 启动失败（fail-closed
 });
 
 test('registry: 登记条目校验——kind/transport/url/timeout/secret 逐项挡下（按份 fail-safe + 台账）', () => {
-  const base = { id: 'svc', kind: 'decorator', secret: 'x'.repeat(20) };
+  const base = { id: 'svc', kind: 'resource', transport: 'http', url: 'http://127.0.0.1:7300', secret: 'x'.repeat(20) };
   // 登记目录按份 fail-safe：坏文件不进服务面，reject 理由落台账（与内联装载
   // 的 fail-closed 不同——一个坏服务不能拖死整个网关启动）。
   const assertRejected = (entry, pattern) => {
@@ -137,28 +146,40 @@ test('registry: 登记条目校验——kind/transport/url/timeout/secret 逐项
     assert.match(ledger, pattern);
   };
   assertRejected({ ...base, kind: 'magic' }, /serviceRegistration invalid[\s\S]*kind/i);
-  assertRejected({ ...base, transport: 'http' }, /requires url/);
+  // 传输非对称：resource 配 ws fail-closed 拒载并给迁移文案（consumer 不受限）。
+  // 台账是 JSONL 原文（引号带转义），正则用惰性通配跨过转义引号。
+  assertRejected({ ...base, transport: 'ws' }, /with transport .+?ws.+? is not supported/);
+  assertRejected({ ...base, transport: 'ws' }, /migrate .+?transport.+?ws.+? → .+?transport.+?http/);
+  assertRejected({ ...base, transport: 'http', url: undefined }, /requires url/);
   assertRejected({ ...base, url: 'http://10.0.0.1:7000' }, /loopback/i);
   assertRejected({ ...base, timeoutMs: 10 }, /timeoutMs/);
   assertRejected({ ...base, secret: 'short' }, /at least 16/i);
 });
 
-test('registry: 服务 id 与消费者 id 冲突 → 拒载 + 台账', () => {
+test('registry: 登记 consumer 直接生效（消费端身份唯一来源 = 登记目录）', () => {
   const d = tmpDir('gw-reg-');
-  const file = writeServices(d, { services: [{ id: 'qq-main', kind: 'decorator', secret: 'x'.repeat(20) }] });
-  const registry = makeRegistry(file, { reservedIds: ['qq-main'] });
-  assert.deepEqual(registry.services(), []);
+  const file = writeServices(d, { services: [{ id: 'qq-main', name: 'qq-bridge', kind: 'consumer', transport: 'http', url: 'http://127.0.0.1:3100', platform: 'qq', secret: 'x'.repeat(20) }] });
+  const registry = makeRegistry(file);
+  assert.equal(registry.services().length, 1);
+  assert.equal(registry.consumers().length, 1);
+  assert.equal(registry.consumers()[0].source, 'registry');
   const ledger = fs.readFileSync(path.join(d, 'ledger.jsonl'), 'utf8');
-  assert.match(ledger, /conflicts with an existing consumer/);
+  assert.match(ledger, /"register"/);
 });
 
 test('registry: 合法条目解析出同构客户端身份；pipelines 形状校验与 default 回退', () => {
-  const ok = writeServices(tmpDir('gw-reg-'), { services: [{ id: 'svc', kind: 'filter', secret: 'y'.repeat(20), url: 'http://127.0.0.1:7300' }] });
+  // 传输非对称：consumers()（HTTP 入站验签 / WS 握手身份表共用视图）只含消费端——
+  // resource 不出现；消费端身份形状不变（id/platform/secret）。
+  const ok = writeServices(tmpDir('gw-reg-'), { services: [{ id: 'svc', kind: 'resource', transport: 'http', secret: 'y'.repeat(20), url: 'http://127.0.0.1:7300' }] });
   const registry = makeRegistry(ok);
-  const client = registry.clients().get('svc');
-  assert.equal(client.platform, null);
-  assert.equal(client.secret, 'y'.repeat(20));
+  assert.equal(registry.consumers().some((c) => c.id === 'svc'), false, 'resource 不进消费端视图');
   assert.equal(registry.services()[0].connected, false);
+  const okConsumer = writeServices(tmpDir('gw-reg-'), { services: [{ id: 'qq-main', name: 'qq-bridge', kind: 'consumer', transport: 'http', url: 'http://127.0.0.1:3100', platform: 'qq', secret: 'z'.repeat(20) }] });
+  const consumerRegistry = makeRegistry(okConsumer);
+  const client = consumerRegistry.consumers().find((c) => c.id === 'qq-main');
+  assert.equal(client.platform, 'qq');
+  assert.equal(client.secret, 'z'.repeat(20));
+  assert.equal(consumerRegistry.services()[0].connected, false);
 
   const dir = tmpDir('gw-reg-');
   assert.throws(() => makeRegistry(writeServices(dir, { services: [], pipelines: { 'qq-main': [] } })), /non-empty array/);
@@ -168,21 +189,29 @@ test('registry: 合法条目解析出同构客户端身份；pipelines 形状校
     () => makeRegistry(writeServices(dir, { services: [], pipelines: { 'qq-main': Array.from({ length: 17 }, (_, i) => `s${i}`) } })),
     /exceeds 16/,
   );
-  const file = writeServices(tmpDir('gw-reg-'), { services: [], pipelines: { 'qq-main': ['a', 'b'], default: ['c'] } });
-  const withPipelines = makeRegistry(file, { consumerIds: ['qq-main', 'other'] });
+  // 编排权限只认登记消费端：把 qq-main / other 落成 services/<id>.json。
+  const file = writeServices(tmpDir('gw-reg-'), {
+    services: [
+      { id: 'qq-main', name: 'qq-bridge', kind: 'consumer', platform: 'qq', secret: 'q'.repeat(20) },
+      { id: 'other', name: 'other-bridge', kind: 'consumer', platform: 'wx', secret: 'o'.repeat(20) },
+    ],
+    pipelines: { 'qq-main': ['a', 'b'], default: ['c'] },
+  });
+  const withPipelines = makeRegistry(file);
   assert.deepEqual(withPipelines.pipelineFor('qq-main'), ['a', 'b']);
   // 无精确键但有身份的消费端：default 回退；无身份者连 default 都不享受。
   assert.deepEqual(withPipelines.pipelineFor('other'), ['c']);
   assert.deepEqual(withPipelines.pipelineKeys().sort(), ['default', 'qq-main']);
 
-  // 编排权限（P3）：未注册消费端（无身份）不享受编排——精确键与 default 都不生效。
-  const gated = makeRegistry(file, { consumerIds: [] });
+  // 编排权限（P3）：未登记消费端（无身份）不享受编排——精确键与 default 都不生效。
+  const gated = makeRegistry(writeServices(tmpDir('gw-reg-'), {
+    services: [], pipelines: { 'qq-main': ['a', 'b'], default: ['c'] },
+  }));
   assert.deepEqual(gated.pipelineFor('qq-main'), []);
   assert.deepEqual(gated.pipelineFor('other'), []);
   assert.throws(() => gated.assertPipelinePermissions(), /no consumer behind it/);
-  // 启动期权限校验：有身份的键通过。
-  const withConsumer = makeRegistry(file, { consumerIds: ['qq-main'] });
-  withConsumer.assertPipelinePermissions();
+  // 启动期权限校验：登记消费端的键通过。
+  withPipelines.assertPipelinePermissions();
 });
 
 test('registry: 编排权限——登记的消费端即拥有编排，非消费端服务不行（P3 门禁）', () => {
@@ -195,10 +224,10 @@ test('registry: 编排权限——登记的消费端即拥有编排，非消费�
   const consumerId = crypto.randomUUID().replaceAll('-', '');
   const decoratorId = crypto.randomUUID().replaceAll('-', '');
   fs.writeFileSync(path.join(regDir, `${consumerId}.json`), JSON.stringify({
-    v: 1, id: consumerId, name: 'bridge-x', kind: 'consumer', transport: 'ws', secret: 'x'.repeat(20), enabled: true,
+    v: 1, id: consumerId, name: 'bridge-x', kind: 'consumer', transport: 'ws', platform: 'qq', secret: 'x'.repeat(20), enabled: true,
   }));
   fs.writeFileSync(path.join(regDir, `${decoratorId}.json`), JSON.stringify({
-    v: 1, id: decoratorId, name: 'memory-d', kind: 'decorator', transport: 'ws', secret: 'y'.repeat(20), enabled: true,
+    v: 1, id: decoratorId, name: 'memory-d', kind: 'resource', transport: 'http', url: 'http://127.0.0.1:7390', secret: 'y'.repeat(20), enabled: true,
   }));
   const file = writeServices(dir, { services: [], pipelines: { [consumerId]: ['d1'], default: ['d2'] } });
   const registry = makeRegistry(file, {
@@ -216,10 +245,10 @@ test('registry: 编排权限——登记的消费端即拥有编排，非消费�
   }).assertPipelinePermissions(), /no consumer behind it/);
 });
 
-test('registry: callService 未知服务 → E_SCHEMA', async () => {
+test('registry: callServiceTool 未知服务 → E_SCHEMA', async () => {
   const registry = makeRegistry(path.join(tmpDir('gw-reg-'), 'nope.json'));
   await assert.rejects(
-    () => registry.callService('ghost', { v: 1, callId: 'c1' }),
+    () => registry.callServiceTool('ghost', { tool: 'chat_x' }),
     (error) => error.code === 'E_SCHEMA',
   );
 });
@@ -244,45 +273,53 @@ test('pipeline: 空编排 = 透传，但 protocol 令牌仍强制注入', async 
   assert.equal(out.degraded, false);
 });
 
-test('pipeline: decorator 改写消息 + sections 追加', async () => {
+test('pipeline: decorator 纯注入（改写职责归 filter）——sections 追加、消息本体不动', async () => {
   const registry = fakeServiceRegistry({
-    services: { dec: { id: 'dec', kind: 'decorator' } },
+    services: { dec: { id: 'dec', kind: 'resource', role: 'decorator' } },
     pipelines: { 'qq-main': ['dec', 'persona'] },
     results: {
-      dec: { verdict: 'pass', message: 'enhanced', sections: [{ name: 'mem', text: 'MEMORY', priority: 70 }] },
+      dec: { sections: [{ name: 'mem', text: 'MEMORY', priority: 70 }] },
     },
   });
   const pipeline = createPipeline({ registry, builtinSteps: BUILTINS, budgetChars: 6000 });
   const out = await pipeline.runForward({ consumerId: 'qq-main', sessionKey: 's', turnToken: 't', text: 'original' });
-  assert.equal(out.steps.find((s) => s.name === 'dec').outcome, 'rewritten');
-  // 拼接顺序：消息本体 → sections 按 priority 降序（protocol 100 > persona 80 > mem 70）。
-  assert.equal(out.text, `enhanced\n\n${protocolTokenLine('t')}\n\nPERSONA\n\nMEMORY`);
+  assert.equal(out.steps.find((s) => s.name === 'dec').outcome, 'injected');
+  // 拼接顺序：消息本体（不动）→ sections 按 priority 降序（protocol 100 > persona 80 > mem 70）。
+  assert.equal(out.text, `original\n\n${protocolTokenLine('t')}\n\nPERSONA\n\nMEMORY`);
 });
 
-test('pipeline: filter drop 短路——后续步骤不执行，reason 透传', async () => {
+test('pipeline: filter 改写与 drop 短路——text 替换消息本体；空串 = drop（reason 透传，后续步骤不执行）', async () => {
   const calls = [];
   const registry = fakeServiceRegistry({
     services: {
-      guard: { id: 'guard', kind: 'filter' },
-      dec: { id: 'dec', kind: 'decorator' },
+      guard: { id: 'guard', kind: 'resource', role: 'filter' },
+      dec: { id: 'dec', kind: 'resource', role: 'decorator' },
     },
     pipelines: { 'qq-main': ['guard', 'dec'] },
   });
-  registry.callService = async (id, request) => {
-    calls.push(id);
-    if (id === 'guard') return { v: 1, callId: request.callId, verdict: 'drop', reason: 'spam' };
-    return { v: 1, callId: request.callId, verdict: 'pass' };
+  registry.callServiceTool = async (id, request) => {
+    calls.push({ id, request });
+    if (id === 'guard') return { ok: true, data: { text: request.context.text === 'drop-me' ? '' : 'clean', reason: 'spam' } };
+    return { ok: true, data: {} };
   };
   const pipeline = createPipeline({ registry, builtinSteps: BUILTINS, budgetChars: 6000 });
-  const out = await pipeline.runForward({ consumerId: 'qq-main', sessionKey: 's', turnToken: 't', text: 'hi' });
-  assert.equal(out.verdict, 'drop');
-  assert.equal(out.reason, 'spam');
-  assert.deepEqual(calls, ['guard'], 'drop 后不得继续执行后续步骤');
+  // 改写：非空 text 替换消息本体（后续 decorator 正常执行）。
+  const rewritten = await pipeline.runForward({ consumerId: 'qq-main', sessionKey: 's', turnToken: 't', text: 'drop-me-no' });
+  assert.equal(rewritten.steps.find((s) => s.name === 'guard').outcome, 'rewritten');
+  assert.ok(rewritten.text.startsWith('clean'), 'filter 输出替换消息本体');
+  assert.equal(calls[0].request.context.text, 'drop-me-no', 'context.text = 当前工作文本随 filter 下发');
+
+  // drop：text 空串 → 短路，后续步骤不执行。
+  calls.length = 0;
+  const dropped = await pipeline.runForward({ consumerId: 'qq-main', sessionKey: 's', turnToken: 't', text: 'drop-me' });
+  assert.equal(dropped.verdict, 'drop');
+  assert.equal(dropped.reason, 'spam');
+  assert.deepEqual(calls.map((c) => c.id), ['guard'], 'drop 后不得继续执行后续步骤');
 });
 
 test('pipeline: 外部步骤失败 fail-safe——超时/抛错记 degraded 继续放行', async () => {
   const registry = fakeServiceRegistry({
-    services: { bad: { id: 'bad', kind: 'decorator' } },
+    services: { bad: { id: 'bad', kind: 'resource', role: 'decorator' } },
     pipelines: { 'qq-main': ['bad', 'persona'] },
     failWith: Object.assign(new Error('timed out'), { code: 'E_TIMEOUT' }),
   });
@@ -294,13 +331,13 @@ test('pipeline: 外部步骤失败 fail-safe——超时/抛错记 degraded 继�
   assert.equal(out.steps.find((s) => s.name === 'bad').outcome, 'degraded');
 });
 
-test('pipeline: 非法响应（callId 不匹配）→ degraded 放行（registry 契约层抛错）', async () => {
+test('pipeline: 非法响应（契约层抛错）→ degraded 放行', async () => {
   const registry = fakeServiceRegistry({
-    services: { liar: { id: 'liar', kind: 'decorator' } },
+    services: { liar: { id: 'liar', kind: 'resource', role: 'decorator' } },
     pipelines: { 'qq-main': ['liar'] },
   });
-  registry.callService = async () => {
-    throw Object.assign(new Error('result callId mismatch'), { code: 'E_SCHEMA' });
+  registry.callServiceTool = async () => {
+    throw Object.assign(new Error('invalid result'), { code: 'E_SCHEMA' });
   };
   const pipeline = createPipeline({ registry, builtinSteps: BUILTINS, budgetChars: 6000 });
   const out = await pipeline.runForward({ consumerId: 'qq-main', sessionKey: 's', turnToken: 't', text: 'x' });
@@ -308,27 +345,45 @@ test('pipeline: 非法响应（callId 不匹配）→ degraded 放行（registry
   assert.equal(out.verdict, 'pass');
 });
 
-test('pipeline: shadow 步骤只记录 diff，不应用产出', async () => {
+test('pipeline: 业务失败（ok:false）与非法 data 同口径 degraded 放行；服务 id 当步骤报迁移错', async () => {
+  // 业务失败（ok:false + error）也是失效步骤：degraded 继续，绝不误杀。
   const registry = fakeServiceRegistry({
-    services: { ghost: { id: 'ghost', kind: 'shadow' } },
-    pipelines: { 'qq-main': ['ghost'] },
-    results: { ghost: { verdict: 'pass', message: 'SHADOW-PROPOSAL' } },
+    services: { bad: { id: 'bad', kind: 'resource', role: 'decorator' } },
+    pipelines: { 'qq-main': ['bad'] },
   });
-  const counters = new Map();
-  const metrics = { inc: (name, labels = {}) => counters.set(`${name}|${labels.diff ?? ''}`, (counters.get(`${name}|${labels.diff ?? ''}`) ?? 0) + 1) };
-  const pipeline = createPipeline({ registry, builtinSteps: BUILTINS, budgetChars: 6000, metrics });
-  const out = await pipeline.runForward({ consumerId: 'qq-main', sessionKey: 's', turnToken: 't', text: 'original' });
-  assert.equal(out.text.includes('SHADOW-PROPOSAL'), false, 'shadow 产出不得进入 prompt');
-  assert.equal(out.text.startsWith('original'), true);
-  assert.equal(out.steps.find((s) => s.name === 'ghost').outcome, 'shadow-diff');
-  assert.equal(counters.get('gateway_pipeline_shadow_total|diff'), 1);
+  registry.callServiceTool = async () => ({ ok: false, error: { code: 'E_ACTION', message: 'boom' } });
+  const pipeline = createPipeline({ registry, builtinSteps: BUILTINS, budgetChars: 6000 });
+  const out = await pipeline.runForward({ consumerId: 'qq-main', sessionKey: 's', text: 'x' });
+  assert.equal(out.degraded, true);
+  assert.equal(out.verdict, 'pass');
+
+  // 服务 id 直接当步骤不再合法（两级解析硬切）：无 role 工具的服务 id 解析
+  // 落空 → 命中 resolveService → 报迁移错。
+  const shadowRegistry = fakeServiceRegistry({
+    services: { ghostsvc: { id: 'ghostsvc', kind: 'resource' } },
+    pipelines: { 'qq-main': ['ghostsvc'] },
+  });
+  const byServiceId = createPipeline({ registry: shadowRegistry, builtinSteps: BUILTINS, budgetChars: 6000 });
+  assert.throws(() => byServiceId.validate(['qq-main', 'ghostsvc']), /no longer valid steps/);
+});
+
+test('pipeline: 非法 data（不合 decorator 契约）→ degraded 放行', async () => {
+  const registry = fakeServiceRegistry({
+    services: { liar: { id: 'liar', kind: 'resource', role: 'decorator' } },
+    pipelines: { 'qq-main': ['liar'] },
+    results: { liar: { verdict: 'pass', message: 'old-shape' } }, // 旧 service.call 形状 → schema 拒收
+  });
+  const pipeline = createPipeline({ registry, builtinSteps: BUILTINS, budgetChars: 6000 });
+  const out = await pipeline.runForward({ consumerId: 'qq-main', sessionKey: 's', turnToken: 't', text: 'x' });
+  assert.equal(out.degraded, true);
+  assert.equal(out.verdict, 'pass');
 });
 
 test('pipeline: 预算超限整段丢弃最低优先级 section，消息本体永不裁剪', async () => {
   const registry = fakeServiceRegistry({
-    services: { dec: { id: 'dec', kind: 'decorator' } },
+    services: { dec: { id: 'dec', kind: 'resource', role: 'decorator' } },
     pipelines: { 'qq-main': ['dec', 'persona', 'time'] },
-    results: { dec: { verdict: 'pass', sections: [{ name: 'big', text: 'B'.repeat(50), priority: 90 }, { name: 'small', text: 'S', priority: 10 }] } },
+    results: { dec: { sections: [{ name: 'big', text: 'B'.repeat(50), priority: 90 }, { name: 'small', text: 'S', priority: 10 }] } },
   });
   const pipeline = createPipeline({ registry, builtinSteps: BUILTINS, budgetChars: 60 });
   // 不传 turnToken → protocol 缺席，纯 section 裁剪场景。
@@ -393,17 +448,6 @@ function decodeFrame(buffer, offset = 0) {
   return { opcode, payload: buffer.subarray(pos, pos + len), next: pos + len };
 }
 
-function clientTextFrame(text) {
-  const data = Buffer.from(text, 'utf8');
-  const mask = crypto.randomBytes(4);
-  const masked = Buffer.from(data);
-  for (let i = 0; i < masked.length; i += 1) masked[i] ^= mask[i % 4];
-  const header = data.length < 126
-    ? Buffer.from([0x81, 0x80 | data.length])
-    : Buffer.from([0x81, 0x80 | 126, data.length >> 8, data.length & 0xff]);
-  return Buffer.concat([header, mask, masked]);
-}
-
 function handshakeQuery(secret, id) {
   const ts = Date.now();
   const nonce = crypto.randomBytes(12).toString('hex');
@@ -444,17 +488,6 @@ function connectWs(port, pathWithQuery) {
   });
 }
 
-async function waitFor(conn, type, timeoutMs = 2000) {
-  conn.cursor[type] ??= 0;
-  const deadline = Date.now() + timeoutMs;
-  for (;;) {
-    const idx = conn.frames.findIndex((f, i) => i >= conn.cursor[type] && f.type === type);
-    if (idx >= 0) { conn.cursor[type] = idx + 1; return conn.frames[idx]; }
-    if (Date.now() > deadline) throw new Error(`timeout waiting for frame type=${type}`);
-    await new Promise((r) => setTimeout(r, 20));
-  }
-}
-
 const SERVICE_SECRET = 'service-secret-0123456789';
 const ADAPTER_SECRET = 'adapter-secret-0123456789';
 
@@ -462,16 +495,21 @@ async function startPipelineServer({ dir }) {
   // stateDir 与 pipelines.json/secretFile 同目录（secretFile 相对 stateDir 解析）。
   fs.writeFileSync(path.join(dir, 'svc.secret'), SERVICE_SECRET);
   const pipelinesFile = writeServices(dir, {
-    services: [{ id: 'svc-dec', kind: 'decorator', secretFile: 'svc.secret', timeoutMs: 1500 }],
+    // 传输非对称：resource 服务强制 http + url（url 指向无监听端口，供
+    // callServiceTool 的 E_NETWORK 断言用）。
+    services: [
+      { id: 'svc-dec', kind: 'resource', transport: 'http', url: 'http://127.0.0.1:7399', secretFile: 'svc.secret', timeoutMs: 1500 },
+      // 消费端身份只认登记目录（WS 握手 / 动作下行都走这一份视图）。
+      { id: 'qq-main', name: 'qq-bridge', kind: 'consumer', platform: 'qq', secret: ADAPTER_SECRET },
+    ],
   });
   const config = loadConfig({
     // GATEWAY_PORT=0：node --test 并发跑多个文件，别的测试文件也可能监听默认端口。
-    env: { GATEWAY_MODE: 'shadow', GATEWAY_WS: 'on', GATEWAY_PORT: '0' },
-    adapters: [{ id: 'qq-main', platform: 'qq', secret: ADAPTER_SECRET }],
+    env: { GATEWAY_DATA_PLANE: 'shadow', GATEWAY_PORT: '0' },
     stateDir: dir,
   });
   const services = createServiceRegistry({
-    pipelinesFile, stateDir: dir, reservedIds: ['qq-main'], defaultTimeoutMs: 8000, logger: () => {},
+    pipelinesFile, stateDir: dir, defaultTimeoutMs: 8000, logger: () => {},
     registrations: { dir: path.join(dir, 'services'), ledgerFile: path.join(dir, 'ledger.jsonl'), reloadMs: 0 },
   });
   const gateway = createGatewayServer({ config, logger: () => {}, services });
@@ -480,51 +518,27 @@ async function startPipelineServer({ dir }) {
   return { gateway, services, port: gateway.server.address().port };
 }
 
-test('ws callService: 端到端请求-响应关联 + 无连接拒绝 + health 状态', async () => {
+test('ws 通道非对称：resource 握手被拒 + callServiceTool HTTP-only + health 状态', async () => {
   const dir = tmpDir('gw-pipe-');
   const { gateway, services, port } = await startPipelineServer({ dir });
   try {
-    // 无连接时调用：E_DISABLED（auto 会在无 ws 时走 HTTP，但该服务没配 url 且 transport
-    // 由文件声明为 auto + url 缺失 → 这里显式断言 ws 路径的失败语义）。
+    // WS 是消费端专属：resource id 不进 ws-hub 身份表（clients 只放行
+    // kind=consumer），握手即 401（不泄露「谁存在」）。
     await assert.rejects(
-      () => services.callService('svc-dec', { v: 1, callId: 'c0' }),
-      (error) => ['E_DISABLED', 'E_NETWORK'].includes(error.code),
+      () => connectWs(port, `/v1/ws?${handshakeQuery(SERVICE_SECRET, 'svc-dec')}`),
+      /handshake rejected: 401/,
+    );
+    assert.equal(services.services()[0].connected, false, 'resource 无 WS 连接状态');
+
+    // callServiceTool 恒走 HTTP（transport 强制 http）：url 指向无监听端口 → E_NETWORK。
+    await assert.rejects(
+      () => services.callServiceTool('svc-dec', { tool: 'chat_x', args: {} }),
+      (error) => error.code === 'E_NETWORK',
     );
 
-    // 服务以客户端身份连入（与消费者同一握手鉴权）。
-    const conn = await connectWs(port, `/v1/ws?${handshakeQuery(SERVICE_SECRET, 'svc-dec')}`);
-    assert.equal(services.services()[0].connected, true);
-
-    const pending = services.callService('svc-dec', {
-      v: 1, callId: 'call-1', service: 'svc-dec', step: 'svc-dec', kind: 'decorator',
-      sessionKey: 'qq:group:1', text: 'inbound',
-    });
-    const request = await waitFor(conn, 'service.call');
-    assert.equal(request.callId, 'call-1');
-    assert.equal(request.text, 'inbound');
-    conn.socket.write(clientTextFrame(JSON.stringify({
-      v: 1, type: 'service.call/result', callId: 'call-1', ok: true,
-      result: { v: 1, callId: 'call-1', verdict: 'pass', message: 'rewritten' },
-    })));
-    const result = await pending;
-    assert.equal(result.verdict, 'pass');
-    assert.equal(result.message, 'rewritten');
-
-    // callId 不匹配的回执：契约层拒绝（degraded 语义的来源）。
-    const mismatch = services.callService('svc-dec', {
-      v: 1, callId: 'call-2', service: 'svc-dec', step: 'x', kind: 'decorator', sessionKey: 's', text: 'x',
-    });
-    await waitFor(conn, 'service.call');
-    conn.socket.write(clientTextFrame(JSON.stringify({
-      v: 1, type: 'service.call/result', callId: 'OTHER', ok: true,
-      result: { v: 1, callId: 'OTHER', verdict: 'pass' },
-    })));
-    await assert.rejects(() => mismatch, (error) => error.code === 'E_TIMEOUT' || error.code === 'E_SCHEMA');
-
-    // health：pipeline 块可见（mode=on + 服务连接状态）。
+    // health：pipeline 块可见（mode=on）。
     const health = await fetch(`http://127.0.0.1:${port}/v1/health`).then((r) => r.json());
     assert.equal(health.pipeline.mode, 'on');
-    conn.socket.destroy();
   } finally {
     await gateway.close();
   }
@@ -546,7 +560,7 @@ function createFakeDsh() {
       this.emit({ type: 'session/event', sessionId, event: { type: 'assistant/message', data: { turn, message: { content: [{ type: 'text', text }] } } } });
       this.emit({ type: 'session/event', sessionId, event: { type: 'turn/end', data: { turn, reason: { kind: 'completed' } } } });
     },
-    async listPresets() { return ['qq-chat-v2']; },
+    async listPresets() { return ['qq-chat', 'minimal']; },
     async ensureWorkspace() { return 'ws'; },
     async createSession() { const id = `s${++seq}`; state.sessions.set(id, { turns: 0 }); return id; },
     async selectModel() { return {}; },
@@ -596,41 +610,41 @@ function buildBuiltinSteps() {
   };
 }
 
-async function buildRunnerHarness({ pipeline = null, config }) {
+async function buildRunnerHarness({ pipeline = null, config, notifyTurnEnded = null }) {
   const dsh = createFakeDsh();
-  const registry = createSessionRegistry({ dsh, chat: CHAT, file: null });
+  const registry = createSessionRegistry({ presetsFor: PRESETS_FOR, dsh, chat: CHAT, file: null });
   const gateway = createDshGateway({ dsh, turnTimeoutMs: 2000 });
   const turns = createTurnStore({ file: null });
   const runner = createTurnRunner({
     config: { chat: CHAT, pipeline: config?.pipeline ?? { mode: 'off' } },
     dsh, registry, gateway, queue: createPromptQueue({}), turns,
-    pipeline, logger: () => {},
+    pipeline, logger: () => {}, notifyTurnEnded,
   });
   gateway.start();
   return { runner, dsh, turns };
 }
 
-test('runner: 管线接管拼装——decorator 改写生效、令牌注入', async () => {
+test('runner: 管线接管拼装——filter 改写生效、令牌注入', async () => {
   const registry = fakeServiceRegistry({
-    services: { dec: { id: 'dec', kind: 'decorator' } },
-    pipelines: { 'qq-main': ['dec'] },
-    results: { dec: { verdict: 'pass', message: 'pipelined' } },
+    services: { guard: { id: 'guard', kind: 'resource', role: 'filter' } },
+    pipelines: { 'qq-main': ['guard'] },
+    results: { guard: { text: 'pipelined' } },
   });
   const pipeline = createPipeline({ registry, builtinSteps: buildBuiltinSteps(), budgetChars: 6000 });
   const { runner, dsh } = await buildRunnerHarness({ pipeline, config: { pipeline: { mode: 'on' } } });
   const result = await submitAndFinish(runner, dsh, makeRecord(baseEnvelope()));
   assert.equal(result.status, 'completed');
   const prompt = dsh.state.prompts[0].text;
-  assert.ok(prompt.startsWith('pipelined'), '管线改写生效');
+  assert.ok(prompt.startsWith('pipelined'), 'filter 改写生效（消息本体替换）');
   assert.ok(prompt.includes('【会话令牌】'), 'protocol 令牌注入');
   assert.equal(prompt.includes('adapter-assembled-prompt'), false, '适配器 prompt 被管线产出替换');
 });
 
 test('runner: filter drop 短路——turn 完成、不进 DSH、degraded 标记', async () => {
   const registry = fakeServiceRegistry({
-    services: { guard: { id: 'guard', kind: 'filter' } },
+    services: { guard: { id: 'guard', kind: 'resource', role: 'filter' } },
     pipelines: { 'qq-main': ['guard'] },
-    results: { guard: { verdict: 'drop', reason: 'spam' } },
+    results: { guard: { text: '', reason: 'spam' } },
   });
   const pipeline = createPipeline({ registry, builtinSteps: buildBuiltinSteps(), budgetChars: 6000 });
   const { runner, dsh, turns } = await buildRunnerHarness({ pipeline, config: { pipeline: { mode: 'on' } } });
@@ -645,7 +659,7 @@ test('runner: filter drop 短路——turn 完成、不进 DSH、degraded 标记
 
 test('runner: 引擎失败回退适配器 prompt（fail-safe），degraded 记 fallback', async () => {
   // 引擎级失败（ok:false，如装配配置错误）→ 整体回退适配器 prompt。
-  // 步骤级失败（service.call 抛错）走 fail-safe 继续放行，不触发回退——那是上面的引擎用例。
+  // 步骤级失败（tool.call 抛错 / ok:false）走 fail-safe 继续放行，不触发回退——那是上面的引擎用例。
   const pipeline = {
     runForward: async () => ({ ok: false, verdict: 'pass', text: '', chars: 0, degraded: true, dropped: [], steps: [] }),
   };
@@ -663,14 +677,34 @@ test('runner: GATEWAY_PIPELINE=off 回滚通道——prompt 原样透传（P3 �
   assert.equal(dsh.state.prompts[0].text, 'adapter-assembled-prompt', 'off = 适配器说什么就发什么（含令牌在内的一切注入都停）');
 });
 
+test('runner: 回合结束通知——notifyTurnEnded 收到终态推送（适配器释放防重入的信号源）', async () => {
+  const notifications = [];
+  const { runner, dsh } = await buildRunnerHarness({
+    pipeline: null,
+    config: { pipeline: { mode: 'off' } },
+    notifyTurnEnded: (n) => notifications.push(n),
+  });
+  const record = makeRecord(baseEnvelope());
+  const result = await submitAndFinish(runner, dsh, record);
+  assert.equal(result.status, 'completed');
+  assert.equal(notifications.length, 1, '一个回合恰好一条通知');
+  const { adapterId, payload } = notifications[0];
+  assert.ok(adapterId, '通知带适配器 id（sendTo 的目标）');
+  assert.equal(payload.type, 'turn/status');
+  assert.equal(payload.turnId, record.turnId);
+  assert.equal(payload.sessionKey, record.sessionKey);
+  assert.equal(payload.status, 'completed');
+  assert.equal(payload.v, 1);
+});
+
 // ---------------------------------------------------------------- P4.x 注入规则引擎
 
 test('rules: registry 双形态装载——对象条目合法、protocol 对象与坏 regex/坏 fn 启动即拒', () => {
   const ok = writeServices(tmpDir('gw-rules-'), {
-    services: [],
+    services: [{ id: 'qq-main', name: 'qq-bridge', kind: 'consumer', platform: 'qq', secret: 'r'.repeat(20) }],
     pipelines: { 'qq-main': ['dec', { step: 'card', text: 'ROLECARD' }, { step: 'dec2', join: 'prefix' }] },
   });
-  const registry = makeRegistry(ok, { consumerIds: ['qq-main'] });
+  const registry = makeRegistry(ok);
   // 原始条目原样存储（引擎按双形态消费，视图原样透出）。
   assert.deepEqual(registry.pipelineFor('qq-main')[1], { step: 'card', text: 'ROLECARD' });
   assert.deepEqual(registry.pipelineFor('qq-main')[0], 'dec');
@@ -700,15 +734,15 @@ test('rules: engine validate——静态步骤不做三级解析，未知外部�
   assert.throws(() => bad.validate(['c']), /unknown pipeline step/);
 });
 
-test('rules: once——仅首轮注入，非首轮整个步骤跳过（不调服务），首轮标记透传 ctx', async () => {
+test('rules: once——仅首轮注入，非首轮整个步骤跳过（不调服务）；信封无 firstTurn 字段', async () => {
   const calls = [];
   const registry = fakeServiceRegistry({
-    services: { card: { id: 'card', kind: 'decorator' } },
+    services: { card: { id: 'card', kind: 'resource', role: 'decorator' } },
     pipelines: { 'qq-main': [{ step: 'card', once: true, join: 'prefix' }] },
   });
-  registry.callService = async (id, request) => {
-    calls.push({ id, firstTurn: request.firstTurn });
-    return { v: 1, callId: request.callId, verdict: 'pass', message: 'ROLECARD' };
+  registry.callServiceTool = async (id, request) => {
+    calls.push({ id, request });
+    return { ok: true, data: { sections: [{ name: 'card', text: 'ROLECARD' }] } };
   };
   const pipeline = createPipeline({ registry, builtinSteps: buildBuiltinSteps(), budgetChars: 6000 });
   const first = await pipeline.runForward({
@@ -716,7 +750,9 @@ test('rules: once——仅首轮注入，非首轮整个步骤跳过（不调服
   });
   assert.equal(first.steps[0].outcome, 'injected');
   assert.equal(first.text, `ROLECARD\n\nhello\n\n${protocolTokenLine('t')}`);
-  assert.equal(calls[0].firstTurn, true, '首轮标记进 serviceCallRequest（加工型装饰器的自治依据）');
+  // tool.call 统一改造：首轮语义由网关 once 规则 + epoch 去重覆盖，信封不再带 firstTurn。
+  assert.equal('firstTurn' in calls[0].request, false, '信封无 firstTurn 字段');
+  assert.deepEqual(calls[0].request.args, {}, 'decorator 的 args 恒为空对象');
 
   const second = await pipeline.runForward({
     consumerId: 'qq-main', sessionKey: 's', turnToken: 't2', text: 'hello2', isFirstTurnOfSession: false,
@@ -760,9 +796,9 @@ test('rules: 本地静态供料——prefix/suffix/regex/function 四种拼接�
 
 test('rules: 装饰器产出 + join 规则——引擎接管拼接（供料型），sections 不再单独收集', async () => {
   const registry = fakeServiceRegistry({
-    services: { feed: { id: 'feed', kind: 'decorator' } },
+    services: { feed: { id: 'feed', kind: 'resource', role: 'decorator' } },
     pipelines: { 'qq-main': [{ step: 'feed', join: 'prefix' }] },
-    results: { feed: { verdict: 'pass', sections: [{ name: 'mem', text: 'MEMORY' }] } },
+    results: { feed: { sections: [{ name: 'mem', text: 'MEMORY' }] } },
   });
   const pipeline = createPipeline({ registry, builtinSteps: buildBuiltinSteps(), budgetChars: 6000 });
   const out = await pipeline.runForward({ consumerId: 'qq-main', sessionKey: 's', turnToken: 't', text: 'hello' });

@@ -2,17 +2,20 @@
  * V2 P2 管线引擎（core）：纯通用编排器——通路（forward）步骤的确定性执行。
  *
  * 职责边界（docs/design/GATEWAY_V2_REFACTOR.md §1/§3，读它再读这里）：
- *  - 步骤两类：**内置**（main.mjs 注入的步骤对象；P3 转正后仅剩强制殿后的
- *    protocol）与**外部**（登记的 decorator/filter/shadow，经 service-registry
- *    调用；装饰器能力由登记工具声明 roles 承载）。本文件不认识任何具体步骤名，
- *    core 无平台/服务名（test-layering 钉住）。
+ *  - 步骤两类：**内置**（main.mjs 注入的步骤对象；仅剩强制殿后的 protocol）
+ *    与**外部**（decorator/filter 角色的登记工具，经 service-registry 走
+ *    tool.call 调用；编排能力由登记工具声明 role 承载）。本文件不认识任何
+ *    具体步骤名，core 无平台/服务名（test-layering 钉住）。
+ *  - 步骤解析两级：builtin protocol → decorator/filter 工具名。**服务 id
+ *    直接当步骤不再合法**（resolveStep 对其报迁移错——tool.call 统一改造）。
  *  - 只作用于「网关 ↔ DSH」之间的消息：入口 text 是入站 prompt（适配器终稿 /
  *    合成事件文案 / 兜底文案，由调用方先解析好），出口 text 交给 dsh.prompt。
  *    消费者入站信封与 DSH 事件流协议不变。
- *  - 每个外部步骤一个入口一个出口：verdict=drop 短路（turn 按「无消息」处理，
- *    幂等键不变）；decorator 的 message 改写当前 text、sections 追加具名文本块。
- *  - fail-safe：外部步骤超时/非法响应/抛错一律记 degraded **继续**——宁放行
- *    不误杀；内置步骤 build 抛错同口径（与 context-assembler 语义一致）。
+ *  - 每个外部步骤一个入口一个出口：filter 改写当前 text，**text 空串 = 丢弃
+ *    消息**（turn 按「无消息」处理，幂等键不变）；decorator 纯注入（sections
+ *    追加具名文本块 + epoch 纪元去重），改写/丢弃职责完全归 filter。
+ *  - fail-safe：外部步骤超时/非法响应/抛错/业务失败一律记 degraded **继续**
+ *    ——宁放行不误杀；内置步骤 build 抛错同口径。
  *
  * 组装规则（确定性，测试钉住）：
  *  1. 步骤按编排顺序串行执行（顺序敏感，不做 priority 重排——重排是 assembler
@@ -25,24 +28,23 @@
  * 注入规则引擎（P4.x，编排条目双形态中的对象条目）：
  *  - 本地静态步骤（条目带 text）：内容直接来自编排配置，零服务调用——
  *    供料语义，join 缺省 'suffix'（与 sections 追加同向）。
- *  - 外部步骤配置 join：装饰器产出（message ?? sections 文本）视为 extra，
- *    引擎接管拼接（prefix/suffix 加 `\n\n` 分隔、regex 以 {extra} 占位替换、
- *    function 调用 (message, extra) => string）——「供料型装饰器 + 编排规则」。
+ *  - 外部步骤配置 join：decorator 产出（sections 文本）视为 extra，引擎接管
+ *    拼接（prefix/suffix 加 `\n\n` 分隔、regex 以 {extra} 占位替换、function
+ *    调用 (message, extra) => string）——「供料型装饰器 + 编排规则」。
  *  - once：仅会话首轮执行（isFirstTurnOfSession 由调用方传入，判定数据源是
  *    turn store 会话历史，归网关不归服务）。非首轮整个步骤跳过（不调服务）。
- *  - ctx 透传：首轮时 serviceCallRequest 带 firstTurn:true——加工型装饰器
- *    可据此自治实现 once（契约不降级：消息进消息出仍是装饰器定义）。
+ *    会话纪元去重（epoch）是注入侧的自治 once——两者语义互补。
  *  - 规则编译随条目对象缓存（WeakMap，热加载换装后自然失效）；函数/正则
  *    运行期异常 fail-safe：记 degraded 保留当前文本，不中断管线。
  *
  * runForward/runReturn 永不抛错：失败返回 { ok:false, ... }，调用方回退原文。
  * 回路（return：DSH 产出 → 消费者）与通路共用同一套步骤循环（P5 抽取的
- * runChain），差异面只有三处：编排来源（pipelineForReturn）、protocol 只在
- * forward 强制殿后（令牌只在入站有意义）、serviceCallRequest 带 direction。
- * 回路的调用方是 deliverAction（发送动作外发文本过链）：verdict=drop = 拦截
- * 投递；text = 改写后的外发文本。
+ * runChain），差异面只有两处：编排来源（pipelineForReturn）、protocol 只在
+ * forward 强制殿后（令牌只在入站有意义）。回路的调用方是 deliverAction
+ * （发送动作外发文本过链）：filter 链产出空串 = 拦截投递；text = 改写后的外发文本。
  */
 import { randomUUID } from 'node:crypto';
+import { parsePipelineStepResult } from './service-registry.mjs';
 
 const PROTOCOL_STEP = 'protocol';
 const JOIN_SEPARATOR = '\n\n';
@@ -104,18 +106,24 @@ export function createPipeline({
   newCallId = randomUUID,
 } = {}) {
   /**
-   * 步骤名解析（三级）：内置优先；其次已登记外部服务 id；最后装饰器/过滤器
-   * 角色的登记工具名（工具即步骤——recall 既是模型可调的工具，也是可编排的
-   * 装饰器，见 contracts.mjs SERVICE_TOOL_ROLES）。未知 = 配置错误。
+   * 步骤名解析（两级，tool.call 统一改造）：内置 protocol 优先；其次
+   * decorator/filter 角色的登记工具名（工具即步骤——chat_memory_get 既是
+   * 模型可调的工具，也是可编排的装饰器，见 contracts.mjs SERVICE_TOOL_ROLES）。
+   * 服务 id 直接当步骤不再合法：显式报迁移错（fail-closed，启动装载/
+   * 热加载/控制台写入三处共用本函数）。未知 = 配置错误。
    */
   function resolveStep(name) {
     const builtin = builtinSteps[name];
     if (builtin) return { type: 'builtin', name, step: builtin };
-    const service = registry?.resolveService?.(name) ?? null;
-    if (service) return { type: 'external', name, service };
     const toolStep = registry?.resolveToolStep?.(name) ?? null;
-    if (toolStep) return { type: 'external', name, service: toolStep.service };
-    throw new Error(`unknown pipeline step "${name}" (not a builtin step, registered service, or decorator/filter tool)`);
+    if (toolStep) return { type: 'external', name, service: toolStep.service, tool: toolStep.tool };
+    if (registry?.resolveService?.(name)) {
+      throw new Error(
+        `pipeline step "${name}" is a registered service id — service ids are no longer valid steps; `
+        + `use a decorator/filter-role tool name declared by "${name}" (e.g. chat_memory_get)`,
+      );
+    }
+    throw new Error(`unknown pipeline step "${name}" (not a builtin step or a decorator/filter-role tool)`);
   }
 
   /** 规则编译缓存：原始条目对象 → { shape, re?, fn? }（WeakMap，换装自然失效）。
@@ -166,7 +174,7 @@ export function createPipeline({
     const keys = new Set([...(registry?.pipelineKeys?.() ?? []), ...consumerIds]);
     for (const key of keys) {
       for (const entry of registry?.pipelineFor?.(key) ?? []) {
-        const shape = entryShape(entry); // 抛错 = 启动失败（fail-closed，与 adapters.json 同口径）
+        const shape = entryShape(entry); // 抛错 = 启动失败（fail-closed，与 pipelines.json 同口径）
         if (typeof entry !== 'string' && shape.text !== undefined) continue; // 本地静态步骤不做三级解析
         resolveStep(shape.name);
       }
@@ -190,8 +198,7 @@ export function createPipeline({
    * fail-safe degraded 全套语义一致。差异面（测试钉住）：
    *  - 编排来源：pipelineFor vs pipelineForReturn（registry 校验层已拒回路配 protocol）；
    *  - protocol 内置步骤只在 forward 强制殿后（安全凭据，不变量 §5.2）；return
-   *    方向防御性拒绝任何内置步骤（回路链只有外部服务/静态供料步骤）；
-   *  - serviceCallRequest 带 direction（服务可感知方向；缺省 forward，既有服务无感）。
+   *    方向防御性拒绝任何内置步骤（回路链只有外部工具/静态供料步骤）。
    *
    * @param {object} input
    * @param {'forward'|'return'} input.direction 管线方向
@@ -203,7 +210,8 @@ export function createPipeline({
    * @param {string} [input.text]      管线消息本体的初始值（forward=入站 prompt；
    *   return=发送动作外发文本）
    * @param {boolean} [input.isFirstTurnOfSession] 会话首轮判定（调用方经 turn store
-   *   得出——首轮判定归网关）。once 规则与外部步骤 ctx.firstTurn 的数据源。
+   *   得出——首轮判定归网关）。once 规则的数据源（不再随信封下发——首轮语义由
+   *   once 规则 + epoch 去重覆盖，tool.call 统一改造后契约无 firstTurn 字段）。
    * @param {number} [input.budgetChars]
    * @returns {Promise<object>} { ok, verdict, text, chars, sections, steps, degraded, dropped, reason? }
    */
@@ -314,100 +322,115 @@ export function createPipeline({
         continue;
       }
 
-      // ── 外部步骤：service.call（契约与 fail-safe 语义见文件头）────────────
-      const { service } = resolved;
-      const request = {
-        v: 1,
-        callId: newCallId(),
-        service: service.id,
-        step: resolved.name,
-        kind: service.kind,
-        sessionKey,
-        turnId,
-        senderId, // §6.4 按对象召回：记忆服务以它识别 identity（画像/关系）的 subject
-        text: current,
-        direction, // P5：服务可感知方向（forward/return），既有服务无感（schema 缺省 forward）
-      };
-      if (firstTurn) request.firstTurn = true; // 加工型装饰器的自治 once 依据（契约不降级）
+      // ── 外部步骤：tool.call（唯一服务间信封；契约与 fail-safe 语义见文件头）──
+      const { service, tool } = resolved;
+      // context 契约：senderId = 发送者平台用户 id（§6.4 按对象召回；出站/合成
+      // 事件无 senderId 时缺省）；text 仅 filter 下发（当前工作文本），decorator 不带。
+      const context = {};
+      if (senderId) context.senderId = senderId;
+      if (tool.role === 'filter') context.text = current;
       let result;
       try {
-        result = await registry.callService(service.id, request);
+        result = await registry.callServiceTool(service.id, {
+          tool: tool.name,
+          args: {}, // decorator/filter 的 args 恒为空对象（行为由 role 决定）
+          sessionKey,
+          turnId,
+          context,
+        });
       } catch (error) {
-        logger(`pipeline service "${service.id}" call failed: ${error?.message ?? error}`);
+        // 传输/契约失败（超时/断连/非法帧）：宁放行不误杀。
+        logger(`pipeline tool "${service.id}/${tool.name}" call failed: ${error?.message ?? error}`);
         summary.outcome = 'degraded';
         degraded = true;
         metrics?.inc('gateway_pipeline_step_total', { outcome: 'degraded' });
-        continue; // 宁放行不误杀
+        continue;
       }
       metrics?.inc('gateway_pipeline_step_total', { outcome: 'ok' });
 
-      if (result.verdict === 'drop') {
-        summary.outcome = 'drop';
-        dropReason = result.reason ?? '';
-        logger(`pipeline step "${resolved.name}" dropped the message${result.reason ? `: ${result.reason}` : ''}`);
-        return {
-          ...base,
-          verdict: 'drop',
-          reason: dropReason,
-          steps: summaries,
-          degraded,
-          text: current,
-        };
-      }
-
-      if (service.kind === 'shadow') {
-        // shadow 步骤：只记录 diff，不应用（灰度验收期语义，§3）。
-        const same = (result.message ?? current) === current;
-        metrics?.inc('gateway_pipeline_shadow_total', { diff: same ? 'same' : 'diff' });
-        if (!same) logger(`pipeline shadow "${service.id}" diff: proposed=${(result.message ?? '').length}c current=${current.length}c`);
-        summary.outcome = same ? 'shadow-same' : 'shadow-diff';
+      if (result.ok !== true) {
+        // 业务失败（ok:false + error）是正常结果而非传输错误，但管线步骤语义下
+        // 与失效步骤同口径：degraded 放行（filter 失败绝不该变成误杀）。
+        logger(`pipeline tool "${service.id}/${tool.name}" business failure: ${result.error?.code ?? ''} ${result.error?.message ?? ''}`);
+        summary.outcome = 'degraded';
+        degraded = true;
         continue;
       }
 
-      if (service.kind === 'filter' && (result.message !== undefined || (result.sections ?? []).length > 0)) {
-        // filter 只表达放行/丢弃；带内容属于契约误用，忽略并提醒（不放行内容等于放行）。
-        logger(`pipeline filter "${service.id}" returned content but kind=filter, ignored`);
+      // 结果按工具 role 收口（parsePipelineStepResult 抛错 = 服务坏了，degraded 放行）。
+      let parsed;
+      try {
+        parsed = parsePipelineStepResult(tool.role, result.data);
+      } catch (error) {
+        logger(`pipeline tool "${service.id}/${tool.name}" returned an invalid result: ${error?.message ?? error}`);
+        summary.outcome = 'degraded';
+        degraded = true;
+        continue;
       }
-      if (service.kind === 'decorator') {
-        // 会话纪元契约（§6.4）：响应带 epoch = 记忆服务的多 block 注入。服务端
-        // 每次都幂等返回全部 block + epoch；网关按 (sessionKey, subjectId, epoch)
-        // 去重——同 epoch 已注入过的 block 不重发，实现「会话首轮注入一次」。
-        // 缓存 LRU 淘汰 / 网关重启后重发是幂等无害的（at-least-once 接收 +
-        // 去重 = exactly-once 注入；多注入一次也不丢数据）。
-        const epochBlocks = Number.isSafeInteger(result.epoch)
-          ? identitySendBlocks(sessionKey, senderId, result.epoch, result.sections ?? [])
-          : null;
-        if (resolved.rule?.shape.join) {
-          // 供料型 + 编排规则（P4.x）：装饰器产出（message 优先，缺省取
-          // sections 文本）视为 extra，引擎接管拼接——sections 不再单独收集。
-          const extra = typeof result.message === 'string' && result.message.length > 0
-            ? result.message
-            : (epochBlocks ?? result.sections ?? []).map((section) => section.text).filter(Boolean).join(JOIN_SEPARATOR);
-          try {
-            current = applyJoin(resolved.rule, current, extra);
-            summary.outcome = 'injected';
-          } catch (error) {
-            logger(`pipeline step "${resolved.name}" join rule failed: ${error?.message ?? error}`);
-            summary.outcome = 'degraded';
-            degraded = true;
-          }
-        } else if (typeof result.message === 'string') {
-          current = result.message;
-          summary.outcome = 'rewritten';
-        } else {
-          summary.outcome = 'pass';
+
+      if (tool.role === 'filter') {
+        // filter 改写器语义：输出 {text, reason?}。text 空串 = 丢弃该消息
+        // （入站不建 turn；出站不发送），reason 仅进日志/诊断（约定不含正文）。
+        const filtered = parsed.text;
+        if (filtered === '') {
+          summary.outcome = 'drop';
+          dropReason = parsed.reason ?? '';
+          logger(`pipeline filter "${resolved.name}" dropped the message${parsed.reason ? `: ${parsed.reason}` : ''}`);
+          return {
+            ...base,
+            verdict: 'drop',
+            reason: dropReason,
+            steps: summaries,
+            degraded,
+            text: current,
+          };
         }
-        // join 规则接管时 sections 已并入 extra（经 applyJoin 进消息本体），
-        // 不再重复收集——否则同一内容注入两遍。
-        if (!resolved.rule?.shape.join) {
-          for (const section of epochBlocks ?? result.sections ?? []) {
-            collected.push({
-              name: section.name,
-              text: section.text,
-              priority: section.priority ?? 0,
-              from: service.id,
-            });
-          }
+        const before = current;
+        current = filtered;
+        summary.outcome = current === before ? 'pass' : 'rewritten';
+        if (parsed.reason && summary.outcome === 'rewritten') {
+          logger(`pipeline filter "${resolved.name}" rewrote text${parsed.reason ? `: ${parsed.reason}` : ''}`);
+        }
+        continue;
+      }
+
+      // ── decorator：纯注入（改写/丢弃职责完全归 filter）─────────────────────
+      // 会话纪元契约（§6.4）：结果带 epoch = 记忆服务的多 block 注入。服务端
+      // 每次都幂等返回全部 block + epoch；网关按 (sessionKey, subjectId, epoch)
+      // 去重——同 epoch 已注入过的 block 不重发，实现「会话首轮注入一次」。
+      // 缓存 LRU 淘汰 / 网关重启后重发是幂等无害的（at-least-once 接收 +
+      // 去重 = exactly-once 注入；多注入一次也不丢数据）。
+      const epochBlocks = Number.isSafeInteger(parsed.epoch)
+        ? identitySendBlocks(sessionKey, senderId, parsed.epoch, parsed.sections ?? [])
+        : null;
+      if (resolved.rule?.shape.join) {
+        // 供料型 + 编排规则（P4.x）：decorator 产出（sections 文本）视为 extra，
+        // 引擎接管拼接——sections 不再单独收集。
+        const extra = (epochBlocks ?? parsed.sections ?? [])
+          .map((section) => section.text).filter(Boolean).join(JOIN_SEPARATOR);
+        try {
+          current = applyJoin(resolved.rule, current, extra);
+          summary.outcome = extra ? 'injected' : 'pass';
+        } catch (error) {
+          logger(`pipeline step "${resolved.name}" join rule failed: ${error?.message ?? error}`);
+          summary.outcome = 'degraded';
+          degraded = true;
+        }
+      } else {
+        const injectable = epochBlocks ?? parsed.sections ?? [];
+        summary.outcome = injectable.some((section) => typeof section?.text === 'string' && section.text.length > 0)
+          ? 'injected' : 'pass';
+      }
+      // join 规则接管时 sections 已并入 extra（经 applyJoin 进消息本体），
+      // 不再重复收集——否则同一内容注入两遍。
+      if (!resolved.rule?.shape.join) {
+        for (const section of epochBlocks ?? parsed.sections ?? []) {
+          collected.push({
+            name: section.name,
+            text: section.text,
+            priority: section.priority ?? 0,
+            from: service.id,
+          });
         }
       }
     }

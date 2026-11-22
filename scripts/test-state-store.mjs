@@ -13,9 +13,14 @@ const { loadConfig } = await import(new URL('../src/core/config.mjs', import.met
 const { createGatewayServer } = await import(new URL('../src/core/server.mjs', import.meta.url).href);
 const { signRequest } = await import(new URL('../src/core/auth.mjs', import.meta.url).href);
 const { createSessionRegistry } = await import(new URL('../src/runtime/session-registry.mjs', import.meta.url).href);
+// 建会话需要适配器声明「平台→preset」：测试里用一个最小的声明表顶替登记文件。
+const PRESETS_FOR = () => ({ qq: 'qq-chat', wx: 'wx-chat' });
 const { createPromptQueue } = await import(new URL('../src/runtime/prompt-queue.mjs', import.meta.url).href);
 const { createDshGateway } = await import(new URL('../src/runtime/dsh-gateway.mjs', import.meta.url).href);
 const { createTurnStore } = await import(new URL('../src/core/turn-store.mjs', import.meta.url).href);
+const { seedConsumer, createConsumerRegistry } = await import(
+  new URL('./support/consumer-registration.mjs', import.meta.url).href
+);
 
 const ADAPTER_SECRET = 'adapter-secret-0123456789';
 
@@ -157,12 +162,11 @@ test('contracts: stateUpdate 按 action 校验必填字段', () => {
 
 async function startServer(env, runtime) {
   const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), 'gateway-state-'));
-  const config = loadConfig({
-    env,
-    stateDir,
-    adapters: [{ id: 'qq-main', platform: 'qq', secret: ADAPTER_SECRET }],
-  });
-  const gateway = createGatewayServer({ config, logger: () => {}, runtime });
+  // 消费端身份只认登记目录（mode=on 需至少一份 kind=consumer 登记）。
+  seedConsumer(stateDir, { id: 'qq-main', platform: 'qq', secret: ADAPTER_SECRET });
+  const config = loadConfig({ env, stateDir });
+  const services = env.GATEWAY_MODE === 'off' ? null : createConsumerRegistry({ stateDir });
+  const gateway = createGatewayServer({ config, logger: () => {}, runtime, services });
   await gateway.listen();
   return { gateway, port: gateway.server.address().port };
 }
@@ -270,7 +274,7 @@ function createFakeDsh() {
       this.emit({ type: 'session/event', sessionId, event: { type: 'assistant/message', data: { turn, message: { content: [{ type: 'text', text }] } } } });
       this.emit({ type: 'session/event', sessionId, event: { type: 'turn/end', data: { turn, reason: { kind: 'completed' } } } });
     },
-    async listPresets() { return ['qq-chat-v2']; },
+    async listPresets() { return ['qq-chat', 'minimal']; },
     async ensureWorkspace() { return 'ws'; },
     async createSession() { const id = `s${++seq}`; state.sessions.set(id, { turns: 0 }); return id; },
     async selectModel() { return {}; },
@@ -292,8 +296,8 @@ async function waitFor(predicate, { timeoutMs = 2000, stepMs = 10 } = {}) {
 
 test('turn-runner: 带 seq 的入站登记进 mailbox，不带 seq 的不猜', async () => {
   const dsh = createFakeDsh();
-  const chat = { preset: 'qq-chat-v2', provider: 'p', model: 'm', reasoningEffort: 'max', workspaceDir: fs.mkdtempSync(path.join(os.tmpdir(), 'gw-mb-')), turnTimeoutMs: 2000 };
-  const registry = createSessionRegistry({ dsh, chat, file: null });
+  const chat = { preset: 'qq-chat', provider: 'p', model: 'm', reasoningEffort: 'max', workspaceDir: fs.mkdtempSync(path.join(os.tmpdir(), 'gw-mb-')), turnTimeoutMs: 2000 };
+  const registry = createSessionRegistry({ presetsFor: PRESETS_FOR, dsh, chat, file: null });
   const gateway = createDshGateway({ dsh, turnTimeoutMs: 2000 });
   const mailbox = createMailbox({ file: null });
   const { createTurnRunner } = await import(new URL('../src/runtime/turn-runner.mjs', import.meta.url).href);

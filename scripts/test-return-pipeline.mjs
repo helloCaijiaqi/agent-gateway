@@ -1,6 +1,6 @@
 /**
- * P5 回路链执行端到端：
- *  - engine 级：runReturn 语义（filter drop / decorator 改写 / direction 透传 /
+ * P5 回路链执行端到端（tool.call 统一改造后语义）：
+ *  - engine 级：runReturn 语义（filter 改写/空串丢弃 / decorator 纯注入 /
  *    once / 静态供料 / default 回退 / forward 不受影响）；
  *  - transport 级：deliverAction 拦截点（drop 不发请求且回执成功 / 改写生效 /
  *    无钩子或无 text 或钩子异常 = 原样透传）。
@@ -19,10 +19,15 @@ const BUILTINS = {
 function fakeServiceRegistry({ services = {}, pipelines = {}, returnPipelines = {}, results = {}, requests = [] } = {}) {
   return {
     resolveService: (id) => services[id] ?? null,
-    resolveToolStep: () => null,
-    async callService(id, request) {
+    resolveToolStep: (name) => {
+      const svc = services[name];
+      if (!svc || svc.kind === 'consumer' || !svc.role) return null;
+      return { service: svc, kind: svc.kind, tool: { name, role: svc.role } };
+    },
+    async callServiceTool(id, request) {
       requests.push({ id, request });
-      return { v: 1, callId: request.callId, ...(results[id] ?? {}) };
+      // tool.call 契约：decorator {sections,epoch} / filter {text,reason} 装 data。
+      return { ok: true, data: results[id] ?? {} };
     },
     pipelineFor: (consumerId) => pipelines[consumerId] ?? pipelines.default ?? [],
     pipelineKeys: () => Object.keys(pipelines),
@@ -34,17 +39,18 @@ function fakeServiceRegistry({ services = {}, pipelines = {}, returnPipelines = 
 
 // ---------------------------------------------------------------- engine 级
 
-test('runReturn: filter drop 拦截 + decorator 改写 + direction=return 透传契约', async () => {
+test('runReturn: filter 改写外发文本 + drop 空串拦截 + context.text 契约', async () => {
   const requests = [];
   const registry = fakeServiceRegistry({
     services: {
-      guard: { id: 'guard', kind: 'filter' },
-      rewriter: { id: 'rewriter', kind: 'decorator' },
+      guard: { id: 'guard', kind: 'resource', role: 'filter' },
+      // decorator 在回路面只做注入（改写职责归 filter）。
+      enrich: { id: 'enrich', kind: 'resource', role: 'decorator' },
     },
-    returnPipelines: { 'qq-main': ['guard', 'rewriter'] },
+    returnPipelines: { 'qq-main': ['guard', 'enrich'] },
     results: {
-      guard: { verdict: 'pass' },
-      rewriter: { verdict: 'pass', message: '改写后的回复' },
+      guard: { text: '改写后的回复' },
+      enrich: { sections: [{ name: '附言', text: '【附言】记得查收' }] },
     },
     requests,
   });
@@ -55,18 +61,19 @@ test('runReturn: filter drop 拦截 + decorator 改写 + direction=return 透传
   });
   assert.equal(out.ok, true);
   assert.equal(out.verdict, 'pass');
-  assert.equal(out.text, '改写后的回复', 'decorator 改写外发文本');
+  assert.equal(out.text, '改写后的回复\n\n【附言】记得查收', 'filter 改写外发文本 + decorator 追加');
   assert.equal(out.degraded, false);
-  // direction 字段进契约（服务可感知方向）；firstTurn 未传不带。
-  assert.equal(requests[0].request.direction, 'return');
-  assert.equal(requests[0].request.text, '原始回复');
-  assert.equal(requests[1].request.direction, 'return');
+  // tool.call 契约：filter 的 context.text = 当前工作文本；decorator 不带 text。
+  assert.equal(requests[0].request.context.text, '原始回复');
+  assert.equal('text' in requests[1].request.context, false, 'decorator 调用不带 context.text');
+  assert.equal('firstTurn' in requests[0].request, false, '信封无 firstTurn 字段');
+  assert.equal('direction' in requests[0].request, false, '信封无 direction 字段');
 
-  // drop：verdict=drop 短路（调用方拦截投递）。
+  // drop：filter text 空串 = 短路（调用方拦截投递）。
   const dropRegistry = fakeServiceRegistry({
-    services: { guard: { id: 'guard', kind: 'filter' } },
+    services: { guard: { id: 'guard', kind: 'resource', role: 'filter' } },
     returnPipelines: { 'qq-main': ['guard'] },
-    results: { guard: { verdict: 'drop', reason: 'sensitive' } },
+    results: { guard: { text: '', reason: 'sensitive' } },
   });
   const dropped = await createPipeline({ registry: dropRegistry, builtinSteps: BUILTINS })
     .runReturn({ consumerId: 'qq-main', sessionKey: 's', text: 'x' });
@@ -74,20 +81,19 @@ test('runReturn: filter drop 拦截 + decorator 改写 + direction=return 透传
   assert.equal(dropped.reason, 'sensitive');
 });
 
-test('runReturn: forward 面不受影响（direction=forward + protocol 殿后）', async () => {
+test('runReturn: forward 面不受影响（filter 改写 + protocol 殿后）', async () => {
   const requests = [];
   const registry = fakeServiceRegistry({
-    services: { persona: { id: 'persona', kind: 'decorator' } },
-    pipelines: { 'qq-main': ['persona'] },
-    results: { persona: { verdict: 'pass', message: 'PERSONA' } },
+    services: { guard: { id: 'guard', kind: 'resource', role: 'filter' } },
+    pipelines: { 'qq-main': ['guard'] },
+    results: { guard: { text: 'PERSONA' } },
     requests,
   });
   const pipeline = createPipeline({ registry, builtinSteps: BUILTINS, budgetChars: 6000 });
   const out = await pipeline.runForward({
     consumerId: 'qq-main', sessionKey: 's', turnToken: 'tk', text: 'msg',
   });
-  assert.equal(out.text, `PERSONA\n\n${protocolTokenLine('tk')}`, 'decorator 整段改写 + protocol 殿后');
-  assert.equal(requests[0].request.direction, 'forward', '契约缺省/显式 forward');
+  assert.equal(out.text, `PERSONA\n\n${protocolTokenLine('tk')}`, 'filter 改写消息本体 + protocol 殿后');
   // runReturn 与 forward 编排隔离：同一 consumer 无 return 编排 = 透传。
   const ret = await pipeline.runReturn({ consumerId: 'qq-main', sessionKey: 's', text: 'out' });
   assert.equal(ret.text, 'out');
@@ -97,11 +103,11 @@ test('runReturn: forward 面不受影响（direction=forward + protocol 殿后�
 test('runReturn: once 首轮跳过 + 本地静态供料 + default 键回退', async () => {
   const requests = [];
   const registry = fakeServiceRegistry({
-    services: { feed: { id: 'feed', kind: 'decorator' } },
+    services: { feed: { id: 'feed', kind: 'resource', role: 'decorator' } },
     returnPipelines: {
       default: [{ step: 'feed', once: true, join: 'prefix' }, { step: 'sign', text: '—— 网关' }],
     },
-    results: { feed: { verdict: 'pass', message: '首轮摘要' } },
+    results: { feed: { sections: [{ name: '摘要', text: '首轮摘要' }] } },
     requests,
   });
   const pipeline = createPipeline({ registry, builtinSteps: BUILTINS, budgetChars: 6000 });

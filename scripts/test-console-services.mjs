@@ -12,6 +12,7 @@ import test from 'node:test';
 const { loadConfig } = await import(new URL('../src/core/config.mjs', import.meta.url).href);
 const { createGatewayServer } = await import(new URL('../src/core/server.mjs', import.meta.url).href);
 const { createServiceRegistry } = await import(new URL('../src/core/service-registry.mjs', import.meta.url).href);
+const { seedConsumer, seedOperatorToken } = await import(new URL('./support/consumer-registration.mjs', import.meta.url).href);
 const { createTokenLedger } = await import(new URL('../src/core/usage-ledger.mjs', import.meta.url).href);
 const { resolvePriceTable } = await import(new URL('../src/core/prices.mjs', import.meta.url).href);
 
@@ -25,29 +26,34 @@ const JSON_TYPE = { 'content-type': 'application/json', connection: 'close' };
 
 async function startServer(envExtra = {}) {
   const stateDir = mkdtempSync(path.join(os.tmpdir(), 'gw-console-svc-test-'));
+  // 消费端身份只认登记目录：qq-main 落成 services/qq-main.json。
+  for (const adapter of ADAPTERS) {
+    seedConsumer(stateDir, { id: adapter.id, platform: adapter.platform, secret: adapter.secret });
+  }
+  // 控制台凭据文件单源（env 通道已退役）。
+  seedOperatorToken(stateDir, TOKEN);
   const config = loadConfig({
     // GATEWAY_PORT=0：node --test 并发跑多个文件，别的测试文件也可能监听默认端口。
-    env: { GATEWAY_MODE: 'shadow', GATEWAY_CONSOLE: 'on', GATEWAY_OPERATOR_TOKEN: TOKEN, GATEWAY_PORT: '0', ...envExtra },
-    adapters: ADAPTERS,
+    env: { GATEWAY_MODE: 'shadow', GATEWAY_CONSOLE: 'on', GATEWAY_PORT: '0', ...envExtra },
     stateDir,
   });
   mkdirSync(config.registrations.dir, { recursive: true });
-  // 编排硬切：echo-svc 从内联 services 迁为登记文件（可读 id 合法）；
+  // 编排硬切：echo-svc 从内联 services 迁为登记文件（可读 id 合法），带 decorator
+  // 工具 chat_echo——两级解析下步骤名写工具名，服务 id 不再是合法步骤；
   // pipelines.json 初始为空（无编排）。
   writeFileSync(path.join(config.registrations.dir, 'echo-svc.json'), JSON.stringify({
-    v: 1, id: 'echo-svc', name: 'echo-svc', kind: 'decorator', transport: 'ws',
+    v: 1, id: 'echo-svc', name: 'echo-svc', kind: 'resource', transport: 'http', url: 'http://127.0.0.1:7391',
     secret: 'echo-service-secret-0123456789', enabled: true,
+    tools: [{ name: 'chat_echo', description: '回声装饰器', inputSchema: {}, role: 'decorator' }],
   }, null, 2));
   writeFileSync(config.pipeline.file, '{}\n');
   const registry = createServiceRegistry({
     pipelinesFile: config.pipeline.file,
     stateDir,
-    reservedIds: ADAPTERS.map((a) => a.id),
-    consumerIds: ADAPTERS.map((a) => a.id),
     registrations: { ...config.registrations, reloadMs: 0 },
     logger: () => {},
   });
-  // server 用 status().builtinSteps 做步骤名三级解析的前置校验；P5 起还读
+  // server 用 status().builtinSteps 做步骤名两级解析的前置校验；P5 起还读
   // returnEffective（回路引擎开关）——测试装配按 on（已接通）标注。
   const pipeline = { status: () => ({ builtinSteps: ['protocol'], returnEffective: true }) };
   // 计费总览需要账本（/v1/console/adapters 无 ledger = 503）。
@@ -127,7 +133,7 @@ test('console services: 无 operator 凭据 401；registry 未装配 503', async
     assert.equal(list.status, 200);
     const body = await list.json();
     assert.equal(body.registrationsEnabled, true);
-    assert.deepEqual(body.services.map((s) => s.id).sort(), ['echo-svc']);
+    assert.deepEqual(body.services.map((s) => s.id).sort(), ['echo-svc', 'qq-main']);
   } finally {
     await gateway.close();
   }
@@ -139,43 +145,60 @@ test('console services: 注册流——secret 落盘不进登记文件、台账 
     // 非法输入：secret 与 secretEnv 二选一。
     const both = await fetch(`${base}/v1/console/services`, {
       method: 'POST', headers: { ...OPERATOR, ...JSON_TYPE },
-      body: JSON.stringify({ name: 'x', kind: 'decorator', transport: 'ws', secret: 's'.repeat(20), secretEnv: 'X_SECRET' }),
+      body: JSON.stringify({ name: 'x', kind: 'resource', transport: 'http', url: 'http://127.0.0.1:7392', secret: 's'.repeat(20), secretEnv: 'X_SECRET' }),
     });
     assert.equal(both.status, 400);
     // 非法输入：非回环 url（fail-closed，先于文件落盘）。
     const badUrl = await fetch(`${base}/v1/console/services`, {
       method: 'POST', headers: { ...OPERATOR, ...JSON_TYPE },
-      body: JSON.stringify({ name: 'x', kind: 'decorator', transport: 'http', url: 'http://10.0.0.8:9', secret: 'bad-url-secret-0123456789' }),
+      body: JSON.stringify({ name: 'x', kind: 'resource', transport: 'http', url: 'http://10.0.0.8:9', secret: 'bad-url-secret-0123456789' }),
     });
     assert.equal(badUrl.status, 400);
     assert.match((await badUrl.json()).error.message, /loopback/);
-    // shadow 已进入登记 kind 词典（灰度对账服务可登记）；无凭据仍挡在落盘前。
-    const shadowNoCred = await fetch(`${base}/v1/console/services`, {
+    // 凭据三态：secret / secretEnv 全缺 → 服务端自动生成（201 + 回执一次性明文回显）。
+    // 空串视同未填（UI 展示值粘贴空格时不应炸）。
+    const noCredResource = await fetch(`${base}/v1/console/services`, {
       method: 'POST', headers: { ...OPERATOR, ...JSON_TYPE },
-      body: JSON.stringify({ name: 'x', kind: 'shadow', transport: 'ws' }),
+      body: JSON.stringify({ name: 'auto-secret-mcp', kind: 'resource', transport: 'http', url: 'http://127.0.0.1:7181', secret: '  ' }),
     });
-    assert.equal(shadowNoCred.status, 400);
-    assert.match((await shadowNoCred.json()).error.message, /credential/);
-    // 非法输入：无凭据（登记服务与网关是 HMAC，resolveSecret 必拒载——挡在落盘前）。
-    const noSecret = await fetch(`${base}/v1/console/services`, {
-      method: 'POST', headers: { ...OPERATOR, ...JSON_TYPE },
-      body: JSON.stringify({ name: 'x', kind: 'decorator', transport: 'ws' }),
-    });
-    assert.equal(noSecret.status, 400);
-    assert.match((await noSecret.json()).error.message, /credential/);
+    assert.equal(noCredResource.status, 201);
+    const auto = await noCredResource.json();
+    assert.equal(auto.secretGenerated, true, '回执标注来源为服务端生成');
+    assert.ok(typeof auto.secret === 'string' && auto.secret.length >= 16, 'secret 一次性明文回显');
+    // 密钥文件落盘且与回执一致；登记文件不含明文（只有 secretFile 引用）。
+    const autoSecretFile = path.join(stateDir, 'secrets', `${auto.id}.secret`);
+    assert.equal(readFileSync(autoSecretFile, 'utf8').trim(), auto.secret);
+    const autoRegFile = JSON.parse(readFileSync(path.join(stateDir, 'services', `${auto.id}.json`), 'utf8'));
+    assert.equal(autoRegFile.secret, undefined);
+    assert.equal(autoRegFile.secretFile, `secrets/${auto.id}.secret`);
+    // 交接文件与密钥同源：secretFile 指向同一落盘文件（复制 handoff 即完成交接）。
+    const autoHandoff = JSON.parse(readFileSync(auto.handoffFile, 'utf8'));
+    assert.equal(autoHandoff.secretFile, autoSecretFile);
 
-    // 合法注册：decorator + decorator 角色工具 + secret 落盘。
+    // 合法注册：decorator + decorator 单值 role 工具 + secret 落盘。
     const res = await fetch(`${base}/v1/console/services`, {
       method: 'POST', headers: { ...OPERATOR, ...JSON_TYPE },
       body: JSON.stringify({
-        name: 'memory-mcp', kind: 'decorator', transport: 'ws', timeoutMs: 9000,
-        tools: [{ name: 'chat_memory_recall', description: '检索记忆', roles: ['decorator'] }],
+        name: 'memory-mcp', kind: 'resource', transport: 'http', url: 'http://127.0.0.1:7181', timeoutMs: 9000, memoryService: true,
+        tools: [{ name: 'chat_memory_recall', description: '检索记忆', role: 'decorator' }],
         secret: 'super-secret-value-0123456789',
       }),
     });
     assert.equal(res.status, 201);
-    const { id } = await res.json();
+    const registered = await res.json();
+    const { id } = registered;
     assert.match(id, /^[0-9a-f]{32}$/);
+    // 交接文件：注册即产出可复制的 gateway.json，且回显路径（省掉手抄密钥）。
+    assert.equal(registered.handoffAuth, 'secretFile');
+    assert.equal(registered.handoffFile, path.join(stateDir, 'handoff', `${id}.gateway.json`));
+    assert.ok(existsSync(registered.handoffFile), '交接文件已生成');
+    const handoffDoc = JSON.parse(readFileSync(registered.handoffFile, 'utf8'));
+    assert.equal(handoffDoc.v, 1);
+    assert.equal(handoffDoc.id, id);
+    assert.equal(handoffDoc.kind, 'service');
+    assert.match(handoffDoc.url, /^http:\/\/127\.0\.0\.1:\d+$/);
+    assert.equal(handoffDoc.secretFile, path.join(stateDir, 'secrets', `${id}.secret`));
+    assert.ok(!JSON.stringify(handoffDoc).includes('super-secret'), '交接文件只引用密钥文件，不含明文');
 
     const regFile = path.join(config.registrations.dir, `${id}.json`);
     assert.ok(existsSync(regFile), '登记文件落盘（文件名即身份）');
@@ -190,6 +213,9 @@ test('console services: 注册流——secret 落盘不进登记文件、台账 
     // 列表即时可见（operator 扫描），工具面合并。
     const list = await (await get(base, '/v1/console/services', OPERATOR)).json();
     assert.ok(list.registrations.some((r) => r.id === id && r.name === 'memory-mcp'));
+    // 列表带交接文件状态：UI 据此提示「复制到目标仓」是否已做过。
+    const listed = list.registrations.find((r) => r.id === id);
+    assert.deepEqual(listed.handoff, { file: registered.handoffFile, exists: true });
     assert.ok(list.tools.some((t) => t.name === 'chat_memory_recall' && t.serviceId === id));
 
     // 台账：register + source=operator + snapshot 脱敏。
@@ -199,6 +225,13 @@ test('console services: 注册流——secret 落盘不进登记文件、台账 
     assert.equal(event.source, 'operator');
     assert.ok(!JSON.stringify(event.snapshot).includes('super-secret'), '台账快照脱敏');
     assert.equal(event.snapshot.name, 'memory-mcp');
+
+    // 注销：登记、密钥、交接文件一起撤销（否则对端会拿着一份指向空文件的路引）。
+    const del = await fetch(`${base}/v1/console/services/${id}`, { method: 'DELETE', headers: { ...OPERATOR, ...JSON_TYPE } });
+    assert.equal(del.status, 200);
+    assert.equal(existsSync(regFile), false);
+    assert.equal(existsSync(secretFile), false);
+    assert.equal(existsSync(registered.handoffFile), false, '交接文件随注销清理');
   } finally {
     await gateway.close();
   }
@@ -211,8 +244,8 @@ test('console pipelines: PUT fail-closed（未知步骤/非消费端）+ 保存�
     const reg = await fetch(`${base}/v1/console/services`, {
       method: 'POST', headers: { ...OPERATOR, ...JSON_TYPE },
       body: JSON.stringify({
-        name: 'rolecard-mcp', kind: 'decorator', transport: 'ws', secret: 'rolecard-secret-0123456789',
-        tools: [{ name: 'chat_role_render', description: '渲染人格', roles: ['decorator'] }],
+        name: 'rolecard-mcp', kind: 'resource', transport: 'http', url: 'http://127.0.0.1:7182', secret: 'rolecard-secret-0123456789',
+        tools: [{ name: 'chat_role_render', description: '渲染人格', role: 'decorator' }],
       }),
     });
     assert.equal(reg.status, 201);
@@ -238,7 +271,7 @@ test('console pipelines: PUT fail-closed（未知步骤/非消费端）+ 保存�
     // 合法保存：通路 = protocol → 工具步骤；回路 = 服务步骤（引擎透传）。
     const put = await fetch(`${base}/v1/console/pipelines/qq-main`, {
       method: 'PUT', headers: { ...OPERATOR, ...JSON_TYPE },
-      body: JSON.stringify({ forward: ['protocol', 'chat_role_render'], return: ['echo-svc'] }),
+      body: JSON.stringify({ forward: ['protocol', 'chat_role_render'], return: ['chat_echo'] }),
     });
     assert.equal(put.status, 200);
     const putBody = await put.json();
@@ -251,17 +284,18 @@ test('console pipelines: PUT fail-closed（未知步骤/非消费端）+ 保存�
     const doc = JSON.parse(readFileSync(config.pipeline.file, 'utf8'));
     assert.equal(doc.services, undefined);
     assert.deepEqual(doc.pipelines['qq-main'], ['protocol', 'chat_role_render']);
-    assert.deepEqual(doc.returnPipelines['qq-main'], ['echo-svc']);
+    assert.deepEqual(doc.returnPipelines['qq-main'], ['chat_echo']);
 
-    // GET 视图：consumer 行带 forward/return 与 returnEffective（P5 已翻面）+ 可用步骤三级。
+    // GET 视图：consumer 行带 forward/return 与 returnEffective（P5 已翻面）+ 可用步骤两级。
     const view = await (await get(base, '/v1/console/pipelines', OPERATOR)).json();
     const row = view.consumers.find((c) => c.id === 'qq-main');
     assert.deepEqual(row.forward, ['protocol', 'chat_role_render']);
-    assert.deepEqual(row.return, ['echo-svc']);
+    assert.deepEqual(row.return, ['chat_echo']);
     assert.equal(row.returnEffective, true, 'P5：GET 视图同步真实开关');
-    assert.ok(view.available.builtin.includes('protocol'));
-    assert.ok(view.available.services.some((s) => s.id === 'echo-svc'));
+    assert.equal(view.available.builtin, undefined, 'builtin protocol 已退役，不再暴露');
+    assert.equal(view.available.services, undefined, '服务 id 不再是合法步骤，不再暴露');
     assert.ok(view.available.tools.some((t) => t.name === 'chat_role_render'));
+    assert.ok(view.available.tools.some((t) => t.name === 'chat_echo' && t.role === 'decorator'));
 
     // 清空编排（空数组 = 删除键 = 透传）。
     const clear = await fetch(`${base}/v1/console/pipelines/qq-main`, {
@@ -279,11 +313,14 @@ test('console pipelines: PUT fail-closed（未知步骤/非消费端）+ 保存�
 
 test('console services: 卸载——文件删除、编排即刻撤销、台账 unregister；未知 id 404', async () => {
   const { gateway, base, registry, config } = await startServer();
+  const secretsDir = path.join(config.stateDir, 'secrets');
+  // 夹具已为 qq-main 落了一份密钥：卸载断言以「基线不变」为准，而不是硬编码 0。
+  const secretBaseline = existsSync(secretsDir) ? readdirSync(secretsDir).length : 0;
   try {
     // 注册一个消费端并给它编排。
     const reg = await fetch(`${base}/v1/console/services`, {
       method: 'POST', headers: { ...OPERATOR, ...JSON_TYPE },
-      body: JSON.stringify({ name: 'wx-bridge', kind: 'consumer', transport: 'ws', secret: 'wx-bridge-secret-0123456789' }),
+      body: JSON.stringify({ name: 'wx-bridge', kind: 'consumer', transport: 'ws', platform: 'wx', secret: 'wx-bridge-secret-0123456789' }),
     });
     const { id } = await reg.json();
     const put = await fetch(`${base}/v1/console/pipelines/${id}`, {
@@ -302,10 +339,40 @@ test('console services: 卸载——文件删除、编排即刻撤销、台账 u
 
     const ledger = await (await get(base, '/v1/console/services/ledger', OPERATOR)).json();
     assert.ok(ledger.events.some((e) => e.action === 'unregister' && e.serviceId === id && e.source === 'operator'));
-    // 卸载后配套密钥文件一并撤销（本用例无 secret，验证 secrets 目录无新增残留）。
-    const secretsDir = path.join(config.stateDir, 'secrets');
-    assert.equal(existsSync(secretsDir) ? readdirSync(secretsDir).length : 0, 0);
+    // 卸载后配套密钥文件一并撤销：secrets 目录回到基线，且该消费端的密钥文件已删。
+    assert.ok(!existsSync(path.join(secretsDir, `${id}.secret`)), '消费端密钥文件已删');
+    assert.equal(existsSync(secretsDir) ? readdirSync(secretsDir).length : 0, secretBaseline);
     assert.ok(statSync(config.registrations.dir).isDirectory());
+  } finally {
+    await gateway.close();
+  }
+});
+
+test('console services: GATEWAY_MODE=off 也能登记/卸载（自举第一个消费端；入站仍被 mode 门禁拒绝）', async () => {
+  const { gateway, base, registry, config } = await startServer({ GATEWAY_MODE: 'off' });
+  try {
+    // off 模式下 registry 也装配（登记目录配置即装配）——控制台自举的前提。
+    assert.ok(registry, 'off 模式下 registry 已装配');
+    // 注册第一个消费端（secret 留空 → 自动生成）。
+    const res = await fetch(`${base}/v1/console/services`, {
+      method: 'POST', headers: { ...OPERATOR, ...JSON_TYPE },
+      body: JSON.stringify({ name: 'bootstrap-bridge', kind: 'consumer', transport: 'ws', platform: 'qq' }),
+    });
+    assert.equal(res.status, 201);
+    const reg = await res.json();
+    assert.match(reg.id, /^svc-[0-9a-f]{12}$/);
+    assert.equal(reg.secretGenerated, true, 'off 模式同样享受 secret 自动生成');
+    assert.ok(registry.consumers().some((c) => c.id === reg.id), '登记即时进入消费端视图');
+    assert.ok(existsSync(path.join(config.registrations.dir, `${reg.id}.json`)), '登记文件已落盘');
+
+    // 回滚语义不变：off 模式入站仍被 mode 门禁 503（与 registry 装配无关）。
+    const inbound = await fetch(`${base}/v1/inbound`, { method: 'POST', headers: { ...JSON_TYPE }, body: '{}' });
+    assert.equal(inbound.status, 503);
+
+    // 卸载可用（自举失败重来的出口）。
+    const del = await fetch(`${base}/v1/console/services/${reg.id}`, { method: 'DELETE', headers: { ...OPERATOR, ...JSON_TYPE } });
+    assert.equal(del.status, 200);
+    assert.equal(registry.consumers().some((c) => c.id === reg.id), false, '卸载即从消费端视图消失');
   } finally {
     await gateway.close();
   }
@@ -316,12 +383,12 @@ test('console services: 卸载——文件删除、编排即刻撤销、台账 u
 test('console pipelines P4.x: 规则对象条目保存/回读/落盘 + regex/fn fail-closed', async () => {
   const { gateway, base, registry, config } = await startServer();
   try {
-    // 先登记一个 decorator 工具（工具名即步骤，三级解析的第三级）。
+    // 先登记一个 decorator 工具（工具名即步骤，两级解析的第二级）。
     const dec = await fetch(`${base}/v1/console/services`, {
       method: 'POST', headers: { ...OPERATOR, ...JSON_TYPE },
       body: JSON.stringify({
-        name: 'rolecard-mcp', kind: 'decorator', transport: 'ws', secret: 'rolecard-secret-0123456789',
-        tools: [{ name: 'chat_role_render', description: '渲染人格', roles: ['decorator'] }],
+        name: 'rolecard-mcp', kind: 'resource', transport: 'http', url: 'http://127.0.0.1:7182', secret: 'rolecard-secret-0123456789',
+        tools: [{ name: 'chat_role_render', description: '渲染人格', role: 'decorator' }],
       }),
     });
     assert.equal(dec.status, 201);
@@ -332,8 +399,8 @@ test('console pipelines P4.x: 规则对象条目保存/回读/落盘 + regex/fn 
         forward: [
           { step: 'rolecard', text: '固定人设', once: true, join: 'prefix' },
           { step: 'chat_role_render', join: 'suffix' },
-          { step: 'echo-svc', join: 'regex', pattern: '\\d{11}', replacement: '[手机号:{extra}]' },
-          { step: 'echo-svc', join: 'function', fn: 'return extra ? extra + "\\n\\n" + message : message;' },
+          { step: 'chat_echo', join: 'regex', pattern: '\\d{11}', replacement: '[手机号:{extra}]' },
+          { step: 'chat_echo', join: 'function', fn: 'return extra ? extra + "\\n\\n" + message : message;' },
         ],
         return: [],
       }),
@@ -373,24 +440,24 @@ test('console pipelines P4.x: 规则对象条目保存/回读/落盘 + regex/fn 
   }
 });
 
-test('console adapters P4.x: 统一消费端总览——登记消费端并入 + source 标注 + platforms 汇总', async () => {
+test('console adapters P4.x: 统一消费端总览——登记消费端 + source 标注 + platforms 汇总', async () => {
   const { gateway, base, config } = await startServer();
   try {
     // 登记一个消费端（带自有工具声明，roles 聚合到总览）。
-    // 语义口径：总览 = adapters.json 适配器 ∪ 登记目录 kind=consumer；
-    // decorator/filter 服务不是消费端，不并入（它们不承载入站流量）。
+    // 语义口径：总览 = 登记目录 kind=consumer（唯一来源）；
+    // resource 服务不是消费端，不并入（它们不承载入站流量）。
     const reg = await fetch(`${base}/v1/console/services`, {
       method: 'POST', headers: { ...OPERATOR, ...JSON_TYPE },
       body: JSON.stringify({
-        name: 'wx-bridge', kind: 'consumer', transport: 'ws', secret: 'wx-bridge-secret-0123456789',
-        tools: [{ name: 'chat_wx_send_text', description: 'r', roles: ['tool'] }],
+        name: 'wx-bridge', kind: 'consumer', transport: 'ws', platform: 'wx', secret: 'wx-bridge-secret-0123456789',
+        tools: [{ name: 'chat_wx_send_text', description: 'r', role: 'tool' }],
       }),
     });
     assert.equal(reg.status, 201);
 
     const view = await (await get(base, '/v1/console/adapters', OPERATOR)).json();
     const qq = view.adapters.find((a) => a.id === 'qq-main');
-    assert.equal(qq.source, 'adapters.json', 'adapters.json 适配器标注来源');
+    assert.equal(qq.source, 'registry', '登记消费端标注来源');
     assert.equal(qq.platform, 'qq');
     const wx = view.adapters.find((a) => a.name === 'wx-bridge');
     assert.ok(wx, '登记消费端并入总览');
@@ -399,6 +466,43 @@ test('console adapters P4.x: 统一消费端总览——登记消费端并入 + 
     assert.deepEqual(wx.roles, ['tool'], '登记工具 roles 聚合进总览（chat_wx_send_text）');
     // 平台维度汇总（platform 字段缺省 unknown——无 turn 流量时为空桶或 unknown）。
     assert.ok(Array.isArray(view.platforms));
+  } finally {
+    await gateway.close();
+  }
+});
+
+// ------------------------------------- 编辑消费端预设声明（PUT .../presets）
+
+test('console services: PUT presets——名字声明写登记文件并热生效，非法形状 400', async () => {
+  const { gateway, base } = await startServer();
+  try {
+    const seeded = await (await get(base, '/v1/console/services', OPERATOR)).json();
+    const consumer = seeded.services.find((s) => s.kind === 'consumer');
+    assert.ok(consumer, '夹具里有一个 consumer');
+    const url = '/v1/console/services/' + consumer.id + '/presets';
+    const put = { method: 'PUT', headers: { ...OPERATOR, ...JSON_TYPE } };
+
+    // 1) 单字符串形态（消费端已声明 platform）→ 写入登记文件。
+    const set1 = await fetch(base + url, { ...put, body: JSON.stringify({ preset: 'qq-chat' }) });
+    assert.equal(set1.status, 200);
+    assert.deepEqual((await set1.json()).presets, { [consumer.platform]: 'qq-chat' });
+    const after1 = await (await get(base, '/v1/console/services', OPERATOR)).json();
+    assert.deepEqual(after1.services.find((s) => s.id === consumer.id).presets,
+      { [consumer.platform]: 'qq-chat' }, '列表即时可见（热生效）');
+
+    // 2) 非法形状（preset 名不是 kebab）→ 400。
+    const bad = await fetch(base + url, { ...put, body: JSON.stringify({ preset: 'QQ Chat' }) });
+    assert.equal(bad.status, 400);
+
+    // 3) 空 body 语义 → 400。
+    const empty = await fetch(base + url, { ...put, body: '{}' });
+    assert.equal(empty.status, 400);
+
+    // 4) clear:true → 清除声明；列表里回到 presets:null（会话随后用 minimal）。
+    const cleared = await fetch(base + url, { ...put, body: JSON.stringify({ clear: true }) });
+    assert.equal(cleared.status, 200);
+    const after2 = await (await get(base, '/v1/console/services', OPERATOR)).json();
+    assert.equal(after2.services.find((s) => s.id === consumer.id).presets, null);
   } finally {
     await gateway.close();
   }

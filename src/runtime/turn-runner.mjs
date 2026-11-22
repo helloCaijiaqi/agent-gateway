@@ -28,8 +28,42 @@ async function cancelTimedOutTurn({ dsh, sessionId, turnId, logger }) {
   }
 }
 
+/**
+ * 非正常结束的终态必须自带 error 详情。
+ *
+ * 只搬 `ended.status` 的老写法会落出 `status:error / error:null` 的记录
+ * （2026-11-16 实测有 4 条），等于把「为什么失败」永久丢失。
+ */
+function endedError(ended) {
+  if (ended.status === 'timeout') {
+    return { code: 'E_TURN_TIMEOUT', message: '等待 DSH 回合结束超时（会话可能仍在跑）' };
+  }
+  if (ended.status === 'aborted') {
+    return {
+      code: 'E_TURN_ABORTED',
+      message: ended.dropped ? '等待者被丢弃（prompt 失败或本轮已取消）' : 'DSH 回合被中断',
+    };
+  }
+  if (ended.status === 'error') {
+    const reason = ended.reason ?? {};
+    // 注意别把 `kind: 'error'` 当成原因：它只是状态的复述，写进日志等于没写。
+    const detail = reason.message ?? reason.error?.message ?? reason.code
+      ?? (reason.kind && reason.kind !== ended.status ? reason.kind : null);
+    return {
+      code: 'E_TURN_ENDED',
+      message: detail ? `DSH 会话以 error 结束：${detail}` : 'DSH 会话以 error 结束（DSH 未提供原因）',
+    };
+  }
+  return { code: 'E_TURN_UNEXPECTED', message: `未知的 DSH 回合终态：${ended.status}` };
+}
+
 function classifyError(error) {
   const message = String(error?.message ?? error);
+  // 显式错误码优先：session-registry 会把「DSH 未就绪」标成 E_DSH_NOT_READY，
+  // 若让它落到下面的 /preset/ 规则就会被抹成 E_POLICY，丢掉可操作信息。
+  if (typeof error?.code === 'string' && /^E_[A-Z0-9_]+$/.test(error.code)) return error.code;
+  const tagged = /^([A-Z][A-Z0-9_]{2,}):/.exec(message.trim());
+  if (tagged) return tagged[1];
   if (/preset|fail-closed/i.test(message)) return 'E_POLICY';
   if (/ECONNREFUSED|ENOTFOUND|fetch failed|timeout|abort|DSH 鉴权不可用/i.test(message)) return 'E_DSH_DOWN';
   return 'E_INTERNAL';
@@ -43,12 +77,19 @@ function syntheticEventPrompt(envelope) {
   const wake = envelope.wake ?? {};
   const conversation = envelope.conversation ?? {};
   const where = conversation.kind === 'group' ? `群 ${conversation.id}` : `会话 ${conversation.id ?? '?'}`;
-  const proactive = wake.kind !== 'wait';
-  const label = proactive ? '主动唤醒' : '等待唤醒';
+  // 三态（2026-11-18）：user=真实用户消息触发的唤醒；proactive=定时器/冒泡；wait=登记回推。
+  // 曾经 user 消息唤醒也走 proactive 文案（「不是有人点名你，可以不说话」），直接压制
+  // 模型回复意愿——间歇性「写了回复却不调发送工具」的根因，见 wakeSchema 注释。
+  const kind = wake.kind === 'wait' ? 'wait' : (wake.kind === 'user' ? 'user' : 'proactive');
+  const label = kind === 'wait' ? '等待唤醒' : (kind === 'user' ? '新消息唤醒' : '主动唤醒');
   const lines = [`【唤醒事件】${label}（${where}）`];
   if (wake.status === 'timeout') {
     lines.push('等待已超时：这段时间没有满足条件的新消息。');
-  } else if (proactive) {
+  } else if (kind === 'user') {
+    // 用户真实消息触发的唤醒：快照里有等着你回应的话，基调必须是「优先回应」，
+    // 不允许出现「可以不说话」式的暗示（那是定时器主动唤醒专属的基调）。
+    lines.push('这次唤醒由真实的新消息触发——有人直接给你发消息并明确在等你回应（见下方快照）。先读消息、按人设回应；有未回应的用户消息时，先调用发送工具回复，再考虑收尾动作。');
+  } else if (kind === 'proactive') {
     // 适配器侧定时器（冒泡/主动机会）触发的唤醒：不是有人点名，可以主动开
     // 话题或接续气氛，也可以判断此刻不需要说话（不调用任何发送动作）。
     lines.push('适配器的定时器触发了这次唤醒——这不是有人点名你：可以主动开话题或接续气氛；判断此刻不需要说话，就不调用任何发送动作。');
@@ -57,13 +98,15 @@ function syntheticEventPrompt(envelope) {
   }
   const snapshot = Array.isArray(envelope.snapshot) ? envelope.snapshot.slice(-20) : [];
   if (snapshot.length > 0) {
-    lines.push('', proactive ? '【最近的消息】' : '【等待期间的消息】');
+    lines.push('', kind === 'wait' ? '【等待期间的消息】' : '【最近的消息】');
     for (const entry of snapshot) {
       const at = typeof entry?.at === 'string' && entry.at ? `${entry.at} ` : '';
       lines.push(`- ${at}${entry?.sender ?? ''}：${entry?.text ?? ''}`);
     }
   }
-  lines.push('', '请基于以上内容继续处理；如果不需要接话，可以保持沉默。');
+  lines.push('', kind === 'user'
+    ? '请基于以上内容继续处理；快照里未回应的用户消息需要你调用发送工具回应。'
+    : '请基于以上内容继续处理；如果不需要接话，可以保持沉默。');
   return lines.join('\n');
 }
 
@@ -82,6 +125,10 @@ function fallbackPrompt(record) {
 export function createTurnRunner({
   config, dsh, registry, gateway, queue, turns, executorRegistry = null,
   pipeline = null, toolHost = null, mailbox = null, ledger = null,
+  // 回合结束通知（2026-11-17）：适配器侧唤醒防重入（pendingWakeKeys）需要「AI 说完了」
+  // 的信号来释放——此前只有防卡死租约兜底，回合正常结束后该会话仍被视为繁忙，
+  // 期间所有新消息被静默暂存。wsHubRef 晚绑定（main.mjs），测试传 null 即无通知。
+  notifyTurnEnded = null,
   logger = () => {}, metrics = null, now = Date.now,
 }) {
   const chat = config.chat ?? {};
@@ -126,6 +173,9 @@ export function createTurnRunner({
     let sessionId = null;
     try {
       sessionId = await registry.getOrCreate(sessionKey);
+      // 排障锚点：会话就绪（新建或复用）后立即留痕——「回合静默不动」时第一个要
+      // 判断的就是卡在这一步还是卡在等事件流（见下面 prompt sent 那条）。
+      logger(`turn ${turnId} session ready: ${sessionId}`);
 
       // P3：把本 turn 登记进 ToolHost（工具调用凭 turnId+turnToken 找到活跃
       // turn）。成功与失败路径都要注销（Map.delete 幂等，见 catch 分支）。
@@ -197,6 +247,7 @@ export function createTurnRunner({
         const promptText = promptTextOverride ?? envelope.prompt?.text
         ?? (envelope.kind === 'event' ? syntheticEventPrompt(envelope) : fallbackPrompt(record));
       const response = await dsh.prompt({ sessionId, text: promptText });
+      logger(`turn ${turnId} prompt sent (${promptText.length} chars) -> 等待事件流`);
       if (!response.result?.ok) {
         const { code, message } = response.result?.error ?? {};
         throw new Error(`session.prompt rejected: ${code}: ${message ?? 'unknown'}`);
@@ -220,6 +271,8 @@ export function createTurnRunner({
           ...gateway.pendingFor(sessionId).map((entry) => entry.kind),
           ...(assembledInfo?.fallback ? ['context:fallback'] : []),
         ],
+        // 非 completed 一律带 error：见 endedError 的注释（error:null 无法排查）。
+        ...(ended.status === 'completed' ? {} : { error: endedError(ended) }),
       };
       metrics?.inc('gateway_turn_total', { result: turnResult.status });
       metrics?.observe('gateway_turn_ms', now() - started, { result: turnResult.status });
@@ -267,6 +320,18 @@ export function createTurnRunner({
       // P4.x 平台维度：多平台统筹要能回答「QQ vs WX 各消费多少」。
       platform: record.envelope?.platform ?? null,
     });
+
+    // 回合结束通知：ws 在线就推（sendTo 内部处理无连接），适配器不在线则靠其
+    // 租约自愈；通知失败绝不影响回合本身（尽力而为语义）。
+    try {
+      const adapterId = record.adapterId ?? record.envelope?.adapterId ?? null;
+      if (notifyTurnEnded && adapterId) {
+        notifyTurnEnded({
+          adapterId,
+          payload: { v: 1, type: 'turn/status', turnId, sessionKey, status: turnResult.status, at: now() },
+        });
+      }
+    } catch { /* 尽力而为 */ }
     if (typeof turnResult.text === 'string' && turnResult.text.length > 0 && !(toolStats?.sent > 0)) {
       logger(`turn ${turnId} no-send: 回合文本 ${turnResult.text.length} 字，但没有任何成功的发送工具调用（文本不会自动发到平台）`);
     }

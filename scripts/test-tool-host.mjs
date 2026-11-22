@@ -20,9 +20,14 @@ const { signRequest } = await import(new URL('../src/core/auth.mjs', import.meta
 const { createMcpBus, withTurnToken } = await import(new URL('../src/mcp-bus.mjs', import.meta.url).href);
 const { createTurnRunner } = await import(new URL('../src/runtime/turn-runner.mjs', import.meta.url).href);
 const { createSessionRegistry } = await import(new URL('../src/runtime/session-registry.mjs', import.meta.url).href);
+// 建会话需要适配器声明「平台→preset」：测试里用一个最小的声明表顶替登记文件。
+const PRESETS_FOR = () => ({ qq: 'qq-chat', wx: 'wx-chat' });
 const { createPromptQueue } = await import(new URL('../src/runtime/prompt-queue.mjs', import.meta.url).href);
 const { createDshGateway } = await import(new URL('../src/runtime/dsh-gateway.mjs', import.meta.url).href);
 const { createTurnStore } = await import(new URL('../src/core/turn-store.mjs', import.meta.url).href);
+const { seedConsumer, seedBusSecret, createConsumerRegistry } = await import(
+  new URL('./support/consumer-registration.mjs', import.meta.url).href
+);
 
 const SECRET = '0123456789abcdef0123456789abcdef';
 
@@ -190,7 +195,7 @@ test('service-registry: callServiceTool 打到登记服务的 /v1/tools/call；�
   // 登记身份 = 随机 hash（对象唯一性）；name 只是展示名。
   const memId = crypto.randomUUID().replaceAll('-', '');
   fs.writeFileSync(path.join(dir, `${memId}.json`), JSON.stringify({
-    v: 1, id: memId, name: 'memory-mcp', kind: 'decorator', transport: 'http', url: baseUrl, secret: SECRET,
+    v: 1, id: memId, name: 'memory-mcp', kind: 'resource', transport: 'http', url: baseUrl, secret: SECRET,
     tools: [{ name: 'chat_memory_recall', description: '查记忆', inputSchema: { type: 'object' } }],
   }));
   const { createServiceRegistry } = await import(new URL('../src/core/service-registry.mjs', import.meta.url).href);
@@ -272,12 +277,12 @@ test('tool-host: 登记工具经服务执行器路由；业务失败透传；内
 
 async function startServer(env, runtime) {
   const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), 'gateway-tools-'));
-  const config = loadConfig({
-    env,
-    stateDir,
-    adapters: [{ id: 'qq-main', platform: 'qq', secret: 'adapter-secret-0123456789' }],
-  });
-  const gateway = createGatewayServer({ config, logger: () => {}, runtime });
+  seedConsumer(stateDir, { id: 'qq-main', platform: 'qq', secret: 'adapter-secret-0123456789' });
+  // mcp-bus 共享密钥是文件单源（env 通道已退役）：GATEWAY_TOOLS=on 的用例预置密钥文件。
+  seedBusSecret(stateDir, SECRET);
+  const config = loadConfig({ env, stateDir });
+  const services = env.GATEWAY_MODE === 'off' ? null : createConsumerRegistry({ stateDir });
+  const gateway = createGatewayServer({ config, logger: () => {}, runtime, services });
   await gateway.listen();
   // GATEWAY_PORT=0 时 config.port 是 0，实际端口要从 server 取。
   return { gateway, port: gateway.server.address().port };
@@ -286,7 +291,7 @@ async function startServer(env, runtime) {
 test('server: /v1/tools 与 /v1/tools/call（HMAC 鉴权 + runtime 注入）', async () => {
   const handled = [];
   const { gateway, port } = await startServer(
-    { GATEWAY_MODE: 'on', GATEWAY_TOOLS: 'on', GATEWAY_MCP_TOKEN: SECRET, GATEWAY_PORT: '0' },
+    { GATEWAY_MODE: 'on', GATEWAY_TOOLS: 'on', GATEWAY_PORT: '0' },
     {
       toolCall: async (parsed) => {
         handled.push(parsed);
@@ -333,7 +338,7 @@ test('server: /v1/tools 与 /v1/tools/call（HMAC 鉴权 + runtime 注入）', a
 
 test('server: tools=off 时 /v1/tools 与 /v1/tools/call 返回 503', async () => {
   const { gateway, port } = await startServer(
-    { GATEWAY_MODE: 'on', GATEWAY_TOOLS: 'off', GATEWAY_MCP_TOKEN: SECRET, GATEWAY_PORT: '0' },
+    { GATEWAY_MODE: 'on', GATEWAY_TOOLS: 'off', GATEWAY_PORT: '0' },
     { submit() {}, stop() {}, status() { return {}; } },
   );
   try {
@@ -422,7 +427,7 @@ function createFakeDsh() {
       this.emit({ type: 'session/event', sessionId, event: { type: 'assistant/message', data: { turn, message: { content: [{ type: 'text', text }] } } } });
       this.emit({ type: 'session/event', sessionId, event: { type: 'turn/end', data: { turn, reason: { kind: 'completed' } } } });
     },
-    async listPresets() { return ['qq-chat-v2']; },
+    async listPresets() { return ['qq-chat', 'minimal']; },
     async ensureWorkspace() { return 'ws'; },
     async createSession() { const id = `s${++seq}`; state.sessions.set(id, { turns: 0 }); return id; },
     async selectModel() { return {}; },
@@ -436,8 +441,8 @@ function createFakeDsh() {
 
 test('turn-runner: turn 存活期间 ToolHost 有活跃登记，结束后注销', async () => {
   const dsh = createFakeDsh();
-  const chat = { preset: 'qq-chat-v2', provider: 'p', model: 'm', reasoningEffort: 'max', workspaceDir: fs.mkdtempSync(path.join(os.tmpdir(), 'gw-th-')), turnTimeoutMs: 2000 };
-  const registry = createSessionRegistry({ dsh, chat, file: null });
+  const chat = { preset: 'qq-chat', provider: 'p', model: 'm', reasoningEffort: 'max', workspaceDir: fs.mkdtempSync(path.join(os.tmpdir(), 'gw-th-')), turnTimeoutMs: 2000 };
+  const registry = createSessionRegistry({ presetsFor: PRESETS_FOR, dsh, chat, file: null });
   const gateway = createDshGateway({ dsh, turnTimeoutMs: 2000 });
   const turns = createTurnStore({ file: null });
   const toolHost = makeHost(() => ({ ok: true, receipt: {} }));
@@ -457,4 +462,55 @@ test('turn-runner: turn 存活期间 ToolHost 有活跃登记，结束后注销'
   await done;
   assert.equal(toolHost.status().liveTurns, 0, 'turn 结束后必须注销');
   gateway.stop();
+});
+
+
+test('tool-host: 白名单通道已退役——无 turnToken 调用（含 chat_role_render）一律 E_FORBIDDEN', async () => {
+  // 2026-11-21：persona 插件改为 bootstrap+HMAC 直连 rolecard，网关不再中转
+  // render——免 token 白名单通道随之删除。任何无 token 调用都落主路径被拒。
+  const seen = [];
+  const serviceTools = {
+    resolveTool: (name) => (name === 'chat_role_render' ? { serviceId: 'svc-rolecard', name } : null),
+    listTools: () => [],
+    call: async (serviceId, request) => {
+      seen.push({ serviceId, request });
+      return { ok: true, data: {} };
+    },
+  };
+  const host = createToolHost({
+    executorRegistry: createExecutorRegistry(),
+    serviceTools,
+    logger: () => {},
+  });
+  const result = await host.handle({ callId: 'c1', tool: 'chat_role_render', args: {} });
+  assert.equal(result.ok, false);
+  assert.equal(result.error.code, 'E_FORBIDDEN');
+  assert.equal(seen.length, 0, '拒绝路径不得外发调用');
+  assert.equal(host.status().liveTurns, 0);
+});
+
+test('tool-host: 无 turnToken 调用未知工具仍 E_FORBIDDEN（主路径统一拒绝）', async () => {
+  const host = makeHost(() => ({ ok: true, receipt: {} }));
+  const result = await host.handle({ callId: 'c1', tool: 'chat_fake_echo', args: {} });
+  assert.equal(result.ok, false);
+  assert.equal(result.error.code, 'E_FORBIDDEN');
+});
+
+test('tool-host: 带合法 turnToken 时登记工具走 turn 路径（sessionKey 随回合）', async () => {
+  const seen = [];
+  const serviceTools = {
+    resolveTool: (name) => (name === 'chat_role_render' ? { serviceId: 'svc-rolecard', name } : null),
+    listTools: () => [],
+    call: async (serviceId, request) => { seen.push({ serviceId, request }); return { ok: true, data: {} }; },
+  };
+  const host = createToolHost({
+    executorRegistry: createExecutorRegistry(),
+    serviceTools,
+    logger: () => {},
+  });
+  host.registerTurn({ turnId: 'turn_1', turnToken: 'tok-1', sessionKey: 'qq:group:1' });
+  const result = await host.handle({ callId: 'c1', tool: 'chat_role_render', args: {}, turnToken: 'tok-1' });
+  assert.equal(result.ok, true);
+  assert.equal(seen[0].request.sessionKey, 'qq:group:1');
+  assert.equal(host.status().liveTurns, 1);
 });

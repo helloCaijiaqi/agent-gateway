@@ -12,6 +12,9 @@ const { createGatewayServer } = await import(new URL('../src/core/server.mjs', i
 const { createDshGateway, PENDING_CAPACITY } = await import(new URL('../src/runtime/dsh-gateway.mjs', import.meta.url).href);
 const { createPendingForwarder } = await import(new URL('../src/runtime/pending-forwarder.mjs', import.meta.url).href);
 const { deliverAction } = await import(new URL('../src/executors/adapter-tools/common/transport.mjs', import.meta.url).href);
+const { seedConsumer, seedOperatorToken, createConsumerRegistry } = await import(
+  new URL('./support/consumer-registration.mjs', import.meta.url).href
+);
 
 const TOKEN = 'test-operator-token-0123456789';
 const ADAPTERS = [{ id: 'qq-main', platform: 'qq', secret: 'adapter-secret-0123456789' }];
@@ -224,12 +227,18 @@ test('pending-forwarder: 无 callbackBase 适配器跳过；构造参数防呆',
 
 async function startServer(runtime) {
   const stateDir = mkdtempSync(path.join(os.tmpdir(), 'gw-pending-console-'));
+  for (const adapter of ADAPTERS) {
+    seedConsumer(stateDir, { id: adapter.id, platform: adapter.platform, secret: adapter.secret });
+  }
+  // 控制台凭据文件单源（env 通道已退役）。
+  seedOperatorToken(stateDir, TOKEN);
   const config = loadConfig({
-    env: { GATEWAY_MODE: 'shadow', GATEWAY_CONSOLE: 'on', GATEWAY_OPERATOR_TOKEN: TOKEN, GATEWAY_PORT: '0' },
-    adapters: ADAPTERS,
+    env: { GATEWAY_MODE: 'shadow', GATEWAY_CONSOLE: 'on', GATEWAY_PORT: '0' },
     stateDir,
   });
-  const gateway = createGatewayServer({ config, logger: () => {}, runtime });
+  const gateway = createGatewayServer({
+    config, logger: () => {}, runtime, services: createConsumerRegistry({ stateDir }),
+  });
   await gateway.listen();
   const base = `http://127.0.0.1:${gateway.server.address().port}`;
   return { gateway, base, auth: { 'x-operator-token': TOKEN } };

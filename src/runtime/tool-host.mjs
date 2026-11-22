@@ -32,6 +32,16 @@ function tokensMatch(a, b) {
 }
 
 /**
+ * 「控制台专用」工具（2026-11-21 显式名单）：角色卡控制面板工具（list/switch）
+ * 是控制台「角色卡」视图签名代理的后端（/v1/console/rolecards*，verifyOperator +
+ * CSRF），经 runtime.rolecardAdmin 直连 serviceRegistry——**不经 ToolHost**。
+ * 因此它们绝不能出现在模型/适配器工具面：/v1/tools 清单过滤（模型看不到 =
+ * 不会误调），handle 调用一律拒绝（纵深防御）——聊天工具面零 rolecard 工具
+ * （人格渲染已由 DSH persona 插件 bootstrap+HMAC 直连 rolecard，不经网关）。
+ */
+const CONSOLE_ONLY_TOOLS = new Set(['chat_role_list', 'chat_role_switch']);
+
+/**
  * 「发送类」动作：成功的这些调用才计入 sent。
  * 与桥接清单的发送动作保持一致（清单新增发送类时同步这里，测试会钉住几个核心名字）。
  */
@@ -113,7 +123,7 @@ export function createToolHost({
       };
     }
     // 显式带上 sessionKey/turnId 时必须与令牌对应的 turn 一致（防串会话）。
-    if ((sessionKey && sessionKey !== entry.sessionKey) || (turnId && !byTurn.has(turnId))) {
+    if ((sessionKey && sessionKey !== entry.sessionKey) || (turnId && turnId !== entry.turnId)) {
       metrics?.inc('gateway_tool_total', { tool, result: 'forbidden' });
       return { ok: false, error: { code: 'E_FORBIDDEN', message: 'identity does not match the live turn' } };
     }
@@ -121,11 +131,21 @@ export function createToolHost({
     // 也不该被频控掩盖（否则排查「工具名打错」时要先绕过限流）。
     // V2 P3：内置清单查不到时再查登记工具面——内置优先，登记工具不遮蔽内置
     // executor（模型工具面的既有词汇不会被一个登记文件悄悄改掉）。
+    if (CONSOLE_ONLY_TOOLS.has(tool)) {
+      metrics?.inc('gateway_tool_total', { tool, result: 'forbidden' });
+      return { ok: false, error: { code: 'E_FORBIDDEN', message: `console-only tool: ${tool}（管理面请走控制台）` } };
+    }
     const action = executorRegistry.actionForTool(tool);
     const registeredTool = action ? null : (serviceTools?.resolveTool?.(tool) ?? null);
     if (!action && !registeredTool) {
       metrics?.inc('gateway_tool_total', { tool, result: 'unsupported' });
       return { ok: false, error: { code: 'E_UNSUPPORTED', message: `unknown tool: ${tool}` } };
+    }
+    // 2026-11-22 修复：decorator/filter 登记工具是管线内部步骤，模型直调一律
+    // 拒绝（清单层已过滤，这里是 call 路径的兜底——防止旧清单缓存/旁路转发）。
+    if (registeredTool && registeredTool.role && registeredTool.role !== 'tool') {
+      metrics?.inc('gateway_tool_total', { tool, result: 'forbidden' });
+      return { ok: false, error: { code: 'E_FORBIDDEN', message: `pipeline-internal tool: ${tool}（记忆与人格已由系统自动注入，不需要也不允许调用）` } };
     }
     if (entry.calls >= maxCallsPerTurn) {
       metrics?.inc('gateway_tool_total', { tool, result: 'rate_limited' });
@@ -213,12 +233,23 @@ export function createToolHost({
     };
   }
 
-  /** 完整工具面 = 内置 executors ∪ 登记工具（内置优先，登记不遮蔽内置）。 */
+  /** 模型工具面 = 内置 executors ∪ 登记工具中 role='tool' 的子集（内置优先，
+   *  登记不遮蔽内置）。
+   *  控制台专用工具（chat_role_admin_*）不在清单——消费方是 /v1/console 代理，
+   *  走 serviceRegistry 直连；出现在这里只会让模型面多出一组语义重复的写工具。
+   *  2026-11-22 修复：decorator/filter 角色的登记工具（如 chat_memory_get——
+   *  管线注入步骤）同样不在清单。它们是管线内部步骤，对模型不可调用；
+   *  泄漏进模型面只会诱发「探索式调用 → 失败 → 重试」的回合死循环
+   *  （2026-11-22 实测：模型 35 次工具探索后陷入 recall/get 交替循环，
+   *  每回合烧满预算 no-send）。 */
   function mergedTools() {
     const builtin = executorRegistry.listTools();
     const registered = serviceTools?.listTools?.() ?? [];
     const seen = new Set(builtin.map((tool) => tool.name));
-    return [...builtin, ...registered.filter((tool) => !seen.has(tool.name))];
+    return [...builtin, ...registered.filter((tool) => !seen.has(tool.name))]
+      .filter((tool) => !CONSOLE_ONLY_TOOLS.has(tool.name))
+      // decorator/filter 是管线步骤：不进模型清单（handle 侧同样拒绝直调）。
+      .filter((tool) => tool.role === undefined || tool.role === 'tool');
   }
 
   function status() {

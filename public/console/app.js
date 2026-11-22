@@ -21,11 +21,16 @@ const state = {
 /* ── 基础设施 ─────────────────────────────────────────────────────────── */
 
 async function api(path, { method = 'GET', body } = {}) {
+  // 写方法（POST/PUT/DELETE）一律显式 content-type: application/json——服务端
+  // CSRF 守卫要求 console 写请求必须声明 JSON（无 body 的 POST 也发 '{}'），
+  // 否则 403「console writes require content-type application/json」。
+  const isWrite = method.toUpperCase() !== 'GET';
+  const hasBody = body !== undefined;
   const res = await fetch(path, {
     method,
     credentials: 'same-origin',
-    headers: body !== undefined ? { 'content-type': 'application/json' } : {},
-    body: body !== undefined ? JSON.stringify(body) : undefined,
+    headers: isWrite || hasBody ? { 'content-type': 'application/json' } : {},
+    body: hasBody ? JSON.stringify(body) : (isWrite ? '{}' : undefined),
   });
   let payload = null;
   try { payload = await res.json(); } catch { /* 非 JSON（如 503 空体） */ }
@@ -67,6 +72,63 @@ function confirmDialog(text, { okText = '确认', danger = true } = {}) {
     };
     const onOk = () => { settle(true); modal.hide(); };
     const onHide = () => settle(false);
+    okBtn.addEventListener('click', onOk);
+    modalEl.addEventListener('hidden.bs.modal', onHide, { once: true });
+    modal.show();
+  });
+}
+
+/**
+ * 工具清单编辑模态（Bootstrap Modal）：每行 name 只读 + role 三选一下拉 +
+ * description 可编辑；返回 Promise<tools|null>（确认=编辑后的数组，取消=null）。
+ * 行值以服务清单预填；role 非法/缺省落 tool（与服务端 schema 缺省一致）。
+ * name 由服务定义只读——改名等于指向不存在的工具，服务端会拒绝。
+ */
+function manifestEditorDialog(tools) {
+  const modalEl = $('#manifest-modal');
+  const rowsEl = $('#manifest-rows');
+  const okBtn = $('#manifest-ok');
+  const ROLES = ['tool', 'decorator', 'filter'];
+  rowsEl.innerHTML = '';
+  (tools ?? []).forEach((tool, index) => {
+    const role = ROLES.includes(tool.role) ? tool.role : 'tool';
+    const row = document.createElement('div');
+    row.className = 'd-flex align-items-start gap-2 mb-2 manifest-row';
+    row.innerHTML = `
+      <code class="flex-shrink-0 pt-1" style="min-width:150px" title="name 由服务定义，不可改">${escapeHtml(tool.name)}</code>
+      <select class="form-select form-select-sm manifest-role" style="max-width:130px" aria-label="role">
+        ${ROLES.map((r) => `<option value="${r}"${r === role ? ' selected' : ''}>${r}</option>`).join('')}
+      </select>
+      <input class="form-control form-control-sm manifest-desc" maxlength="500"
+             value="${escapeHtml(tool.description ?? '')}" placeholder="工具描述（1-500 字）" aria-label="description">`;
+    rowsEl.append(row);
+  });
+  const modal = bootstrap.Modal.getOrCreateInstance(modalEl);
+  return new Promise((resolve) => {
+    let settled = false;
+    const settle = (value) => {
+      if (settled) return;
+      settled = true;
+      okBtn.removeEventListener('click', onOk);
+      modalEl.removeEventListener('hidden.bs.modal', onHide);
+      resolve(value);
+    };
+    const onOk = () => {
+      const edited = [...rowsEl.querySelectorAll('.manifest-row')].map((row, i) => {
+        const source = tools[i] ?? {};
+        const desc = row.querySelector('.manifest-desc').value.trim();
+        return {
+          name: source.name,
+          // 服务清单带过来的 inputSchema 透传不动（网关只挡「不是对象」）。
+          inputSchema: source.inputSchema ?? {},
+          role: row.querySelector('.manifest-role').value,
+          description: desc || '（无描述）',
+        };
+      });
+      settle(edited);
+      modal.hide();
+    };
+    const onHide = () => settle(null);
     okBtn.addEventListener('click', onOk);
     modalEl.addEventListener('hidden.bs.modal', onHide, { once: true });
     modal.show();
@@ -115,8 +177,67 @@ function setLoggedIn(on) {
   show($('#view-login'), !on);
   $('#session-dot').className = `dot ${on ? 'on' : 'off'}`;
   $('#session-hint').textContent = on ? '已登录' : '未登录';
-  if (on) switchView(state.view);
+  // 模式开关只对已登录 operator 有意义（端点有 operator 鉴权）。
+  show($('.mode-switch'), on);
+  if (on) { switchView(state.view); refreshModeSwitch(); }
 }
+
+/**
+ * GATEWAY_DATA_PLANE 滑动开关（常驻装配 + 请求期门禁）：拨动即时生效、零重启，
+ * 服务端同时写回启动时装载的 env 文件保持重启后不变。off = 消息面门禁关闭
+ * （入站 503 / WS 帧 E_DISABLED），off 语义是操作员的显式意图，绝不自动翻转。
+ * 状态映射：on=勾选可拨；off=未勾选可拨；shadow=禁用（灰度只认 env，改后重启）；
+ * health 不可达=禁用 + 「—」。
+ */
+async function refreshModeSwitch() {
+  const input = $('#mode-switch');
+  const label = $('#mode-switch-label');
+  try {
+    const health = await fetch('/v1/health').then((r) => r.json());
+    const mode = health?.mode;
+    input.checked = mode === 'on';
+    input.setAttribute('aria-checked', String(input.checked));
+    input.disabled = mode === 'shadow';
+    input.title = mode === 'shadow'
+      ? 'GATEWAY_DATA_PLANE=shadow（灰度）：不支持在线切换，改 .env 后重启'
+      : 'GATEWAY_DATA_PLANE：off = 消息面关闭（入站 503 / WS 帧 E_DISABLED）；on = 消息面放行。拨动即时生效、零重启，并写回启动时装载的 env 文件。';
+    label.textContent = mode === 'shadow' ? '消息面 shadow（改 env 重启）' : `消息面 ${mode ?? '—'}`;
+  } catch {
+    input.checked = false;
+    input.setAttribute('aria-checked', 'false');
+    input.disabled = true;
+    label.textContent = '消息面 —';
+  }
+}
+
+$('#mode-switch').addEventListener('change', async () => {
+  const input = $('#mode-switch');
+  const target = input.checked ? 'on' : 'off';
+  const verb = target === 'on' ? '启用' : '停用';
+  // on/off 都二次确认：这是操作员显式意图的翻转，不因误点改变消息面状态。
+  const ok = await confirmDialog(`${verb}消息面（GATEWAY_DATA_PLANE=${target}）？切换即时生效并写回 env 文件。`, {
+    okText: verb, danger: target === 'off',
+  });
+  if (!ok) {
+    // 取消：把滑块拨回真实位置（本地不保留未确认的状态）。
+    input.checked = !input.checked;
+    input.setAttribute('aria-checked', String(input.checked));
+    return;
+  }
+  input.disabled = true;
+  try {
+    const result = await api('/v1/console/mode', { method: 'POST', body: { mode: target } });
+    toast(`GATEWAY_DATA_PLANE=${result.mode} 已生效${result.persisted ? '（已写回 env 文件，重启后保持）' : '（未持久化：重启后回退 env 值）'}`,
+      result.persisted ? 'ok' : 'warn');
+    await refreshModeSwitch();
+  } catch (error) {
+    // 400 = 校验拒绝（典型：切 on 但还没有消费端登记）；失败回弹到真实状态。
+    toast(`切换失败：${error?.message ?? error}`, 'bad');
+    await refreshModeSwitch();
+  }
+  // disabled 状态由 refreshModeSwitch 按真实 mode 重绘（shadow/不可达保持禁用），
+  // 这里不额外兜底，避免把禁用态错误地重新打开。
+});
 
 async function checkSession() {
   try {
@@ -142,6 +263,7 @@ $('#login-form').addEventListener('submit', async (event) => {
   }
 });
 
+bindRolecardEvents();
 $('#btn-logout').addEventListener('click', async () => {
   try { await api('/v1/console/session', { method: 'DELETE' }); } catch { /* 会话可能已过期 */ }
   setLoggedIn(false);
@@ -151,6 +273,7 @@ $('#btn-logout').addEventListener('click', async () => {
 $$('.nav-item[data-view]').forEach((btn) => btn.addEventListener('click', () => {
   switchView(btn.dataset.view);
   if (btn.dataset.view === 'services') loadServices();
+  if (btn.dataset.view === 'rolecards') loadRolecards();
   if (btn.dataset.view === 'pipelines') loadPipelines();
   if (btn.dataset.view === 'ledger') loadLedger();
   if (btn.dataset.view === 'presets') loadPresets();
@@ -162,6 +285,7 @@ $$('.nav-item[data-view]').forEach((btn) => btn.addEventListener('click', () => 
 
 /* ── 服务注册视图 ─────────────────────────────────────────────────────── */
 
+// 工具角色单值三选一（tool.call 统一改造）：role 是单选，不再是 roles 数组。
 const TOOL_ROLES = ['tool', 'decorator', 'filter'];
 
 function addToolRow(tool = {}) {
@@ -181,7 +305,7 @@ function addToolRow(tool = {}) {
     <div class="d-flex align-items-center gap-3 flex-wrap mt-2">
       ${TOOL_ROLES.map((role) => `
         <label class="form-check form-check-inline muted mb-0">
-          <input class="form-check-input tool-role" type="checkbox" value="${role}" ${role === 'tool' ? 'checked' : ''}>
+          <input class="form-check-input tool-role" type="radio" name="tool-role-${Math.random().toString(36).slice(2)}" value="${role}" ${role === 'tool' ? 'checked' : ''}>
           <span class="form-check-label">${role}</span>
         </label>`).join('')}
       <button type="button" class="btn btn-outline-danger btn-sm ms-auto">移除</button>
@@ -189,7 +313,8 @@ function addToolRow(tool = {}) {
   row.querySelector('button').addEventListener('click', () => row.remove());
   if (tool.name) row.querySelector('.tool-name').value = tool.name;
   if (tool.description) row.querySelector('.tool-desc').value = tool.description;
-  $$('.tool-role', row).forEach((box) => { box.checked = (tool.roles ?? ['tool']).includes(box.value); });
+  const selectedRole = tool.role ?? 'tool';
+  $$('.tool-role', row).forEach((box) => { box.checked = box.value === selectedRole; });
   $('#tools-editor').appendChild(row);
 }
 
@@ -201,10 +326,108 @@ function collectTools() {
     tools.push({
       name,
       description: row.querySelector('.tool-desc').value.trim() || name,
-      roles: $$('.tool-role:checked', row).map((box) => box.value),
+      role: row.querySelector('.tool-role:checked')?.value ?? 'tool',
     });
   }
   return tools;
+}
+
+/**
+ * 登记 kind 只有两种（consumer / resource）：装饰/过滤职责由工具 role 承担。
+ * UI 与契约同口径，避免提交注定被 parseServiceRegistration 拒载的登记：
+ *   - resource 纯被动，transport 只能是 http 且 url 必填；
+ *   - consumer 的 transport 三态（ws/http/auto）合法，工具 role 只允许 tool。
+ */
+function syncRegistrationForm() {
+  const isResource = $('#reg-kind').value === 'resource';
+  const transport = $('#reg-transport');
+  for (const option of transport.options) {
+    const legal = !isResource || option.value === 'http';
+    option.disabled = !legal;
+    option.hidden = !legal;
+  }
+  if (isResource) transport.value = 'http';
+  // 必填项随 kind 迁移：resource → url；consumer → platform（契约同口径）。
+  $('#reg-url').required = isResource;
+  $('#reg-platform').required = !isResource;
+  $('#reg-url-label').textContent = isResource
+    ? 'url *（resource 走 http tool.call，必填、仅回环）'
+    : 'url（http/auto 必填，仅回环；WS-only 消费者可空）';
+  $('#tools-hint').textContent = isResource
+    ? 'resource 可声明 tool / decorator / filter（装饰/过滤步骤只认 resource 工具）。'
+    : 'consumer 能力走 manifest 现拉清单（此声明通常留空）；如声明，role 只能是 tool。';
+  for (const row of $$('#tools-editor .tool-row')) {
+    let hasChecked = false;
+    for (const box of $$('.tool-role', row)) {
+      const legal = isResource || box.value === 'tool';
+      box.disabled = !legal;
+      if (box.checked && legal) hasChecked = true;
+    }
+    if (!hasChecked) row.querySelector('.tool-role[value="tool"]').checked = true;
+  }
+}
+
+// ── 角色卡视图（2026-11-20）：人格唯一来源的管理面 ─────────────────────────
+// 数据面：GET /v1/console/rolecards（列表+当前）、GET/PUT …/:name（读/写）、
+// POST …/apply（切卡 + 会话退役 + 渲染预览）。改卡保存即生效（DSH 插件每
+// step 实时拉渲染）；切卡必须退役会话（system 突变防精神分裂）。
+
+async function loadRolecards() {
+  try {
+    const data = await api('/v1/console/rolecards');
+    renderRolecards(data);
+  } catch (error) { toast(`加载角色卡失败：${error.message}`, 'bad'); }
+}
+
+function renderRolecards(data) {
+  const roles = data.roles ?? [];
+  const current = data.current ?? '';
+  const select = $('#rolecard-select');
+  select.innerHTML = '';
+  for (const name of roles) {
+    const option = document.createElement('option');
+    option.value = name;
+    option.textContent = name + (name === current ? '（当前）' : '');
+    select.append(option);
+  }
+  if (current && roles.includes(current)) select.value = current;
+  $('#rolecard-current').textContent = `当前：${current || '（未设置）'}`;
+}
+
+function bindRolecardEvents() {
+  $('#btn-rolecard-refresh').addEventListener('click', loadRolecards);
+  // 编辑已迁至 rolecard 服务管理页（/admin，服务分离时随服务走）；本视图只管切换。
+  // 编辑已迁至 rolecard 服务管理页（/admin，服务分离时随服务走）；本视图只管切换。
+  // 2026-11-21 审计修复：地址不再硬编码——从服务登记的 url 动态取（声明
+  // chat_role_switch 的 enabled resource 服务），取不到才回退本机默认。
+  $('#btn-rolecard-edit').addEventListener('click', async () => {
+    let target = 'http://127.0.0.1:7182/admin';
+    try {
+      const services = await api('/v1/console/services');
+      const owner = (services.registrations ?? []).find((r) => r.kind === 'resource'
+        && r.enabled !== false && Array.isArray(r.tools) && r.tools.includes('chat_role_switch'));
+      if (owner?.url) target = `${String(owner.url).replace(/\/+$/, '')}/admin`;
+    } catch { /* 登记拉取失败 → 用默认地址兜底 */ }
+    window.open(target, '_blank', 'noopener');
+  });
+  $('#btn-rolecard-apply').addEventListener('click', async () => {
+    const name = $('#rolecard-select').value;
+    if (!name) return toast('先选择角色卡', 'bad');
+    const confirmed = await confirmDialog(
+      `把当前角色切换为「${name}」？\n\n这会退役全部存量 DSH 会话：下一条消息将以全新会话开始，\n机器人不记得刚才的对话（长期记忆保留）。确认应用？`,
+      { okText: '应用并退役会话' },
+    );
+    if (!confirmed) return;
+    try {
+      const result = await api('/v1/console/rolecards/apply', { method: 'POST', body: { name } });
+      $('#rolecard-current').textContent = `当前：${result.current}`;
+      const previewText = (result.preview ?? []).map((sec) => sec.text ?? '').join('\n\n');
+      $('#rolecard-preview').innerHTML = previewText
+        ? `<div class="card"><div class="card-body"><h6 class="card-subtitle mb-2 text-muted">渲染预览（当前注入 system 的内容）</h6><pre class="mb-0 small" style="white-space:pre-wrap">${escapeHtml(previewText.slice(0, 2000))}</pre></div></div>`
+        : '';
+      toast(`已应用「${result.current}」，退役 ${result.retiredSessions} 个会话——下一条消息从全新会话开始`);
+    } catch (error) { toast(`应用失败：${error.message}`, 'bad'); }
+  });
 }
 
 async function loadServices() {
@@ -214,25 +437,56 @@ async function loadServices() {
   } catch (error) { toast(`加载失败：${error.message}`, 'bad'); }
 }
 
-function svcCard({ id, name, kind, transport, url, enabled, connected, file, tools }, removable) {
+function svcCard({ id, name, kind, transport, url, enabled, memoryService, connected, file, tools, handoff, presets }, removable) {
   const card = document.createElement('div');
   card.className = 'card svc-card';
+  const presetLabel = presets
+    ? Object.entries(presets).map(([p, v]) => `${p}=${v}`).join(', ')
+    : (kind === 'consumer' ? '未声明（会话用内置 minimal）' : '');
   const badges = [
     `<span class="badge text-bg-${enabled === false ? 'danger' : 'success'}">${enabled === false ? '停用' : '启用'}</span>`,
     `<span class="badge text-bg-secondary">${kind}</span>`,
-    `<span class="badge text-bg-secondary">${transport}</span>`,
+    `<span class="badge text-bg-secondary">${transport ?? '—'}</span>`,
+    // 记忆服务徽标：memoryService:true 是 session-save 的 save 目标选路依据。
+    memoryService === true
+      ? '<span class="badge text-bg-primary" title="声明 memoryService —— 会话缓冲 chat_memory_save 的落地目标">记忆服务</span>'
+      : '',
+    // 预设声明徽标（consumer）：只是名字，内容在 qq-bridge 编辑安装。
+    presetLabel && kind === 'consumer'
+      ? `<span class="badge text-bg-info" title="DSH 预设声明（仅名字；内容编辑/安装在 qq-bridge）">预设 ${presetLabel}</span>`
+      : '',
     connected ? '<span class="badge text-bg-success">已连接</span>' : '',
     url ? `<span class="badge text-bg-secondary">${url}</span>` : '',
+    // 交接文件是「对端能不能连上」的前置条件：生成了不代表复制过去了，
+    // 所以这里只陈述事实（已生成/未生成），不冒充「已接入」。
+    handoff?.exists
+      ? '<span class="badge text-bg-info" title="复制到目标仓库根目录并保持文件名 gateway.json">交接文件已生成</span>'
+      : '<span class="badge text-bg-secondary">交接文件未生成</span>',
   ].join(' ');
-  const chips = (tools ?? []).map((t) => `<span class="badge text-bg-dark border fw-normal">${t}</span>`).join('');
+  // 控制台专用工具（chat_role_admin_*）不在卡片徽章逐个铺开——它们不在模型/适配器
+  // 工具面（ToolHost 过滤），只在控制台签名代理通道使用；汇总一个徽章保持登记事实可见。
+  const visibleTools = (tools ?? []).filter((t) => !/^chat_role_admin_/.test(String(t)));
+  const consoleOnlyCount = (tools ?? []).length - visibleTools.length;
+  const chips = visibleTools.map((t) => `<span class="badge text-bg-dark border fw-normal">${t}</span>`).join('')
+    + (consoleOnlyCount > 0 ? `<span class="badge text-bg-light border fw-normal" title="控制台专用（角色卡管理面），不进入模型/适配器工具面">另有 ${consoleOnlyCount} 个控制台专用工具</span>` : '');
   card.innerHTML = `<div class="card-body p-3">
     <div class="d-flex align-items-center gap-2 flex-wrap"><strong>${name ?? id}</strong>${badges}</div>
     <div class="muted small d-flex gap-2 flex-wrap mt-1"><span>${id}</span>${file ? `<span>${file}</span>` : ''}</div>
     ${chips ? `<div class="d-flex flex-wrap gap-1 mt-2">${chips}</div>` : ''}
+    ${kind === 'consumer' && removable ? `<div class="mt-2 d-flex gap-2 align-items-center flex-wrap">
+      <input class="form-control form-control-sm preset-input" style="max-width:220px"
+             placeholder="DSH 预设名（清空保存=清除声明）" pattern="[a-z][a-z0-9-]{0,63}">
+      <button class="btn btn-outline-primary btn-sm preset-save">保存声明</button>
+      <span class="muted small">当前：${presetLabel}</span>
+    </div>` : ''}
+    ${kind !== 'consumer' && removable ? `<div class="mt-2 d-flex gap-2 align-items-center flex-wrap">
+      <button class="btn btn-outline-secondary btn-sm manifest-fetch">从服务拉取工具清单</button>
+      <span class="muted small">凭据用登记自身（url+secret）；写回后热生效，role 可在登记文件微调</span>
+    </div>` : ''}
     ${removable ? '<div class="mt-2"><button class="btn btn-outline-danger btn-sm">卸载</button></div>' : ''}
   </div>`;
   if (removable) {
-    card.querySelector('button').addEventListener('click', async () => {
+    card.querySelector('button.btn-outline-danger').addEventListener('click', async () => {
       if (!await confirmDialog(`卸载服务 ${name ?? id}（${id}）？登记文件将被删除，编排立即撤销。`, { okText: '卸载' })) return;
       try {
         await api(`/v1/console/services/${id}`, { method: 'DELETE' });
@@ -240,6 +494,40 @@ function svcCard({ id, name, kind, transport, url, enabled, connected, file, too
         loadServices();
       } catch (error) { toast(`卸载失败：${error.message}`, 'bad'); }
     });
+    // 预设声明行内编辑：保存即写登记文件并热生效（下一回合按新声明退役重建）。
+    const presetSave = card.querySelector('.preset-save');
+    if (presetSave) {
+      presetSave.addEventListener('click', async () => {
+        const value = card.querySelector('.preset-input').value.trim();
+        try {
+          const result = await api(`/v1/console/services/${id}/presets`, {
+            method: 'PUT',
+            body: value ? { preset: value } : { clear: true },
+          });
+          toast(result.presets
+            ? `预设声明已更新：${Object.entries(result.presets).map(([p, v]) => `${p}=${v}`).join(', ')}（下一回合生效；会话人设变化时会自动退役重建）`
+            : '已清除预设声明（会话将改用内置 minimal）');
+          loadServices();
+        } catch (error) { toast(`保存声明失败：${error.message}`, 'bad'); }
+      });
+    }
+    // 工具清单拉取 + 写回（resource 卡）：凭据用登记自身，role 缺省 tool（网关侧
+    // schema 兜底），覆盖前确认防误覆盖手工声明。
+    const manifestBtn = card.querySelector('.manifest-fetch');
+    if (manifestBtn) {
+      manifestBtn.addEventListener('click', async () => {
+        manifestBtn.disabled = true;
+        try {
+          const fetched = await api(`/v1/console/services/${id}/manifest`, { method: 'POST' });
+          const edited = await manifestEditorDialog(fetched.tools ?? []);
+          if (!edited) return;
+          const saved = await api(`/v1/console/services/${id}/tools`, { method: 'PUT', body: { tools: edited } });
+          toast(`已写回 ${(saved.tools ?? []).length} 条工具声明（热生效，编排词典下一拍可用）`);
+          loadServices();
+        } catch (error) { toast(`拉取清单失败：${error.message}`, 'bad'); }
+        finally { manifestBtn.disabled = false; }
+      });
+    }
   }
   return card;
 }
@@ -256,10 +544,60 @@ function renderServices() {
   void toolCount; void tools; // 工具面随服务卡片呈现
 }
 
+/**
+ * 登记成功面板：自动生成的 secret 只在此一次性展示（服务端不会再次返回），
+ * 连同 handoff 文件路径一起给出「复制」按钮——复制交接文件到对端仓根目录
+ * 改名 gateway.json 即完成凭据交接，无需手抄随机串。
+ */
+function renderRegisterResult(result) {
+  const panel = $('#register-result');
+  panel.innerHTML = '';
+  const title = document.createElement('div');
+  title.textContent = `已注册 ${result.name}（${result.id}，${result.kind}${result.active ? '' : '，装载未生效——见服务端日志'}）`;
+  panel.appendChild(title);
+  const addCopyRow = (label, value) => {
+    const row = document.createElement('div');
+    row.className = 'd-flex align-items-center gap-2 mt-1';
+    const text = document.createElement('span');
+    text.className = 'small text-break';
+    text.textContent = `${label}：${value}`;
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'btn btn-sm btn-outline-secondary flex-shrink-0';
+    btn.textContent = '复制';
+    btn.addEventListener('click', async () => {
+      try {
+        await navigator.clipboard.writeText(value);
+        btn.textContent = '已复制';
+        setTimeout(() => { btn.textContent = '复制'; }, 1500);
+      } catch { /* 剪贴板不可用（如非安全上下文）：静默，值仍在面板上可手动选 */ }
+    });
+    row.append(text, btn);
+    panel.appendChild(row);
+  };
+  if (result.secretGenerated && result.secret) {
+    addCopyRow('secret（仅此一次显示）', result.secret);
+  }
+  if (result.handoffFile) {
+    addCopyRow('交接文件', result.handoffFile);
+  }
+  show(panel, true);
+  // 自举提示：off 模式下登记已落盘并热加载，消息面用侧边栏开关一键启用（即时生效）。
+  fetch('/v1/health').then((r) => r.json()).then((health) => {
+    if (health?.mode === 'off') {
+      const note = document.createElement('div');
+      note.className = 'small text-warning mt-1';
+      note.textContent = '当前 GATEWAY_DATA_PLANE=off：登记已生效（可继续注册），消息面用侧边栏「启用消息面」开关开启（即时生效、零重启）。';
+      panel.appendChild(note);
+    }
+  }).catch(() => { /* 健康检查不可达时不提示 */ });
+}
+
 $('#register-form').addEventListener('submit', async (event) => {
   event.preventDefault();
   const errEl = $('#register-error');
   show(errEl, false);
+  show($('#register-result'), false);
   const secret = $('#reg-secret').value.trim();
   const secretEnv = $('#reg-secret-env').value.trim();
   const body = {
@@ -270,13 +608,24 @@ $('#register-form').addEventListener('submit', async (event) => {
   };
   const url = $('#reg-url').value.trim();
   if (url) body.url = url;
+  // consumer 平台声明（动作会话定位 + 入站验签 expectedPlatform；新契约必填）。
+  const platform = $('#reg-platform').value.trim();
+  if (platform) body.platform = platform;
+  // 预设声明（非必填）：只是名字，内容在 qq-bridge 编辑安装（dsh/qq/** + install:preset）。
+  const preset = $('#reg-preset').value.trim();
+  if (preset && platform) body.preset = preset;
   const timeoutMs = Number($('#reg-timeout').value);
   if (Number.isFinite(timeoutMs) && timeoutMs > 0) body.timeoutMs = timeoutMs;
   if (secret) body.secret = secret;
   if (secretEnv) body.secretEnv = secretEnv;
   try {
     const result = await api('/v1/console/services', { method: 'POST', body });
-    toast(`已注册 ${result.name}（${result.id}）`);
+    renderRegisterResult(result);
+    // 交接文件是这一步真正的交付物：不给路径，运维就只能去猜密钥怎么抄到对端。
+    toast(result.handoffFile
+      ? `已注册 ${result.name}（${result.id}）；交接文件：${result.handoffFile} — 复制到目标仓根目录并命名 gateway.json`
+      : `已注册 ${result.name}（${result.id}）（交接文件生成失败，见服务端日志）`,
+    result.handoffFile ? 'ok' : 'warn');
     event.target.reset();
     $('#tools-editor').innerHTML = '';
     loadServices();
@@ -286,8 +635,15 @@ $('#register-form').addEventListener('submit', async (event) => {
   }
 });
 
-$('#btn-add-tool').addEventListener('click', () => addToolRow());
+$('#btn-add-tool').addEventListener('click', () => { addToolRow(); syncRegistrationForm(); });
 $('#btn-refresh-services').addEventListener('click', loadServices);
+// kind 切换即收敛 transport / url / 工具 role 的合法取值（与契约同口径）。
+$('#reg-kind').addEventListener('change', syncRegistrationForm);
+$('#register-form').addEventListener('reset', () => {
+  // reset 先把控件还原到 HTML 默认值，推迟到事件循环末尾再同步派生约束。
+  setTimeout(() => { $('#tools-editor').innerHTML = ''; syncRegistrationForm(); }, 0);
+});
+syncRegistrationForm();
 
 /* ── 通路/回路编排视图 ────────────────────────────────────────────────── */
 
@@ -301,12 +657,18 @@ async function loadPipelines() {
 /** 可用步骤清单：内置 → 登记服务 id → 装饰器/过滤器工具名（带来源标注）。 */
 function availableSteps() {
   const { available = {} } = state.pipelines ?? {};
-  const groups = [
-    ['内置', (available.builtin ?? []).map((name) => ({ name, from: '内置' }))],
-    ['服务', (available.services ?? []).map((s) => ({ name: s.id, from: `服务·${s.kind}` }))],
-    ['工具', (available.tools ?? []).map((t) => ({ name: t.name, from: `工具·${t.serviceId}` }))],
+  // 可编排步骤只有 decorator/filter 角色的登记工具（服务 id 自 V2 起不再是
+  // 合法步骤、builtin protocol 已退役——两者都不再作为选项暴露）。
+  // 选项按「服务 => 工具」展示，value 仍是工具名（服务端按名解析）。
+  const registrations = state.services?.registrations ?? [];
+  const serviceNameOf = (id) => registrations.find((r) => r.id === id)?.name ?? id;
+  return [
+    ['工具', (available.tools ?? []).map((t) => ({
+      name: t.name,
+      label: `${serviceNameOf(t.serviceId)} => ${t.name}`,
+      role: t.role,
+    }))],
   ];
-  return groups;
 }
 
 /* ── P4.x 注入规则（once / 前缀·后缀·正则·函数 / 本地静态文本）────────── */
@@ -383,7 +745,7 @@ function chainEditor({ label, steps, effective = true }) {
   const options = groups
     .filter(([, items]) => items.length > 0)
     .map(([group, items]) => `<optgroup label="${group}">${items
-      .map((item) => `<option value="${item.name}">${item.name}（${item.from}）</option>`).join('')}</optgroup>`)
+      .map((item) => `<option value="${item.name}">${item.label}（${item.role ?? "tool"}）</option>`).join('')}</optgroup>`)
     .join('');
   wrap.innerHTML = `
     <div class="chain-title d-flex align-items-center gap-2 flex-wrap">${label}
@@ -404,7 +766,7 @@ function chainEditor({ label, steps, effective = true }) {
   /** 规则面板：once / 注入模式 / 正则 / 函数 / 静态文本 / 本地预览。
    *  字符串条目在首次改动规则时升级为规则对象（steps 原地替换，PUT 直接收）。
    *  输入事件只改条目对象并刷新徽标/预览，不整链重渲染（保住输入焦点）。 */
-  function attachRulePanel(panel, index) {
+  function attachRulePanel(panel, index, badgesEl) {
     const ensureObject = () => {
       if (typeof steps[index] === 'string') steps[index] = { step: steps[index] };
       return steps[index];
@@ -446,7 +808,9 @@ function chainEditor({ label, steps, effective = true }) {
         <div class="pv-out small text-secondary mt-1">（输入后即时预览）</div>
       </div>`;
 
-    const rowBadges = panel.parentElement.querySelector('.rule-badges');
+    // badges 元素由调用方传入（buildRow 持有 row 引用）——本函数执行时 panel
+    // 尚未挂入 DOM，panel.parentElement 为 null，不可反向从父节点查找。
+    const rowBadges = badgesEl;
     const statusEl = $('.rule-status', panel);
     const pvMsg = $('.pv-msg', panel);
     const pvExtra = $('.pv-extra', panel);
@@ -521,7 +885,7 @@ function chainEditor({ label, steps, effective = true }) {
         panel.classList.toggle('hidden', openIndex !== index);
       }
     });
-    if (!isProtocol) attachRulePanel(panel, index);
+    if (!isProtocol) attachRulePanel(panel, index, row.querySelector('.rule-badges'));
     el.append(row, panel);
     return el;
   }
@@ -648,9 +1012,11 @@ function renderLedger() {
 $('#btn-refresh-ledger').addEventListener('click', loadLedger);
 $('#ledger-limit').addEventListener('change', loadLedger);
 
-/* ── DSH 预设与仿真提示词视图（docs/console/dsh-presets/PLAN.md）───────── */
+/* ── DSH 预设视图（只读清单）──────────────────────────────────────────────
+ * 预设内容/安装归消费端（qq-bridge 的 dsh/qq/** + npm run install:preset），
+ * 网关只回显活 DSH 清单；消费端「用哪个预设」在服务页的登记声明里编辑。 */
 
-const presetState = { list: null, currentId: null };
+const presetState = { list: null };
 
 async function loadPresets() {
   const badge = $('#presets-source');
@@ -675,114 +1041,16 @@ function renderPresets() {
   for (const preset of presetState.list ?? []) {
     const row = document.createElement('div');
     row.className = 'card svc-card';
-    const badges = [
-      `<span class="badge text-bg-${preset.installed ? 'success' : 'secondary'}">${preset.installed ? '已安装' : '未安装'}</span>`,
-      preset.editable ? '<span class="badge text-bg-success">可编辑</span>' : '<span class="badge text-bg-secondary">只读</span>',
-    ].join(' ');
     row.innerHTML = `<div class="card-body p-3">
-      <div class="d-flex align-items-center gap-2 flex-wrap"><strong>${escapeHtml(preset.id)}</strong>${badges}</div>
-      <div class="muted small mt-1">${escapeHtml(preset.label ?? '')}</div>
-      ${preset.editable ? '<div class="mt-2"><button class="btn btn-outline-secondary btn-sm">编辑仿真提示词</button></div>' : ''}
+      <div class="d-flex align-items-center gap-2 flex-wrap"><strong>${escapeHtml(preset.id)}</strong></div>
+      <div class="muted small mt-1">内容与安装：消费端（qq-bridge / npm run install:preset）</div>
     </div>`;
-    const btn = row.querySelector('button');
-    if (btn) btn.addEventListener('click', () => openSimPrompt(preset.id));
     list.appendChild(row);
   }
   if (list.children.length === 0) list.innerHTML = '<div class="text-secondary small py-2">DSH 未返回任何预设</div>';
 }
 
-async function openSimPrompt(name) {
-  presetState.currentId = name;
-  $('#preset-id-label').textContent = name;
-  const warnEl = $('#preset-warnings');
-  try {
-    const data = await api(`/v1/console/dsh/presets/${encodeURIComponent(name)}/sim-prompt`);
-    $('#preset-content').value = data.content;
-    $('#preset-meta').textContent = `${data.chars} 字符 / ${data.bytes} 字节`;
-    renderPresetWarnings(data.warnings ?? []);
-    $('#btn-save-preset').disabled = false;
-    await loadPresetBackups(name);
-  } catch (error) {
-    $('#preset-content').value = '';
-    $('#preset-meta').textContent = '';
-    $('#btn-save-preset').disabled = true;
-    warnEl.textContent = `读取失败：${error.message}`;
-    warnEl.className = 'warn-strip bad';
-    show(warnEl, true);
-    toast(`读取失败：${error.message}`, 'bad');
-  }
-}
-
-function renderPresetWarnings(warnings, errorText) {
-  const el = $('#preset-warnings');
-  const lines = errorText ? [errorText] : (warnings ?? []);
-  if (lines.length === 0) {
-    el.textContent = '';
-    show(el, false);
-    return;
-  }
-  el.innerHTML = lines.map((line) => `⚠ ${escapeHtml(line)}`).join('<br>');
-  el.className = `warn-strip${errorText ? ' bad' : ''}`;
-  show(el, true);
-}
-
-async function loadPresetBackups(name) {
-  const select = $('#preset-backups');
-  const restoreBtn = $('#btn-restore-preset');
-  try {
-    const result = await api(`/v1/console/dsh/presets/${encodeURIComponent(name)}/sim-prompt/backups`);
-    const backups = result.backups ?? [];
-    select.innerHTML = '<option value="">备份（还原用）…</option>'
-      + backups.map((b) => `<option value="${escapeHtml(b.file)}">${fmtTime(b.at)} · ${(b.size / 1024).toFixed(1)} KB</option>`).join('');
-    restoreBtn.disabled = backups.length === 0;
-  } catch {
-    select.innerHTML = '<option value="">备份不可用</option>';
-    restoreBtn.disabled = true;
-  }
-}
-
 $('#btn-refresh-presets').addEventListener('click', loadPresets);
-
-$('#btn-save-preset').addEventListener('click', async () => {
-  const id = presetState.currentId;
-  if (!id) return;
-  try {
-    const result = await api(`/v1/console/dsh/presets/${encodeURIComponent(id)}/sim-prompt`, {
-      method: 'PUT',
-      body: { content: $('#preset-content').value },
-    });
-    if (!result.changed) {
-      toast('内容未变，未落盘（避免无意义的全删全加 diff）');
-    } else {
-      const backupName = result.backup ? String(result.backup).split(/[\\/]/).pop() : '';
-      toast(`已保存${backupName ? `（备份 ${backupName}）` : ''}；重启 DSH 后生效`);
-      $('#preset-meta').textContent = `${result.chars} 字符`;
-    }
-    renderPresetWarnings(result.warnings ?? []);
-    await loadPresetBackups(id);
-  } catch (error) {
-    renderPresetWarnings([], `保存被拒绝：${error.message}`);
-    toast(`保存失败：${error.message}`, 'bad');
-  }
-});
-
-$('#btn-restore-preset').addEventListener('click', async () => {
-  const id = presetState.currentId;
-  const file = $('#preset-backups').value;
-  if (!id || !file) { toast('先选择一个备份', 'bad'); return; }
-  if (!await confirmDialog(`用备份 ${file} 覆盖当前仿真提示词？\n还原前会自动备份当前版本；重启 DSH 后生效。`, { okText: '还原' })) return;
-  try {
-    const result = await api(`/v1/console/dsh/presets/${encodeURIComponent(id)}/sim-prompt/restore`, {
-      method: 'POST',
-      body: { file },
-    });
-    const from = String(result.restoredFrom ?? file).split(/[\\/]/).pop();
-    toast(`已从备份 ${from} 还原；重启 DSH 后生效`);
-    await openSimPrompt(id);
-  } catch (error) {
-    toast(`还原失败：${error.message}`, 'bad');
-  }
-});
 
 /* ── DSH 模型与会话视图（docs/console/dsh-sessions/PLAN.md）────────────── */
 
@@ -1290,7 +1558,8 @@ function renderAdapters() {
       ? '<span class="badge text-bg-danger">unregistered</span>'
       : a.enabled === false ? '<span class="badge text-bg-warning">disabled</span>'
         : '<span class="badge text-bg-success">enabled</span>';
-    const sourceBadge = a.source === 'both' ? 'both' : a.source === 'registry' ? 'registry' : 'adapters.json';
+    // 消费端唯一来源 = 登记目录：registry（已登记）/ unregistered（只在 turn 记录里出现）。
+    const sourceBadge = a.source === 'registry' ? 'registry' : 'unregistered';
     const errorDetail = Object.entries(a.errorCodes ?? {}).map(([code, n]) => `${code}×${n}`).join(', ');
     return `
       <tr data-adapter-id="${escapeHtml(a.id)}" class="adapter-row">

@@ -40,10 +40,6 @@ import stickerNote from './sticker-note.mjs';
 import setStickerRemark from './set-sticker-remark.mjs';
 import sendVoice from './send-voice.mjs';
 import listVoices from './list-voices.mjs';
-import memoryAppend from './memory-append.mjs';
-import memoryQuery from './memory-query.mjs';
-import memoryRemove from './memory-remove.mjs';
-import memoryClear from './memory-clear.mjs';
 import ask from './ask.mjs';
 import approve from './approve.mjs';
 
@@ -53,7 +49,8 @@ export const CAPABILITIES = Object.freeze([
   getMessageDetail, getMessageImages, getForwardMsg, getActiveMembers, getGroupMembers,
   listGroups, getHistory, listStickers, getStickerImage, getSelfImage, sendSticker,
   collectSticker, stickerNote, setStickerRemark, sendVoice, listVoices,
-  memoryAppend, memoryQuery, memoryRemove, memoryClear,
+  // memory_* 已从桥接清单剥离（记忆能力收编到 memory-mcp 资源服务），
+  // agent-gateway 侧同步删除对应桩模块——"目录与清单 1:1" 的不变量不允许孤儿。
   ask, approve,
 ]);
 

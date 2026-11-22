@@ -19,6 +19,7 @@ const { createToolHost } = await import(new URL('../src/runtime/tool-host.mjs', 
 const { loadConfig } = await import(new URL('../src/core/config.mjs', import.meta.url).href);
 const { createGatewayServer } = await import(new URL('../src/core/server.mjs', import.meta.url).href);
 const { createMcpBus } = await import(new URL('../src/mcp-bus.mjs', import.meta.url).href);
+const { seedBusSecret } = await import(new URL('./support/consumer-registration.mjs', import.meta.url).href);
 
 const KEY = 'sk-test-web-search-key-0123456789';
 const SECRET = 'test-secret-0123456789abcdef';
@@ -235,16 +236,17 @@ test('集成：chat_web_search 经 /v1/tools 与 mcp-bus JSON-RPC 端到端可�
     const host = createToolHost({ executorRegistry: registry, logger: () => {}, callTimeoutMs: 5000 });
     host.registerTurn({ turnId: 'turn_1', turnToken: 'tok-1', sessionKey: 'qq:group:456' });
 
+    // mcp-bus 共享密钥是文件单源（env 通道已退役）。
+    const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), 'websearch-gw-'));
+    seedBusSecret(stateDir, SECRET);
     const config = loadConfig({
       env: {
         GATEWAY_MODE: 'off',
         GATEWAY_PORT: '0',
         GATEWAY_HOST: '127.0.0.1',
         GATEWAY_TOOLS: 'on',
-        GATEWAY_MCP_TOKEN: SECRET,
       },
-      stateDir: fs.mkdtempSync(path.join(os.tmpdir(), 'websearch-gw-')),
-      adapters: [{ id: 'qq-test', platform: 'qq', secret: SECRET }],
+      stateDir,
     });
     const gateway = createGatewayServer({
       config,

@@ -24,6 +24,9 @@ const {
 const { signRequest } = await import(new URL('../src/core/auth.mjs', import.meta.url).href);
 const { loadConfig } = await import(new URL('../src/core/config.mjs', import.meta.url).href);
 const { createGatewayServer } = await import(new URL('../src/core/server.mjs', import.meta.url).href);
+const { seedConsumer, createConsumerRegistry } = await import(
+  new URL('./support/consumer-registration.mjs', import.meta.url).href
+);
 const { buildEnvelope, postAdapterAction } = await import(new URL('./helpers/adapter-wire.mjs', import.meta.url).href);
 
 const { createGatewayClient: createQqClient } = await import('../../qq-bridge/src/gateway/gateway-client.js');
@@ -144,18 +147,28 @@ function envelopeFor(entry, overrides = {}) {
   };
 }
 
-async function startGateway({ conversations, adapters, runtime }) {
+async function startGateway({ consumers, runtime }) {
+  const stateDir = tmpStateDir();
+  // 消费端身份只认登记目录：把条目落成 services/<id>.json（唯一身份通道）。
+  for (const entry of consumers) {
+    seedConsumer(stateDir, {
+      id: entry.id,
+      platform: entry.platform,
+      secret: entry.secret,
+      url: entry.callbackBase ?? null,
+      enabled: entry.enabled !== false,
+    });
+  }
   const config = loadConfig({
     env: {
       GATEWAY_MODE: 'on',
       GATEWAY_PORT: '0',
-      GATEWAY_CONVERSATIONS: conversations,
-      GATEWAY_SECRET: '',
     },
-    stateDir: tmpStateDir(),
-    adapters,
+    stateDir,
   });
-  const gateway = createGatewayServer({ config, logger: () => {}, runtime });
+  const gateway = createGatewayServer({
+    config, logger: () => {}, runtime, services: createConsumerRegistry({ stateDir }),
+  });
   await gateway.listen();
   const { port } = gateway.server.address();
   return { gateway, base: `http://127.0.0.1:${port}`, config };
@@ -209,7 +222,7 @@ for (const entry of MATRIX) {
     const runtime = createRuntimeStub();
     const { gateway, base } = await startGateway({
       conversations: 'qq:group:*,wx:room:*',
-      adapters: MATRIX.map((item) => ({ id: item.adapterId, platform: item.platform, secret: item.secret })),
+      consumers: MATRIX.map((item) => ({ id: item.adapterId, platform: item.platform, secret: item.secret })),
       runtime,
     });
     const client = entry.createClient({
@@ -222,12 +235,14 @@ for (const entry of MATRIX) {
       assert.equal(first.body.status, 'accepted');
       assert.equal(first.body.routed, true);
       assert.equal(runtime.submitted.length, 1);
-      assert.equal(runtime.submitted[0].sessionKey, sessionKeyOf(envelope));
+      // 会话键带消费端维度（4 段）：`platform:consumerId:kind:id`——会话绑消费端。
+      assert.equal(runtime.submitted[0].sessionKey, sessionKeyOf(envelope, { consumerId: entry.adapterId }));
 
       // turn 记录里的会话键与幂等键必须与契约推导一致。
       const turn = await client.turn(first.body.turnId);
       assert.equal(turn.ok, true);
-      assert.equal(turn.body.record.sessionKey, entry.sessionKey);
+      assert.equal(turn.body.record.sessionKey, `${entry.platform}:${entry.adapterId}:${entry.kind}:${entry.conversationId}`);
+      assert.equal(turn.body.record.adapterId, entry.adapterId, 'turn 记录顶层带消费端 id');
       assert.equal(inboundIdempotencyKey(envelope), `${entry.platform}:${entry.kind}:${entry.conversationId}:${entry.name}-msg-1`);
 
       const duplicate = await client.inbound(envelope);
@@ -243,7 +258,7 @@ for (const entry of MATRIX) {
     const runtime = createRuntimeStub();
     const { gateway, base } = await startGateway({
       conversations: 'qq:group:*,wx:room:*',
-      adapters: MATRIX.map((item) => ({ id: item.adapterId, platform: item.platform, secret: item.secret })),
+      consumers: MATRIX.map((item) => ({ id: item.adapterId, platform: item.platform, secret: item.secret })),
       runtime,
     });
     const envelope = parseInbound(envelopeFor(entry));
@@ -303,11 +318,10 @@ for (const entry of MATRIX) {
     }
   });
 
-  test(`[${entry.name}] 入站：白名单未命中 → unrouted，适配器可保留本地路径`, async () => {
+  test(`[${entry.name}] 入站：网关不再按会话过滤 → 任何会话都 accepted（白名单在适配器侧）`, async () => {
     const runtime = createRuntimeStub();
     const { gateway, base } = await startGateway({
-      conversations: entry.platform === 'qq' ? 'qq:group:111' : 'wx:room:111@chatroom',
-      adapters: MATRIX.map((item) => ({ id: item.adapterId, platform: item.platform, secret: item.secret })),
+      consumers: MATRIX.map((item) => ({ id: item.adapterId, platform: item.platform, secret: item.secret })),
       runtime,
     });
     const client = entry.createClient({
@@ -315,9 +329,9 @@ for (const entry of MATRIX) {
     });
     try {
       const result = await client.inbound(parseInbound(envelopeFor(entry)));
-      assert.equal(result.body.status, 'unrouted');
-      assert.equal(result.body.routed, false);
-      assert.equal(runtime.submitted.length, 0);
+      assert.equal(result.body.status, 'accepted');
+      assert.equal(result.body.routed, true);
+      assert.equal(runtime.submitted.length, 1);
     } finally {
       await closeGateway(gateway);
     }
@@ -497,21 +511,20 @@ test('动作：适配器回执形状漂移时网关拒绝（不把 {} 当发送�
   }
 });
 
-test('健康检查：两个适配器同时登记，能力与回投地址可观测', async () => {
+test('健康检查：两个适配器同时登记，回投地址可观测（不再输出 capabilities）', async () => {
   const runtime = createRuntimeStub();
   const { gateway, base } = await startGateway({
     conversations: 'qq:group:*,wx:room:*',
-    adapters: MATRIX.map((entry) => ({
+    consumers: MATRIX.map((entry) => ({
       id: entry.adapterId,
       platform: entry.platform,
       secret: entry.secret,
       callbackBase: `http://127.0.0.1:9${entry.name === 'qq' ? 1 : 2}`,
-      capabilities: entry.capabilities,
     })),
     runtime,
   });
   try {
-    // 适配器能力/回投地址属于排障细节：公开 health 只剩最小事实，细节要签名。
+    // 回投地址属于排障细节：公开 health 只剩最小事实，细节要签名。
     const signed = signRequest({ secret: MATRIX[0].secret, adapterId: MATRIX[0].adapterId, body: '' });
     const response = await fetch(`${base}/v1/health?detail=1`, { headers: signed });
     const health = await response.json();
@@ -519,100 +532,23 @@ test('健康检查：两个适配器同时登记，能力与回投地址可观�
     assert.equal(health.ok, true);
     assert.deepEqual(health.adapters.map((item) => item.platform).sort(), ['qq', 'wx']);
     const wx = health.adapters.find((item) => item.platform === 'wx');
-    assert.deepEqual(wx.capabilities, MATRIX[1].capabilities);
+    // 能力清单随运行时 manifest 变化，静态 health 快照会骗人 —— 字段已删除。
+    assert.equal('capabilities' in wx, false);
     assert.match(wx.actionsEndpoint, /\/v1\/actions$/);
   } finally {
     await closeGateway(gateway);
   }
 });
 
-test('注册表：enabled:false 与 GATEWAY_DISABLED_ADAPTERS 都能单独摘掉适配器', async () => {
-  const adapters = MATRIX.map((entry) => ({
-    id: entry.adapterId,
-    platform: entry.platform,
-    secret: entry.secret,
-    ...(entry.platform === 'wx' ? { enabled: false } : {}),
-  }));
-  const disabledByFile = loadConfig({
-    env: { GATEWAY_MODE: 'on', GATEWAY_PORT: '0' },
-    stateDir: tmpStateDir(),
-    adapters,
-  });
-  assert.deepEqual(disabledByFile.adapters.map((item) => item.platform), ['qq']);
-
-  const disabledByEnv = loadConfig({
-    env: { GATEWAY_MODE: 'on', GATEWAY_PORT: '0', GATEWAY_DISABLED_ADAPTERS: 'qq-main' },
-    stateDir: tmpStateDir(),
-    adapters: MATRIX.map((entry) => ({ id: entry.adapterId, platform: entry.platform, secret: entry.secret })),
-  });
-  assert.deepEqual(disabledByEnv.adapters.map((item) => item.platform), ['wx']);
-
-  // 能力写错必须是启动期错误，而不是等到模型调用时才 500。
-  assert.throws(() => loadConfig({
-    env: { GATEWAY_MODE: 'on', GATEWAY_PORT: '0' },
-    stateDir: tmpStateDir(),
-    adapters: [{ id: 'wx-main', platform: 'wx', secret: 'x'.repeat(20), capabilities: ['wait'] }],
-  }), /unknown capabilities/);
-
-  // 开关键写成字符串会静默「开」——必须在启动期拦住。
-  assert.throws(() => loadConfig({
-    env: { GATEWAY_MODE: 'on', GATEWAY_PORT: '0' },
-    stateDir: tmpStateDir(),
-    adapters: [{ id: 'wx-main', platform: 'wx', secret: 'x'.repeat(20), enabled: 'false' }],
-  }), /enabled must be a boolean/);
-
-  // 动作按 platform 路由，同平台两个适配器只会互相覆盖。
-  assert.throws(() => loadConfig({
-    env: { GATEWAY_MODE: 'on', GATEWAY_PORT: '0' },
-    stateDir: tmpStateDir(),
-    adapters: [
-      { id: 'wx-main', platform: 'wx', secret: 'a'.repeat(20) },
-      { id: 'wx-backup', platform: 'wx', secret: 'b'.repeat(20) },
-    ],
-  }), /share platform "wx"/);
-});
-
-/** 每个动作一份最小合法 payload：用于验证「示例声明了什么，实现就真能执行什么」。 */
-const ACTION_PROBES = {
-  send_text: { text: '在吗' },
-  reply: { text: '在吗' },
-  send_media: { kind: 'image', ref: 'https://cdn.example.com/a.png' },
-  send_file: { ref: 'https://cdn.example.com/a.png', name: 'a.png' },
-  mark_read: { throughSeq: 3 },
-  poke: { userId: 'wxid_x' },
-};
-
-test('示例登记：adapters.example.json 声明的能力都能被对应实现执行', async () => {
-  // 这一条钉的是「文档漂移」：示例曾给 qq 声明 send_media/poke，而 gateway-actions.js
-  // 只实现 send_text/reply/mark_read——网关就会把动作发给一个只会回 E_UNSUPPORTED 的适配器。
-  // 所以不比对代码里的常量，而是拿示例里的能力列表逐个真投一次。
-  const example = JSON.parse(fs.readFileSync(new URL('../adapters.example.json', import.meta.url), 'utf8'));
-  for (const entry of MATRIX) {
-    const row = example.adapters.find((item) => item.platform === entry.platform);
-    assert.ok(row, `adapters.example.json 缺少 ${entry.platform} 适配器`);
-    assert.equal(row.id, entry.adapterId);
-
-    const actions = await entry.startActions({ secret: entry.secret, capabilities: row.capabilities });
-    try {
-      for (const type of row.capabilities) {
-        const envelope = {
-          v: 1,
-          actionId: `act-example-${entry.name}-${type}`,
-          turnId: 'turn-example',
-          type,
-          target: { platform: entry.platform, conversationId: entry.conversationId, kind: entry.kind },
-          payload: ACTION_PROBES[type] ?? {},
-          idempotencyKey: `example:${entry.name}:${type}`,
-        };
-        const result = await postSignedAction(actions.port, entry, envelope);
-        assert.equal(result.status, 200, `${entry.name}/${type}: HTTP ${result.status}`);
-        assert.notEqual(
-          result.body?.error?.code, 'E_UNSUPPORTED',
-          `示例声明了 ${entry.platform}/${type}，实现却回 E_UNSUPPORTED`,
-        );
-      }
-    } finally {
-      await closeServer(actions.server);
-    }
-  }
+test('登记目录：enabled:false 的消费端被摘掉；同平台多账号合法', () => {
+  const stateDir = tmpStateDir();
+  seedConsumer(stateDir, { id: 'qq-main', platform: 'qq', secret: 'q'.repeat(20) });
+  seedConsumer(stateDir, { id: 'wx-main', platform: 'wx', secret: 'a'.repeat(20), enabled: false });
+  seedConsumer(stateDir, { id: 'wx-backup', platform: 'wx', secret: 'b'.repeat(20) });
+  const config = loadConfig({ env: { GATEWAY_MODE: 'on', GATEWAY_PORT: '0' }, stateDir });
+  assert.equal(config.mode, 'on');
+  const consumers = createConsumerRegistry({ stateDir }).consumers();
+  assert.deepEqual(consumers.map((item) => item.platform).sort(), ['qq', 'wx']);
+  assert.equal(consumers.filter((item) => item.platform === 'wx').length, 1, '停用条目被摘掉');
+  assert.equal(consumers.find((item) => item.platform === 'wx').id, 'wx-backup', '同平台另一个账号仍在');
 });

@@ -2,7 +2,7 @@
  * 网关配置的加载与校验。
  *
  * 设计原则：**fail-closed 且可解释**。
- *  - 没有任何适配器配置时拒绝启动（而不是回退到无鉴权）——一个能被任意
+ *  - 没有任何消费端登记时拒绝启动（而不是回退到无鉴权）——一个能被任意
  *    本机进程调用的网关，等于把「给任意群发消息」的能力暴露出去。
  *  - 每个错误都告诉操作者该改哪个文件、跑哪个命令，不允许「配置了但没生效」。
  */
@@ -17,15 +17,18 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 // 本文件位于 src/core/，包根是上两级。
 export const PACKAGE_ROOT = path.resolve(__dirname, '..', '..');
 
-export const GATEWAY_MODES = Object.freeze(['off', 'shadow', 'on']);
+// 数据面状态（原 GATEWAY_MODES，随环境变量正名）：off=数据面禁用（入站 503/
+// WS 帧 E_DISABLED），shadow=影子灰度（受理只记 status），on=常驻放行。
+export const DATA_PLANE_MODES = Object.freeze(['off', 'shadow', 'on']);
 export const DEFAULT_PORT = 7190;
 export const MAX_BODY_BYTES = 256 * 1024;
 
 /**
- * 适配器能「真的执行」的动作子集。
+ * 适配器能「真的执行」的动作子集（网关认识的线缆词汇表）。
  *
  * `wait / set_wake / noop` 是模型侧语义，网关自己消费，永远不该出现在适配器的
- * capabilities 里——允许它们会让适配器声称支持一个根本不存在的投递动作。
+ * actions manifest 里——允许它们会让适配器声称支持一个根本不存在的投递动作。
+ * 具体某个适配器实现了哪些动作，唯一事实源是它自己暴露的 actions-manifest。
  */
 export const DELIVERABLE_ACTIONS = Object.freeze(
   ACTION_TYPES.filter((action) => !['wait', 'set_wake', 'noop'].includes(action)),
@@ -68,8 +71,6 @@ export function resolveSecret(entry, env, stateDir, label = 'adapter') {
  * @param {object} options
  * @param {NodeJS.ProcessEnv} [options.env]
  * @param {string}   [options.stateDir]  默认 `<package>/state/gateway`
- * @param {string}   [options.adaptersFile] 默认 `<stateDir>/adapters.json`
- * @param {object[]} [options.adapters]  直接注入（测试用），跳过文件
  */
 /**
  * 数值型环境变量校验（fail-closed）。
@@ -86,13 +87,18 @@ function intInRange(name, raw, { min, max, fallback }) {
   return value;
 }
 
-export function loadConfig({ env = process.env, stateDir, adaptersFile, adapters: injectedAdapters } = {}) {
+export function loadConfig({ env = process.env, stateDir } = {}) {
   const dir = stateDir ?? path.join(PACKAGE_ROOT, 'state', 'gateway');
-  const modeRaw = String(env.GATEWAY_MODE ?? 'off').trim().toLowerCase();
-  if (!GATEWAY_MODES.includes(modeRaw)) {
-    throw new Error(`GATEWAY_MODE must be one of ${GATEWAY_MODES.join(' | ')}, got "${env.GATEWAY_MODE}"`);
+  // 数据面状态（2026-11-18 正名）：GATEWAY_MODE → GATEWAY_DATA_PLANE。旧名仍被
+  // 读取（回退），但打 deprecation 告警——防止存量 env 升级后数据面被静默关闭。
+  const dataPlaneRaw = String(env.GATEWAY_DATA_PLANE ?? env.GATEWAY_MODE ?? 'off').trim().toLowerCase();
+  if (env.GATEWAY_DATA_PLANE == null && env.GATEWAY_MODE != null) {
+    console.warn('[gateway] GATEWAY_MODE 已更名 GATEWAY_DATA_PLANE（值沿用）；请更新 env 文件');
   }
-  const mode = modeRaw;
+  if (!DATA_PLANE_MODES.includes(dataPlaneRaw)) {
+    throw new Error(`GATEWAY_DATA_PLANE must be one of ${DATA_PLANE_MODES.join(' | ')}, got "${env.GATEWAY_DATA_PLANE ?? env.GATEWAY_MODE}"`);
+  }
+  const mode = dataPlaneRaw;
 
   const host = String(env.GATEWAY_HOST ?? '127.0.0.1');
   if (host !== '127.0.0.1' && host !== 'localhost' && host !== '::1') {
@@ -106,141 +112,47 @@ export function loadConfig({ env = process.env, stateDir, adaptersFile, adapters
     throw new Error(`GATEWAY_PORT must be an integer in [0, 65535], got "${env.GATEWAY_PORT}"`);
   }
 
-  let adapterList = injectedAdapters;
-  const file = adaptersFile ?? path.join(dir, 'adapters.json');
-  if (!adapterList) {
-    if (fs.existsSync(file)) {
-      try {
-        const parsed = JSON.parse(fs.readFileSync(file, 'utf8'));
-        adapterList = Array.isArray(parsed?.adapters) ? parsed.adapters : null;
-        if (!adapterList) {
-          throw new Error(`${file} must be {"adapters": [{ id, platform, secretFile | secretEnv }]}`);
-        }
-      } catch (error) {
-        throw new Error(`failed to read ${file}: ${error?.message ?? error}`);
-      }
-    } else if (env.GATEWAY_SECRET) {
-      // 单适配器的最简路径：GATEWAY_ADAPTER_ID 默认 qq-main。
-      adapterList = [{
-        id: String(env.GATEWAY_ADAPTER_ID ?? 'qq-main'),
-        platform: String(env.GATEWAY_ADAPTER_PLATFORM ?? 'qq'),
-        secret: String(env.GATEWAY_SECRET),
-      }];
-    }
+  // ── 消费端身份唯一事实源 = 登记目录 ────────────────────────────────────────
+  // 两条兼容通道（env 单适配器三元组 / adapters.json）已整体退役：消费端身份
+  // 只认 <stateDir>/services/<id>.json（kind=consumer）。静默忽略会让运维以为旧
+  // 配置仍生效（与 GATEWAY_CONTEXT / GATEWAY_SERVICES_FILE 同范式），故读到即
+  // 拒载，并把迁移步骤直接写进错误文案。
+  const retiredEnvKeys = ['GATEWAY_ADAPTER_ID', 'GATEWAY_ADAPTER_PLATFORM', 'GATEWAY_SECRET', 'GATEWAY_DISABLED_ADAPTERS']
+    .filter((key) => env[key] !== undefined && String(env[key]).trim() !== '');
+  if (retiredEnvKeys.length > 0) {
+    throw new Error([
+      `${retiredEnvKeys.join(' / ')} retired: consumer identity now lives ONLY in the registration dir.`,
+      'Migration: (1) run "npm run secrets:gen" (default id = svc-<hash>) to create the secret + handoff file;',
+      `(2) write ${path.join(dir, 'services', '<svc-id>.json')} as`,
+      '{"v":1,"id":"svc-<hash>","name":"<consumer-name>","kind":"consumer","transport":"auto","platform":"<platform>",'
+        + '"url":"http://127.0.0.1:3100","secretFile":"secrets/svc-<hash>.secret"}',
+      '(or register it in the console: POST /v1/console/services with kind=consumer);',
+      '(3) delete these env vars and restart.',
+    ].join(' '));
   }
 
-  // P5：每个适配器一个独立开关，两种写法等价：
-  //   adapters.json 里 `"enabled": false`（长期） / `GATEWAY_DISABLED_ADAPTERS=wx-main`（临时）。
-  // 过滤发生在密钥解析之前：关掉的适配器不该因为「密钥文件忘了放」把网关拖住。
-  const disabledAdapters = new Set(String(env.GATEWAY_DISABLED_ADAPTERS ?? '')
-    .split(',').map((value) => value.trim()).filter(Boolean));
-
-  function resolveAdapter(entry) {
-    if (!entry || typeof entry.id !== 'string' || !/^[a-z0-9][a-z0-9-]{0,63}$/.test(entry.id)) {
-      throw new Error(`adapter id must match ^[a-z0-9][a-z0-9-]{0,63}$, got ${JSON.stringify(entry?.id)}`);
-    }
-    // V2 消费者抽象：kind='route' 的消费者不绑定平台（它可以是一条路由、一个桥），
-    // 网关不关心谁在消费；kind 缺省 = 'platform'，既有 adapters.json 行为不变。
-    const kind = entry.kind ?? 'platform';
-    if (!['platform', 'route'].includes(kind)) {
-      throw new Error(`adapter "${entry.id}": kind must be "platform" or "route"`);
-    }
-    if (kind === 'platform' && !['qq', 'wx'].includes(entry.platform)) {
-      throw new Error(`adapter "${entry.id}": platform must be "qq" or "wx"`);
-    }
-    if (kind === 'route' && entry.platform !== undefined) {
-      throw new Error(`adapter "${entry.id}": route consumers must not declare a platform`);
-    }
-    // V2 客户端通道：auto = 能连 WS 就走 WS、HTTP 备用（缺省，兼容既有部署）；
-    // 显式 http/ws 可钉死。真正的降级逻辑在客户端，网关两侧通道常开。
-    const transport = entry.transport ?? 'auto';
-    if (!['auto', 'http', 'ws'].includes(transport)) {
-      throw new Error(`adapter "${entry.id}": transport must be "auto", "http" or "ws"`);
-    }
-    // capabilities 缺省 = 不限制（既有适配器没有声明，行为保持不变）。
-    // 一旦声明就必须是「可投递动作」的子集：写错一个动作名等于让模型以为能戳一戳。
-    let capabilities = null;
-    if (entry.capabilities !== undefined) {
-      if (!Array.isArray(entry.capabilities) || entry.capabilities.length === 0) {
-        throw new Error(`adapter "${entry.id}": capabilities must be a non-empty array when provided`);
-      }
-      const unknown = entry.capabilities.filter((action) => !DELIVERABLE_ACTIONS.includes(action));
-      if (unknown.length > 0) {
-        throw new Error(
-          `adapter "${entry.id}": unknown capabilities ${unknown.join(', ')} `
-          + `(allowed: ${DELIVERABLE_ACTIONS.join(', ')})`,
-        );
-      }
-      capabilities = [...new Set(entry.capabilities)];
-    }
-    return {
-      id: entry.id,
-      kind,
-      transport,
-      platform: kind === 'platform' ? entry.platform : null,
-      secret: resolveSecret(entry, env, dir),
-      // P1：网关出站动作的回投地址（适配器 /v1/actions）。缺省表示「暂不回投」，
-      // 文本投递仍由适配器经自己的 mux 处理（P1 灰度语义，见设计文档）。
-      callbackBase: typeof entry.callbackBase === 'string' && entry.callbackBase
-        ? entry.callbackBase.replace(/\/+$/, '') : null,
-      capabilities,
-    };
+  const legacyAdaptersFile = path.join(dir, 'adapters.json');
+  if (fs.existsSync(legacyAdaptersFile)) {
+    throw new Error([
+      `${legacyAdaptersFile} retired: adapters.json is no longer read (the registration dir is the only consumer source).`,
+      'Migration: for every "adapters" entry create',
+      `${path.join(dir, 'services', '<id>.json')} with kind="consumer", platform, url (= old callbackBase),`
+        + ' transport (default "auto") and secretFile/secretEnv;',
+      'then delete adapters.json (and the entry from GATEWAY_DISABLED_ADAPTERS, if any) and restart.',
+      'Registration ids are normally svc-<hash>; the console (POST /v1/console/services) generates them for you.',
+    ].join(' '));
   }
 
-  // `enabled` 只接受布尔：`"enabled": "false"` 会被 `!== false` 判成「开」，
-  // 一个引号就让本该关掉的适配器继续跑，这种事故不值得靠人眼发现。
-  for (const entry of adapterList ?? []) {
-    if (entry?.enabled !== undefined && typeof entry.enabled !== 'boolean') {
-      throw new Error(`adapter "${entry?.id}": enabled must be a boolean, got ${JSON.stringify(entry.enabled)}`);
-    }
-  }
-
-  const resolved = (adapterList ?? [])
-    .filter((entry) => entry?.enabled !== false)
-    .filter((entry) => !disabledAdapters.has(entry?.id))
-    .map(resolveAdapter);
-
-  if (mode !== 'off' && resolved.length === 0) {
-    throw new Error(
-      `GATEWAY_MODE=${mode} requires at least one adapter. `
-      + `Create ${file} as {"adapters":[{"id":"qq-main","platform":"qq","secretFile":"qq-main.secret"}]} `
-      + `and put a >=16 char random string into that file, or set GATEWAY_SECRET.`,
-    );
-  }
-
-  const ids = new Set();
-  const platformOwner = new Map();
-  for (const adapter of resolved) {
-    if (ids.has(adapter.id)) throw new Error(`duplicate adapter id: ${adapter.id}`);
-    ids.add(adapter.id);
-    // 出站动作按 platform 路由（adapter-tools 每个平台一个工具命名空间）。同平台两个适配器
-    // 会静默「后登记者覆盖」，模型发到 wx 的动作可能落在另一个进程上。
-    // 真要并行接入，得先给路由加 adapterId，而不是让配置自己撞车。
-    // V2：route 消费者不绑定平台，不参与平台独占检查。
-    if (adapter.kind === 'route') continue;
-    const owner = platformOwner.get(adapter.platform);
-    if (owner) {
-      throw new Error(
-        `adapters "${owner}" and "${adapter.id}" share platform "${adapter.platform}": `
-        + 'only one adapter per platform can receive actions',
-      );
-    }
-    platformOwner.set(adapter.platform, adapter.id);
-  }
-
-  // ── V2 客户端通道（WebSocket）────────────────────────────────────────────
-  // off：不起 WS 端点（默认，P1 灰度期）；on：在 /v1/ws 挂 RFC6455 服务，
-  // 消费者与装饰器/过滤器服务以客户端身份连入（HTTP 端点全部保留为备用）。
-  const wsModeRaw = String(env.GATEWAY_WS ?? 'off').trim().toLowerCase();
-  if (!['off', 'on'].includes(wsModeRaw)) {
-    throw new Error(`GATEWAY_WS must be off|on, got "${env.GATEWAY_WS}"`);
-  }
+  // ── V2 客户端通道（WebSocket，常驻能力，2026-11-18 起无开关）──────────────
+  // 曾有 GATEWAY_WS=off|on 开关：on 时适配器没连 WS 自然落 HTTP，off 的唯一
+  // 作用是「即使连着也不走帧」——消费端早已 WS 优先/HTTP 兜底自协商，开关没有
+  // 独立价值，已移除（传输层行为固定，纯 HTTP 部署形态退役）。下方两项是
+  // 常驻端点的运维参数，不是开关。
   const wsPathRaw = String(env.GATEWAY_WS_PATH ?? '/v1/ws');
   if (!wsPathRaw.startsWith('/')) {
     throw new Error(`GATEWAY_WS_PATH must start with "/", got "${env.GATEWAY_WS_PATH}"`);
   }
   const ws = {
-    mode: wsModeRaw,
     path: wsPathRaw.replace(/\/+$/, '') || '/v1/ws',
     // 服务端心跳间隔：每周期发一次 ping；连续两个周期没有任何入站帧（含 pong）
     // 视为半开连接，ws-hub 会 terminate 掉（见 ws-hub.mjs armHeartbeat）。
@@ -251,10 +163,10 @@ export function loadConfig({ env = process.env, stateDir, adaptersFile, adapters
   }
 
   // ── P1 runtime 配置 ────────────────────────────────────────────────────────
-  // 灰度白名单：命中 `qq:group:123456` 这类 sessionKey 才走网关管线；未命中的
-  // 入站返回 routed:false，适配器继续走自己的旧路径。支持尾缀通配 `qq:group:*`。
-  const conversations = String(env.GATEWAY_CONVERSATIONS ?? '')
-    .split(',').map((s) => s.trim()).filter(Boolean);
+  // 会话白名单**不在网关**（2026-11-16 起）：号码级白名单是平台知识，由适配器
+  // 在自己那一侧裁决——不在白名单的消息根本到不了这里。网关只认「已登记适配器
+  // 的 HMAC 签名 + 重放窗口」，这是它的安全边界。
+  // 旧变量 GATEWAY_CONVERSATIONS 已无效果，main.mjs 会在启动时打一行提示。
 
   const dsh = {
     baseUrl: String(env.GATEWAY_DSH_BASE_URL ?? 'http://127.0.0.1:3080').replace(/\/+$/, ''),
@@ -266,9 +178,9 @@ export function loadConfig({ env = process.env, stateDir, adaptersFile, adapters
   };
 
   const chat = {
-    // fail-closed：preset 缺失或不在 DSH 可用清单时拒绝建会话（绝不回退 DSH 默认
-    // preset——那会把本地工具暴露给群聊，沿用 bridge 的教训）。
-    preset: String(env.GATEWAY_PRESET ?? 'qq-chat-v2'),
+    // 注意：这里**没有** preset 字段。preset 由适配器登记声明（registration.presets，
+    // 见 session-registry），缺失时回退 DSH 内置 minimal（无本地工具）。
+    // 曾经用 GATEWAY_PRESET 全局写死，多平台下必然把人设串平台，已移除。
     provider: String(env.GATEWAY_PROVIDER ?? 'deepseek-official'),
     model: String(env.GATEWAY_MODEL ?? 'deepseek-flash'),
     reasoningEffort: String(env.GATEWAY_REASONING_EFFORT ?? 'max'),
@@ -322,8 +234,8 @@ export function loadConfig({ env = process.env, stateDir, adaptersFile, adapters
   }
 
   // ── V2 P3 服务自主登记（docs/design/GATEWAY_V2_REFACTOR.md §3/§4 P3）───────
-  // 登记目录：每个服务一份登记文件（<id>.json），声明类型（decorator/filter/
-  // consumer）、transport、密钥引用与自有工具。注册=放入文件，卸载=移除文件；
+  // 登记目录：每个服务一份登记文件（<id>.json），声明类型（consumer/resource；
+  // 装饰/过滤职责由工具 role 声明）、transport、密钥引用与自有工具。注册=放入文件，卸载=移除文件；
   // 网关启动/热加载校验装载，注册/卸载事件落 append-only 台账（满足「保存注册
   // 内容 + 记录」，P4 UI 复用同一套校验/装载逻辑，UI 只是目录的前端）。
   // 目录不存在不算错误：没有登记服务 = 纯内置工具面（GATEWAY_TOOLS 的内置
@@ -342,6 +254,12 @@ export function loadConfig({ env = process.env, stateDir, adaptersFile, adapters
     throw new Error(`GATEWAY_SERVICES_RELOAD_MS must be an integer in [0, 600000], got "${env.GATEWAY_SERVICES_RELOAD_MS}"`);
   }
 
+  // 消费端收编校验已从启动期挪到切换点（2026-11-16 常驻装配改造）：mode 变成
+  // 纯请求期活读门禁，on + 零消费端启动合法（消息面武装但无人能入站，main.mjs
+  // 会打显式告警）。fail-closed 校验链（消费端非空 + 编排键有主 + 步骤名合法）
+  // 在 POST /v1/console/mode 切 on 时执行，错误当场 400 回给 UI——配置错误仍
+  // 第一时间可见，只是不再拦住整个网关启动。
+
   // ── P3 统一工具面 ──────────────────────────────────────────────────────────
   // off：不装 ToolHost / 工具 executor（MCP 薄壳的 tools/list 会拿到空清单）；
   // on：装配 tool-host + memory-tools/rolecard-tools executor，开放
@@ -352,9 +270,26 @@ export function loadConfig({ env = process.env, stateDir, adaptersFile, adapters
   if (!['off', 'on'].includes(toolsModeRaw)) {
     throw new Error(`GATEWAY_TOOLS must be off|on, got "${env.GATEWAY_TOOLS}"`);
   }
-  const busSecret = String(env.GATEWAY_MCP_TOKEN ?? '');
+  // 文件单源：<stateDir>/mcp-bus.secret（薄壳经 DSH 条目的 --token-file 读同一份）。
+  // env 通道（GATEWAY_MCP_BUS_TOKEN 及旧名）已整体退役：双源需要「保持一致」
+  // 这种人工对账，漂移只会在运行期 401 才暴露——读到即拒载，与 GATEWAY_CONTEXT
+  // 同范式；密钥文件由 `npm run env:init` 生成/维护。
+  const retiredBusTokenKeys = ['GATEWAY_MCP_BUS_TOKEN', 'GATEWAY_MCP_TOKEN', 'GATEWAY_MCP_BUS_TOKEN_FILE', 'GATEWAY_MCP_TOKEN_FILE']
+    .filter((key) => env[key] !== undefined && String(env[key]).trim() !== '');
+  if (retiredBusTokenKeys.length > 0) {
+    throw new Error([
+      `${retiredBusTokenKeys.join(' / ')} retired: the mcp-bus shared secret now lives ONLY in ${path.join(dir, 'mcp-bus.secret')}.`,
+      'Migration: delete these keys from .env (npm run env:init does it in place), then restart.',
+    ].join(' '));
+  }
+  const busSecretFile = path.join(dir, 'mcp-bus.secret');
+  const busSecret = fs.existsSync(busSecretFile)
+    ? fs.readFileSync(busSecretFile, 'utf8').trim()
+    : '';
   if (toolsModeRaw === 'on' && busSecret.length < 16) {
-    throw new Error('GATEWAY_TOOLS=on requires GATEWAY_MCP_TOKEN (a >=16 char random string shared with mcp-bus)');
+    throw new Error(
+      `GATEWAY_TOOLS=on requires ${busSecretFile} (a >=16 char random string shared with mcp-bus) — file missing or too short; run "npm run env:init".`,
+    );
   }
   // 清单驱动工具面（P2）：网关启动时从每个配了 callbackBase 的适配器拉取
   // GET /v1/actions/manifest，把清单翻译成 chat_<platform>_* 工具。
@@ -434,57 +369,88 @@ export function loadConfig({ env = process.env, stateDir, adaptersFile, adapters
     file: path.join(dir, 'session-state.json'),
   };
 
-  // ── §6 记忆落库调度器（P3：入站+出站双向自动沉淀）───────────────────────────
-  // off（默认）：不装配调度器（observe 点空转，行为与 P3 前一致）；
-  // on：入站消息与发送成功的出站文本按会话/时间窗聚合后，经网关出站通道逐条
-  // POST 记忆服务的 /api/memory/record（与 chat_memory_record 同一写入口径，
-  // 幂等/去重由服务端裁决）。token 三态复用 resolveSecret 口径（>=16 字符）：
-  //   GATEWAY_MEMORY_INGEST_TOKEN（内联）| GATEWAY_MEMORY_INGEST_TOKEN_FILE
-  //   （相对 stateDir）| GATEWAY_MEMORY_INGEST_TOKEN_ENV（环境变量名）。
-  const memoryIngestModeRaw = String(env.GATEWAY_MEMORY_INGEST ?? 'off').trim().toLowerCase();
-  if (!['off', 'on'].includes(memoryIngestModeRaw)) {
-    throw new Error(`GATEWAY_MEMORY_INGEST must be off|on, got "${env.GATEWAY_MEMORY_INGEST}"`);
+  // ── §6 会话缓冲与 save 调度（tool.call 统一改造：缓冲上移网关）──────────────
+  // off（默认）：不装配 session-save（观察点空转）；on：入站消息与发送成功的
+  // 出站文本按 sessionKey 缓冲（state/gateway/session-buffer/<key>.jsonl 逐条
+  // 持久化，崩溃恢复），空闲超时（GATEWAY_MEMORY_SAVE_IDLE_MS）/触顶分段
+  // （_MAX_MESSAGES / _MAX_CHARS）/进程关停时经 tool.call chat_memory_save
+  // 整段落地。落地时机完全由网关裁决，记忆侧不再有内部调度器。
+  //
+  // 目标服务仍由登记目录解析：GATEWAY_MEMORY_SERVICE 显式指定 id；缺省走
+  // selectMemoryService（登记声明 memoryService:true 的服务，多声明取字典序
+  // 首个 + 一次性告警；不再看 chat_memory_record 工具标记）。鉴权复用登记
+  // HMAC 密钥——同一份身份、同一套 transport（WS 优先 / HTTP 兜底）。
+  // 旧 GATEWAY_MEMORY_INGEST* 全家已退役：仍设置时只记告警（retired 数组，
+  // main.mjs 打印），不 fail-closed——致命会让存量 .env 升级即挂。
+  const memorySaveModeRaw = String(env.GATEWAY_MEMORY_SAVE ?? 'off').trim().toLowerCase();
+  if (!['off', 'on'].includes(memorySaveModeRaw)) {
+    throw new Error(`GATEWAY_MEMORY_SAVE must be off|on, got "${env.GATEWAY_MEMORY_SAVE}"`);
   }
-  const memoryIngest = {
-    mode: memoryIngestModeRaw,
-    // 记忆服务的 /api/* 通道（x-mcp-token 鉴权，非登记 HMAC 通道）。
-    url: String(env.GATEWAY_MEMORY_INGEST_URL ?? 'http://127.0.0.1:7181'),
-    token: memoryIngestModeRaw === 'on'
-      ? resolveSecret({
-        id: 'memory-ingest',
-        secret: env.GATEWAY_MEMORY_INGEST_TOKEN,
-        secretFile: env.GATEWAY_MEMORY_INGEST_TOKEN_FILE,
-        secretEnv: env.GATEWAY_MEMORY_INGEST_TOKEN_ENV,
-      }, env, dir, 'memory-ingest')
-      : '',
-    // 聚合时间窗（会话缓冲冲刷周期）与单会话批量阈值（攒满提前冲刷）。
-    windowMs: Number(env.GATEWAY_MEMORY_INGEST_WINDOW_MS ?? 30_000),
-    maxBatch: Number(env.GATEWAY_MEMORY_INGEST_BATCH ?? 50),
+  const retiredMemoryEnv = [
+    'GATEWAY_MEMORY_INGEST',
+    'GATEWAY_MEMORY_INGEST_WINDOW_MS',
+    'GATEWAY_MEMORY_INGEST_BATCH',
+    'GATEWAY_MEMORY_INGEST_URL',
+    'GATEWAY_MEMORY_INGEST_TOKEN',
+    'GATEWAY_MEMORY_INGEST_TOKEN_FILE',
+    'GATEWAY_MEMORY_INGEST_TOKEN_ENV',
+  ].filter((key) => env[key] !== undefined && String(env[key]).trim() !== '');
+  const memorySave = {
+    mode: memorySaveModeRaw,
+    // 显式指定登记服务 id（可空 = selectMemoryService 自动选路）。id 口径与登记文件一致。
+    serviceId: String(env.GATEWAY_MEMORY_SERVICE ?? '').trim() || null,
+    // 缓冲持久化目录（JSONL 逐条追加；崩溃恢复的事实源）。
+    bufferDir: path.join(dir, 'session-buffer'),
+    // 空闲超时（会话收尾 save）与触顶分段阈值。
+    idleMs: Number(env.GATEWAY_MEMORY_SAVE_IDLE_MS ?? 3_600_000),
+    maxMessages: Number(env.GATEWAY_MEMORY_SAVE_MAX_MESSAGES ?? 200),
+    maxChars: Number(env.GATEWAY_MEMORY_SAVE_MAX_CHARS ?? 20_000),
+    retired: retiredMemoryEnv,
   };
-  if (!Number.isSafeInteger(memoryIngest.windowMs) || memoryIngest.windowMs < 1000 || memoryIngest.windowMs > 600_000) {
-    throw new Error(`GATEWAY_MEMORY_INGEST_WINDOW_MS must be an integer in [1000, 600000], got "${env.GATEWAY_MEMORY_INGEST_WINDOW_MS}"`);
+  if (memorySave.serviceId !== null && !/^[a-z0-9][a-z0-9-]{0,63}$/.test(memorySave.serviceId)) {
+    throw new Error(`GATEWAY_MEMORY_SERVICE must match /^[a-z0-9][a-z0-9-]{0,63}$/, got "${env.GATEWAY_MEMORY_SERVICE}"`);
   }
-  if (!Number.isSafeInteger(memoryIngest.maxBatch) || memoryIngest.maxBatch < 1 || memoryIngest.maxBatch > 500) {
-    throw new Error(`GATEWAY_MEMORY_INGEST_BATCH must be an integer in [1, 500], got "${env.GATEWAY_MEMORY_INGEST_BATCH}"`);
+  if (!Number.isSafeInteger(memorySave.idleMs) || memorySave.idleMs < 1000 || memorySave.idleMs > 86_400_000) {
+    throw new Error(`GATEWAY_MEMORY_SAVE_IDLE_MS must be an integer in [1000, 86400000], got "${env.GATEWAY_MEMORY_SAVE_IDLE_MS}"`);
+  }
+  if (!Number.isSafeInteger(memorySave.maxMessages) || memorySave.maxMessages < 1 || memorySave.maxMessages > 5000) {
+    throw new Error(`GATEWAY_MEMORY_SAVE_MAX_MESSAGES must be an integer in [1, 5000], got "${env.GATEWAY_MEMORY_SAVE_MAX_MESSAGES}"`);
+  }
+  if (!Number.isSafeInteger(memorySave.maxChars) || memorySave.maxChars < 100 || memorySave.maxChars > 1_000_000) {
+    throw new Error(`GATEWAY_MEMORY_SAVE_MAX_CHARS must be an integer in [100, 1000000], got "${env.GATEWAY_MEMORY_SAVE_MAX_CHARS}"`);
   }
 
   // ── 控制台 / operator 认证（docs/console/auth/PLAN.md）─────────────────────
-  // on（默认）：挂 /v1/console/* 控制面路由。凭据三态（镜像 resolveSecret）：
-  //   GATEWAY_OPERATOR_TOKEN（内联）> state/operator-token（文件）> 自动生成并
-  //   持久化（与桥接 consoleToken 同语义）。**绝不无凭据开放控制面**：
-  //   自动生成写盘失败 = 启动失败（fail-closed）。
+  // on（默认）：挂 /v1/console/* 控制面路由。凭据文件单源（与 mcp-bus.secret
+  // 同口径）：<stateDir>/operator-token 文件 > 缺失时自动生成并持久化（与桥接
+  // consoleToken 同语义）。**绝不无凭据开放控制面**：自动生成写盘失败 = 启动
+  // 失败（fail-closed）。env 通道 GATEWAY_OPERATOR_TOKEN 已退役：读到即拒载。
+  //
+  // 命名说明（为什么叫 operator 而不是 console）：这里的 operator 指「控制台
+  // 操作员」这一人身份——x-operator-token 请求头直传与 console_session Cookie
+  // 签名**共用同一个值**。它与数据面的适配器 HMAC、工具面的 mcp-bus.secret
+  // 是三套互不复用的身份。历史命名保留：全量改为 console-auth* 会牵动控制台
+  // 前端、脚本与文档约 250 处引用，收益不足以覆盖回归成本（如需改名请单独立项）。
   const consoleModeRaw = String(env.GATEWAY_CONSOLE ?? 'on').trim().toLowerCase();
   if (!['off', 'on'].includes(consoleModeRaw)) {
     throw new Error(`GATEWAY_CONSOLE must be off|on, got "${env.GATEWAY_CONSOLE}"`);
   }
+  const retiredOperatorKeys = ['GATEWAY_OPERATOR_TOKEN']
+    .filter((key) => env[key] !== undefined && String(env[key]).trim() !== '');
+  if (retiredOperatorKeys.length > 0) {
+    throw new Error([
+      `${retiredOperatorKeys.join(' / ')} retired: the console credential now lives ONLY in ${path.join(dir, 'operator-token')}.`,
+      'Migration: delete these keys from .env (npm run env:init does it in place and generates the file if missing), then restart.',
+    ].join(' '));
+  }
   const operatorTokenFile = path.join(dir, 'operator-token');
-  let operatorToken = typeof env.GATEWAY_OPERATOR_TOKEN === 'string' ? env.GATEWAY_OPERATOR_TOKEN.trim() : '';
+  let operatorToken = '';
   let operatorTokenGenerated = false;
-  if (!operatorToken && fs.existsSync(operatorTokenFile)) {
+  if (fs.existsSync(operatorTokenFile)) {
     operatorToken = fs.readFileSync(operatorTokenFile, 'utf8').trim();
   }
   if (operatorToken && !OPERATOR_TOKEN_PATTERN.test(operatorToken)) {
-    throw new Error(`operator token (env or ${operatorTokenFile}) must match ${OPERATOR_TOKEN_PATTERN.source}`);
+    throw new Error(`operator token file ${operatorTokenFile} must match ${OPERATOR_TOKEN_PATTERN.source}`);
   }
   if (consoleModeRaw === 'on' && !operatorToken) {
     operatorToken = randomBytes(24).toString('base64url');
@@ -524,7 +490,6 @@ export function loadConfig({ env = process.env, stateDir, adaptersFile, adapters
     host,
     port,
     stateDir: dir,
-    adaptersFile: file,
     maxBodyBytes: MAX_BODY_BYTES,
     replayWindowMs: intInRange('GATEWAY_REPLAY_WINDOW_MS', env.GATEWAY_REPLAY_WINDOW_MS, {
       min: 1000, max: 3_600_000, fallback: 5 * 60 * 1000,
@@ -533,12 +498,10 @@ export function loadConfig({ env = process.env, stateDir, adaptersFile, adapters
     idempotencyFile: path.join(dir, 'idempotency.json'),
     spoolFile: path.join(dir, 'raw-spool.jsonl'),
     sessionsFile: path.join(dir, 'sessions.json'),
-    adapters: resolved,
-    conversations,
     dsh,
     chat,
     pipeline,
-    memoryIngest,
+    memorySave,
     registrations,
     tools,
     webSearch,
@@ -550,32 +513,20 @@ export function loadConfig({ env = process.env, stateDir, adaptersFile, adapters
   };
 }
 
-/** 灰度白名单匹配：精确键或 `前缀*`。 */
-export function isConversationAllowed(config, sessionKey) {
-  if (config.conversations.length === 0) return false;
-  return config.conversations.some((pattern) =>
-    pattern === '*' || pattern === sessionKey
-    || (pattern.endsWith('*') && sessionKey.startsWith(pattern.slice(0, -1))));
-}
+// 会话白名单判定（isConversationAllowed / matchConversationPattern）已删除：
+// 号码白名单由各自的平台适配器负责（allow/deny），网关不再持有平台身份知识。
 
-/** 只读回环探测用：不需要适配器配置的最小视图。 */
+/**
+ * 只读回环探测用：不需要服务登记的最小视图。
+ * 消费端清单不在这里：它来自登记目录（service-registry.consumers()），随热注册
+ * 变化——静态快照会骗人。
+ */
 export function configSummary(config) {
   return {
     mode: config.mode,
     host: config.host,
     port: config.port,
-    adapters: config.adapters.map(({ id, kind, transport, platform, capabilities, callbackBase }) => ({
-      id,
-      kind: kind ?? 'platform',
-      transport: transport ?? 'auto',
-      platform,
-      // 运维要能一眼看出「这个平台声明了什么、动作会回投到哪」，
-      // 否则「模型说了没发生」只能靠翻日志定位。
-      capabilities: capabilities ?? 'all',
-      actionsEndpoint: callbackBase ? `${callbackBase}/v1/actions` : null,
-    })),
-    ws: config.ws
-      ? { mode: config.ws.mode, path: config.ws.path }
-      : { mode: 'off' }, // 兼容手工构造的测试 config（没有 ws 块）
+    // WS 通道常驻（2026-11-18 起）：只汇报端点运维参数，不再有 mode 开关语义。
+    ws: { path: config.ws?.path ?? '/v1/ws' },
   };
 }

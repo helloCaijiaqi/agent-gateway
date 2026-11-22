@@ -13,8 +13,11 @@ import os from 'node:os';
 import path from 'node:path';
 import { randomBytes } from 'node:crypto';
 
-const { loadConfig, configSummary } = await import(new URL('../src/core/config.mjs', import.meta.url).href);
+const { loadConfig } = await import(new URL('../src/core/config.mjs', import.meta.url).href);
 const { createGatewayServer } = await import(new URL('../src/core/server.mjs', import.meta.url).href);
+const { seedConsumer, createConsumerRegistry } = await import(
+  new URL('./support/consumer-registration.mjs', import.meta.url).href
+);
 const { signRequest } = await import(new URL('../src/core/auth.mjs', import.meta.url).href);
 
 const QQ_SECRET = 'rollback-qq-secret-0123456789';
@@ -42,16 +45,27 @@ function createRuntimeStub() {
   };
 }
 
-async function startGateway({ mode, conversations = '', adapters = [], runtime = null }) {
+async function startGateway({ mode, consumers = [], runtime = null }) {
+  const stateDir = tmpStateDir();
+  // 消费端身份只认登记目录（mode=on 需至少一份 kind=consumer 登记）。
+  for (const consumer of consumers) {
+    seedConsumer(stateDir, {
+      id: consumer.id,
+      platform: consumer.platform,
+      secret: consumer.secret,
+      url: consumer.callbackBase ?? null,
+      enabled: consumer.enabled !== false,
+    });
+  }
   const config = loadConfig({
-    env: { GATEWAY_MODE: mode, GATEWAY_PORT: '0', GATEWAY_CONVERSATIONS: conversations },
-    stateDir: tmpStateDir(),
-    adapters,
+    env: { GATEWAY_MODE: mode, GATEWAY_PORT: '0' },
+    stateDir,
   });
-  const gateway = createGatewayServer({ config, logger: () => {}, runtime });
+  const registry = createConsumerRegistry({ stateDir });
+  const gateway = createGatewayServer({ config, logger: () => {}, runtime, services: registry });
   await gateway.listen();
   const { port } = gateway.server.address();
-  return { gateway, config, base: `http://127.0.0.1:${port}` };
+  return { gateway, config, registry, base: `http://127.0.0.1:${port}` };
 }
 
 async function closeGateway(gateway) {
@@ -133,8 +147,7 @@ function record(name, expected, observed, pass) {
   const runtime = createRuntimeStub();
   const started = await startGateway({
     mode: 'on',
-    conversations: 'qq:group:1',
-    adapters: [{ id: 'qq-main', platform: 'qq', secret: QQ_SECRET }],
+    consumers: [{ id: 'qq-main', platform: 'qq', secret: QQ_SECRET }],
     runtime,
   });
   try {
@@ -169,20 +182,19 @@ function record(name, expected, observed, pass) {
 {
   const started = await startGateway({
     mode: 'on',
-    conversations: 'qq:group:1',
-    adapters: [
+    consumers: [
       { id: 'qq-main', platform: 'qq', secret: QQ_SECRET },
       { id: 'wx-main', platform: 'wx', secret: WX_SECRET, enabled: false },
     ],
     runtime: createRuntimeStub(),
   });
   try {
-    const summary = configSummary(started.config);
+    const visible = started.registry.consumers();
     record(
-      'wx-main enabled:false：健康检查只剩 qq',
-      'adapters=[qq]',
-      `adapters=[${summary.adapters.map((item) => item.platform).join(',')}]`,
-      summary.adapters.length === 1 && summary.adapters[0].platform === 'qq',
+      'wx-main 登记 enabled:false：消费端视图只剩 qq',
+      'consumers=[qq]',
+      `consumers=[${visible.map((item) => item.platform).join(',')}]`,
+      visible.length === 1 && visible[0].platform === 'qq',
     );
     const wx = await postInbound(started.base, {
       secret: WX_SECRET,
@@ -204,8 +216,7 @@ function record(name, expected, observed, pass) {
 {
   const started = await startGateway({
     mode: 'on',
-    conversations: 'qq:group:1',
-    adapters: [{ id: 'qq-main', platform: 'qq', secret: QQ_SECRET }],
+    consumers: [{ id: 'qq-main', platform: 'qq', secret: QQ_SECRET }],
     runtime: createRuntimeStub(),
   });
   try {
@@ -236,7 +247,6 @@ function record(name, expected, observed, pass) {
       loadConfig({
         env: { GATEWAY_MODE: 'on', GATEWAY_PORT: '0', GATEWAY_CONTEXT: 'off' },
         stateDir: tmpStateDir(),
-        adapters: [{ id: 'qq-main', platform: 'qq', secret: QQ_SECRET }],
       });
     } catch (error) {
       retiredRejected = /retired/.test(String(error?.message));

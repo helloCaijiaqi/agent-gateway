@@ -8,6 +8,7 @@ import path from 'node:path';
 
 import { loadConfig } from '../src/core/config.mjs';
 import { createServiceRegistry } from '../src/core/service-registry.mjs';
+import { seedConsumer } from './support/consumer-registration.mjs';
 
 function tmpDir() {
   return fs.mkdtempSync(path.join(os.tmpdir(), 'gw-pl-mig-'));
@@ -17,11 +18,17 @@ const REG = (dir) => ({ dir: path.join(dir, 'services'), ledgerFile: path.join(d
 
 function makeRegistry(file, overrides = {}) {
   const dir = path.dirname(file);
+  const stateDir = overrides.stateDir ?? dir;
+  // 编排权限只认登记消费端：往 services/ 落一份 kind=consumer 登记。
+  seedConsumer(stateDir, {
+    id: overrides.consumerId ?? 'qq-main',
+    platform: 'qq',
+    secret: 'pipelines-migration-secret-0123',
+    inlineSecret: true,
+  });
   return createServiceRegistry({
     pipelinesFile: file,
-    stateDir: overrides.stateDir ?? dir,
-    reservedIds: overrides.reservedIds ?? [],
-    consumerIds: overrides.consumerIds ?? [],
+    stateDir,
     registrations: overrides.registrations ?? REG(dir),
     logger: () => {},
   });
@@ -29,11 +36,11 @@ function makeRegistry(file, overrides = {}) {
 
 test('config: pipelines.json 是默认编排文件；GATEWAY_PIPELINES_FILE 可改路径', () => {
   const dir = tmpDir();
-  const config = loadConfig({ env: { GATEWAY_PORT: '0' }, stateDir: dir, adapters: [] });
+  const config = loadConfig({ env: { GATEWAY_PORT: '0' }, stateDir: dir });
   assert.ok(config.pipeline.file.endsWith('pipelines.json'), `默认编排文件应为 pipelines.json，实际 ${config.pipeline.file}`);
   const custom = loadConfig({
     env: { GATEWAY_PORT: '0', GATEWAY_PIPELINES_FILE: path.join(dir, 'custom.json') },
-    stateDir: dir, adapters: [],
+    stateDir: dir,
   });
   assert.equal(custom.pipeline.file, path.join(dir, 'custom.json'));
 });
@@ -41,7 +48,7 @@ test('config: pipelines.json 是默认编排文件；GATEWAY_PIPELINES_FILE 可�
 test('config: GATEWAY_SERVICES_FILE 设置即报错，且文案给出迁移三步', () => {
   const dir = tmpDir();
   assert.throws(
-    () => loadConfig({ env: { GATEWAY_PORT: '0', GATEWAY_SERVICES_FILE: path.join(dir, 'services.json') }, stateDir: dir, adapters: [] }),
+    () => loadConfig({ env: { GATEWAY_PORT: '0', GATEWAY_SERVICES_FILE: path.join(dir, 'services.json') }, stateDir: dir }),
     (error) => /GATEWAY_SERVICES_FILE is retired/.test(error.message)
       && /registration dir/.test(error.message)
       && /delete the old services\.json/.test(error.message),
@@ -50,7 +57,7 @@ test('config: GATEWAY_SERVICES_FILE 设置即报错，且文案给出迁移三�
 
 test('pipelines.json 缺失 = 无编排，透传不报错（可之后再补文件热加载）', () => {
   const dir = tmpDir();
-  const registry = makeRegistry(path.join(dir, 'pipelines.json'), { consumerIds: ['qq-main'] });
+  const registry = makeRegistry(path.join(dir, 'pipelines.json'), { consumerId: 'qq-main' });
   assert.deepEqual(registry.pipelineFor('qq-main'), []);
   assert.deepEqual(registry.pipelineForReturn('qq-main'), []);
   assert.equal(registry.pipelineKeys().length, 0);
@@ -84,7 +91,7 @@ test('pipelines.json 残留 services 键：启动、热加载、写路径三处 
   const dir3 = tmpDir();
   const file4 = path.join(dir3, 'pipelines.json');
   fs.writeFileSync(file4, JSON.stringify({ pipelines: {} }));
-  const registry4 = makeRegistry(file4, { consumerIds: ['qq-main'] });
+  const registry4 = makeRegistry(file4, { consumerId: 'qq-main' });
   fs.writeFileSync(file4, JSON.stringify(legacy));
   assert.throws(() => registry4.updateConsumerPipeline('qq-main', ['dec'], null), /still contains a "services" key/);
 });
@@ -92,7 +99,7 @@ test('pipelines.json 残留 services 键：启动、热加载、写路径三处 
 test('updateConsumerPipeline：只写 pipelines/returnPipelines 两块，不补 services 字段', () => {
   const dir = tmpDir();
   const file = path.join(dir, 'pipelines.json');
-  const registry = makeRegistry(file, { consumerIds: ['qq-main'] });
+  const registry = makeRegistry(file, { consumerId: 'qq-main' });
   registry.updateConsumerPipeline('qq-main', ['dec'], ['echo']);
   const doc = JSON.parse(fs.readFileSync(file, 'utf8'));
   assert.equal(doc.services, undefined, '硬切后文件里不应再有 services 键');
@@ -102,7 +109,7 @@ test('updateConsumerPipeline：只写 pipelines/returnPipelines 两块，不补 
   // 文件不存在时直接保存：底稿是空对象（旧实现会补 "services": []）。
   const dir2 = tmpDir();
   const file2 = path.join(dir2, 'pipelines.json');
-  const registry2 = makeRegistry(file2, { consumerIds: ['qq-main'] });
+  const registry2 = makeRegistry(file2, { consumerId: 'qq-main' });
   registry2.updateConsumerPipeline('qq-main', ['dec'], null);
   const doc2 = JSON.parse(fs.readFileSync(file2, 'utf8'));
   assert.equal(doc2.services, undefined);

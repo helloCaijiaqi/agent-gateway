@@ -22,11 +22,20 @@ const QUESTION_MAX_CHARS = 500;
 const REASON_MAX_CHARS = 300;
 const TOOLNAME_MAX_CHARS = 100;
 
-/** sessionKey 前缀即平台（`qq:group:123` → `qq`）；坏格式返回 null，绝不猜。 */
+/** sessionKey 首段即平台（`qq:svc-x:group:123` → `qq`）；坏格式返回 null，绝不猜。 */
 function platformOf(sessionKey) {
   const raw = String(sessionKey ?? '');
   const idx = raw.indexOf(':');
   return idx > 0 ? raw.slice(0, idx) : null;
+}
+
+/**
+ * 消费端定位（多消费端收编）：4 段会话键第 2 段 = consumerId（会话绑消费端），
+ * 优先按它精确匹配；3 段旧键 / 未命中时回退平台匹配（存量行为）。
+ */
+function consumerOf(sessionKey) {
+  const parts = String(sessionKey ?? '').split(':');
+  return parts.length === 4 && parts[1] ? parts[1] : null;
 }
 
 /** 按条目种类翻译成动作名与 payload（字段名与 qq-bridge 清单对齐）。 */
@@ -133,11 +142,12 @@ export function createPendingForwarder({
         return;
       }
       const platform = platformOf(sessionKey);
-      const adapter = platform
-        ? adapters.find((item) => item.platform === platform && item.callbackBase)
-        : null;
+      const consumerId = consumerOf(sessionKey);
+      // 先按会话绑定的消费端精确路由（4 段键），回退平台匹配（3 段旧键）。
+      const adapter = adapters.find((item) => consumerId && item.id === consumerId && item.callbackBase)
+        ?? (platform ? adapters.find((item) => item.platform === platform && item.callbackBase) : null);
       if (!adapter) {
-        logger(`pending forward skipped ${entry.eventId}: 无 callbackBase 的 ${platform ?? '未知'} 适配器`);
+        logger(`pending forward skipped ${entry.eventId}: 无 callbackBase 的 ${consumerId ?? platform ?? '未知'} 消费端`);
         return;
       }
       const translated = toAction(entry);

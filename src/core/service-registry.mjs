@@ -1,23 +1,25 @@
 /**
  * V2 P2 管线服务登记（core）：服务身份来自登记目录，向 ws-hub 提供客户端
- * 身份合并表，向管线引擎提供步骤解析与统一的 service.call 出站调用。
+ * 身份合并表，向管线引擎提供步骤解析与统一的 tool.call 出站调用。
  *
  * 设计边界（docs/design/GATEWAY_V2_REFACTOR.md §3）：
- *  - 服务与消费者**同构**：id + HMAC secret（与 adapters.json 同一口径，密钥
+ *  - 服务与消费者**同构**：id + HMAC secret（与登记契约同一口径，密钥
  *    解析直接复用 config 的 resolveSecret）+ transport（ws/http/auto）。网关
- *    不关心服务内部是什么——它只回答「这条消息过不过、要不要加内容」。
+ *    不关心服务内部是什么——管线步骤一律走 tool.call（decorator 注入 / filter 改写）。
  *  - pipelines.json 承载 per-consumer 管线编排（pipelines/returnPipelines）：键为消费者 id
- *    或 "default"，值为步骤名数组。步骤名先在服务表里找（外部服务），找不到
- *    再由管线引擎按内置步骤表解析——本层不认识内置步骤名（core 无平台/服务名，
- *    内置步骤由 main.mjs 注入）。
+ *    或 "default"，值为步骤名数组。步骤解析两级（tool.call 统一改造后）：
+ *    builtin protocol（main.mjs 注入，本层不认识内置名）→ decorator/filter
+ *    角色的登记工具名（resolveToolStep）。**服务 id 直接当步骤不再合法**——
+ *    管线引擎对其报错并给迁移文案。
  *  - 文件不存在 = 没有外部服务、没有编排 = 空登记（管线只剩内置步骤，不算错）。
- *    文件存在但非法 = 启动失败（fail-closed，与 adapters.json 同口径）。
+ *    文件存在但非法 = 启动失败（fail-closed，与 pipelines.json 同口径）。
  *  - 回环-only 外壳不变：http transport 的 url 必须指向回环地址——「回环」不是
  *    信任凭据（签名才是），但它是不变量 §5.4 的一部分，出站同样遵守。
  *
  * V2 P3 服务自主登记（docs/design/GATEWAY_V2_REFACTOR.md §3/§4 P3）：
  *  - 登记目录（config.registrations.dir）：每个服务一份 `<id>.json` 登记文件，
- *    声明类型（decorator/filter/consumer）、transport、密钥引用与自有工具。
+ *    声明类型（consumer/resource；装饰/过滤职责由工具 role 声明）、transport、
+ *    密钥引用与自有工具。
  *    id 是随机 hash（contracts.newRegistrationId 生成，32 位十六进制）——对象
  *    唯一性由 hash 确认（数据库主键风格），`name` 只是展示名；文件名即身份。
  *    注册 = 放入文件，卸载 = 移除文件——文件系统就是登记 API 的磁盘形态，
@@ -45,7 +47,7 @@ import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { resolveSecret } from './config.mjs';
 import { signRequest } from './auth.mjs';
-import { ContractError, parseServiceCallResult, parseServiceRegistration, parseToolResult } from './contracts.mjs';
+import { CONSUMER_ID_RE, ContractError, parseDecoratorResult, parseFilterResult, parseServiceRegistration, parseToolResult, presetsDeclarationSchema, serviceToolDeclarationSchema } from './contracts.mjs';
 import { createRegistrationLedger, redactRegistration } from './registration-ledger.mjs';
 import { createHttpClient } from '../shared/http-client.mjs';
 
@@ -54,16 +56,17 @@ const STEP_NAME_PATTERN = /^[a-z0-9][a-z0-9._-]{0,63}$/i;
 const MAX_STEPS_PER_PIPELINE = 16;
 
 // ── P4.x 编排步骤条目：字符串或对象双形态 ─────────────────────────────────────
-// 字符串 = 纯步骤名（三级解析，P2 语义，完全向后兼容）。
+// 字符串 = 纯步骤名（两级解析：builtin protocol → decorator/filter 工具名；
+// 服务 id 直接当步骤非法——管线引擎报迁移错）。
 // 对象 = 带注入规则的步骤条目（字段全集，多字段即拒——strict 形状）：
 //   { step, once?, join?('prefix'|'suffix'|'regex'|'function'),
 //     text?, pattern?, replacement?, flags?, fn? }
 //  - text：本地静态供料步骤——内容直接落编排配置、零服务调用（step 名仅为
 //    标识，不做三级解析）；配置 join 缺省按 'suffix'（与 sections 语义同向）。
-//  - join：外部装饰器步骤配置了 join 时，其产出（message ?? sections 文本）
-//    视为 extra，由管线引擎接管拼接；缺省 = 现行为（message 改写 / sections 追加）。
+//  - join：外部装饰器步骤配置了 join 时，其产出（sections 文本，decorator 已
+//    无 message 改写职责）视为 extra，由管线引擎接管拼接；缺省 = sections 追加。
 //  - once：仅会话首轮执行（首轮判定归网关——isFirstTurnOfSession ctx）。
-//    非首轮整个步骤跳过（供料型不调服务；filter/shadow 同口径）。
+//    非首轮整个步骤跳过（供料型不调服务；filter 同口径）。
 //  - regex 规则：pattern 匹配当前消息，replacement 可含 {extra} 占位符；
 //    flags 缺省 'g'。编译失败保存即拒（fail-closed，与启动同口径）。
 //  - function 规则：fn 为函数体字符串，签名 (message, extra) => string，
@@ -186,14 +189,97 @@ export function assertLoopbackUrl(raw, id) {
   return parsed.toString().replace(/\/+$/, '');
 }
 
+// selectMemoryService 的「多声明取首个」一次性告警去重（按候选 id 集合）。
+const memoryServiceAmbiguityWarned = new Set();
+// 布尔旧形态 memoryService:true 的一次性迁移告警去重（按服务 id）。
+const memoryServiceLegacyFormWarned = new Set();
+// 消费端非 hash id（qq-main 之类可读 id）的迁移告警去重（按服务 id）。
+const legacyIdWarned = new Set();
+
+/**
+ * 管线步骤结果的改写器解析（tool.call 统一改造）：toolResult.ok 时的 data 按
+ * 工具 role 用契约 schema 收口——decorator → { sections?, epoch? }（纯注入），
+ * filter → { text, reason? }（改写器；text 空串 = 丢弃消息）。tool 角色 result
+ * 不透明，不经此函数。非法结果抛 ContractError（管线捕获后记 degraded 放行）。
+ *
+ * @param {'decorator'|'filter'} role 被编排工具的单值角色
+ * @param {unknown} data toolResult.data
+ */
+export function parsePipelineStepResult(role, data) {
+  return role === 'filter' ? parseFilterResult(data) : parseDecoratorResult(data);
+}
+
+/**
+ * 记忆服务选路（session-save 缓冲的 save 目标）。
+ *
+ * 三级优先：
+ *   1. 显式 `GATEWAY_MEMORY_SERVICE`（必须已登记且未禁用，否则报错）；
+ *   2. 唯一声明 `memoryService` 的登记服务；
+ *   3. 多个声明 = 配置歧义：按 id 字典序取首个 + 一次性告警（onAmbiguous
+ *      缺省 'first-warn'；'error' 则改为抛错——宁可报错也不猜）。
+ *
+ * saveTool 解耦（登记能力对象）：声明形态 `memoryService: { saveTool }` 为
+ * 权威——网关按声明的工具名动态调用；旧布尔形态 `true` 兼容读取，saveTool
+ * 取 `defaultSaveTool`（组合根注入的存量缺省）并一次性告警提示迁移。
+ *
+ * @param {Array<{id: string, enabled?: boolean, memoryService?: boolean|{saveTool: string}}> } services
+ *        registry.services() 形状
+ * @param {{explicit?: string|null, defaultSaveTool?: string|null,
+ *          onAmbiguous?: 'first-warn'|'error', warn?: Function}} [options]
+ * @returns {{id: string, saveTool: string|null}|null} 选路结果；null = 没有候选
+ *          （服务未上线，调用方可重试）。saveTool null = 布尔旧形态且未提供缺省。
+ */
+export function selectMemoryService(services, { explicit = null, defaultSaveTool = null, onAmbiguous = 'first-warn', warn = () => {} } = {}) {
+  const visible = (services ?? []).filter((service) => service.enabled !== false);
+  const declared = visible.filter((service) => Boolean(service.memoryService));
+  const pick = (service) => {
+    const declaration = service.memoryService;
+    if (declaration && typeof declaration === 'object') return declaration.saveTool ?? null;
+    // 布尔旧形态：saveTool 交给组合根的存量缺省，一次性告警提示迁移。
+    if (!memoryServiceLegacyFormWarned.has(service.id)) {
+      memoryServiceLegacyFormWarned.add(service.id);
+      warn(`服务 ${service.id} 的 memoryService 仍是旧布尔形态——请迁移为对象形态 `
+        + `{"saveTool": "<chat_* 工具名>"}（旧形态按网关内置缺省工具处理，即将退役）`);
+    }
+    return defaultSaveTool;
+  };
+  if (explicit) {
+    const service = visible.find((entry) => entry.id === explicit);
+    if (!service) {
+      const known = visible.map((entry) => entry.id).join(', ') || '无';
+      throw new Error(`GATEWAY_MEMORY_SERVICE=${explicit} 未登记或已禁用（可用登记：${known}）`);
+    }
+    return { id: explicit, saveTool: pick(service) };
+  }
+  const candidates = [...declared].sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
+  if (candidates.length <= 1) {
+    const picked = candidates[0];
+    return picked ? { id: picked.id, saveTool: pick(picked) } : null;
+  }
+  const ids = candidates.map((service) => service.id);
+  if (onAmbiguous === 'error') {
+    throw new Error(
+      `多个登记服务声明了 memoryService（${ids.join(', ')}）：请用 GATEWAY_MEMORY_SERVICE 指定其一`,
+    );
+  }
+  // first-warn：字典序首个 + 一次性告警（同一候选集合只告警一次）。
+  const dedupeKey = ids.join('\u0000');
+  if (!memoryServiceAmbiguityWarned.has(dedupeKey)) {
+    memoryServiceAmbiguityWarned.add(dedupeKey);
+    warn(
+      `多个登记服务声明了 memoryService（${ids.join(', ')}）：按 id 字典序取 ${ids[0]}；`
+      + '请用 GATEWAY_MEMORY_SERVICE 显式指定其一',
+    );
+  }
+  const winner = candidates[0];
+  return { id: winner.id, saveTool: pick(winner) };
+}
+
 /**
  * @param {object} options
  * @param {string}   options.pipelinesFile    pipelines.json 路径（config.pipeline.file 提供）
  * @param {NodeJS.ProcessEnv} [options.env]
  * @param {string}   [options.stateDir]       相对 secretFile 的基准目录
- * @param {string[]} [options.reservedIds]    已被消费者占用的 id（服务不得冲突）
- * @param {string[]} [options.consumerIds]    既有消费端 id（adapters.json，过渡期身份来源；
- *                                            P3 起消费端也可经登记目录注册 kind=consumer）
  * @param {number}   [options.defaultTimeoutMs] 步骤缺省超时（config.pipeline.stepTimeoutMs）
  * @param {{dir: string, ledgerFile: string, reloadMs: number}|null} [options.registrations]
  *        登记目录配置（config.registrations）；null = 不启用自主登记（无外部服务）
@@ -204,8 +290,6 @@ export function createServiceRegistry({
   pipelinesFile,
   env = process.env,
   stateDir,
-  reservedIds = [],
-  consumerIds = [],
   defaultTimeoutMs = 8000,
   registrations: registrationsConfig = null,
   logger = () => {},
@@ -217,15 +301,48 @@ export function createServiceRegistry({
   const warnedNonConsumers = new Set();
 
   /**
-   * 消费端身份集（编排权限的判定源，P3）：既有 adapters（过渡期）∪ 已登记且
-   * 启用的 consumer。编排是消费端才有的能力——注册为消费端后即拥有编排权限，
-   * 登记卸载/停用即刻撤销（下次 pipelineFor 生效，无需重启）。
+   * 消费端统一活视图（登记目录 = 唯一事实源）：
+   *   - 登记目录 kind=consumer 且启用的条目（登记条目的 url 即 callbackBase、
+   *     platform 为声明平台）。
+   * 条目形状与 transport.deliverAction 的 adapter 参数同构
+   * （{id, platform, callbackBase, secret, transport, timeoutMs}），
+   * server.authenticate（HTTP 入站验签）、adapter-tools 清单拉取、动作下行、
+   * 编排门禁全部消费这一份视图——消费端断点一次收编。
+   */
+  function consumers() {
+    const out = new Map();
+    for (const entry of registeredById.values()) {
+      if (entry.kind !== 'consumer' || entry.enabled === false) continue;
+      out.set(entry.id, {
+        id: entry.id,
+        platform: entry.platform,
+        callbackBase: entry.url,
+        secret: entry.secret,
+        transport: entry.transport,
+        timeoutMs: entry.timeoutMs,
+        source: 'registry',
+      });
+    }
+    return [...out.values()];
+  }
+
+  /** 单个消费端查视图（authenticate / deliverAction 的 O(1) 入口；未命中 null）。 */
+  function consumerById(id) {
+    return consumers().find((consumer) => consumer.id === id) ?? null;
+  }
+
+  // 多消费端收编：不再限制「一个平台一个消费端」——qq 多账号 = 多份 kind=consumer
+  // 登记文件（各自 svc-<hash> id 与密钥），动作按会话键第 2 段（consumerId）路由，
+  // 见 pending-forwarder 与 adapter-tools executor 的 byConsumer。
+
+  /**
+   * 消费端身份集（编排权限的判定源，P3）：只由登记消费端派生。编排是消费端
+   * 才有的能力——注册为消费端后即拥有编排权限，登记卸载/停用即刻撤销
+   * （下次 pipelineFor 生效，无需重启）。
    */
   function consumerIdSet() {
-    const ids = new Set(consumerIds);
-    for (const entry of registeredById.values()) {
-      if (entry.kind === 'consumer' && entry.enabled !== false) ids.add(entry.id);
-    }
+    const ids = new Set();
+    for (const consumer of consumers()) ids.add(consumer.id);
     return ids;
   }
 
@@ -332,13 +449,18 @@ export function createServiceRegistry({
     if (!SERVICE_ID_PATTERN.test(reg.id)) {
       throw new Error(`id must match ${SERVICE_ID_PATTERN.source}`);
     }
-    if (reservedIds.includes(reg.id)) {
-      throw new Error(`id conflicts with an existing consumer: ${reg.id}`);
-    }
     if (registeredById.has(reg.id) && registeredById.get(reg.id).file !== filePath) {
       throw new Error(`id "${reg.id}" already registered from ${path.basename(registeredById.get(reg.id).file)}`);
     }
-    // http/auto 的 url 是服务基址（origin）：回环校验与 adapters 同口径。
+    // 消费端 id 词法（hash 化，多消费端收编）：id 只标识服务实例、与平台解耦。
+    // 非 svc-<hash> 的存量可读 id（qq-main 之类）兼容读取但告警迁移——新登记
+    // 由控制台/gen-secret 直接生成 svc- id，不再发可读形态。
+    if (reg.kind === 'consumer' && !CONSUMER_ID_RE.test(reg.id) && !legacyIdWarned.has(reg.id)) {
+      legacyIdWarned.add(reg.id);
+      logger(`警告：消费端 "${reg.id}" 的 id 不是 svc-<hash> 形态（id 应与平台名解耦，同平台多账号互不冲突）`
+        + `——请迁为 state/gateway/services/svc-<hash>.json 并同步编排键与桥接 gateway.json 的 id`);
+    }
+    // http/auto 的 url 是服务基址（origin）：回环校验与登记契约同口径。
     const url = typeof reg.url === 'string' && reg.url
       ? assertLoopbackUrl(reg.url, reg.id) : null;
     const timeoutMs = reg.timeoutMs ?? defaultTimeoutMs;
@@ -354,9 +476,17 @@ export function createServiceRegistry({
         transport: reg.transport,
         url,
         timeoutMs,
+        // consumer 平台声明（动作会话定位 + 入站验签 expectedPlatform）；
+        // 非 consumer 恒 null。平台唯一性在 assertConsumerPlatforms 校验。
+        platform: reg.kind === 'consumer' ? (reg.platform ?? null) : null,
         secret: resolveSecret(reg, env, stateDir, 'registered service'),
         enabled: reg.enabled,
+        // memoryService 声明原样保存（boolean|{saveTool}）——saveTool 解析在
+        // selectMemoryService（布尔旧形态的缺省工具由组合根注入，core 无字面量）。
+        memoryService: reg.memoryService ?? null,
         tools: reg.tools ?? [],
+        // 平台→预设声明原样保存：建会话时的 preset 唯一来源（见 session-registry）。
+        presets: reg.presets ?? null,
         file: filePath,
         reg,
       },
@@ -542,13 +672,6 @@ export function createServiceRegistry({
     return httpClients.get(service.id);
   }
 
-  function assertOpenWs(service) {
-    if (!wsHub) throw new ContractError('E_DISABLED', 'ws hub not attached (GATEWAY_WS=off?)');
-    if (!wsHub.isConnected(service.id)) {
-      throw new ContractError('E_DISABLED', `no open ws connection for service "${service.id}"`);
-    }
-  }
-
   // ── 登记启动装载（在 httpClients 之后：scan 会 invalidate 其缓存）───────────
   if (registrationsConfig) {
     scanRegistrations('startup');
@@ -558,6 +681,7 @@ export function createServiceRegistry({
       pollTimer = timer;
     }
   }
+  // 多消费端收编：同平台多 consumer 合法（会话键绑消费端路由），无全局唯一性校验。
 
 
   return {
@@ -566,15 +690,26 @@ export function createServiceRegistry({
 
     /** 健康视图（不含 secret）：登记目录里的全部服务（内联 services 已退役）。 */
     services() {
-      const merge = ({ id, kind, transport, url, timeoutMs, enabled = true, tools = [], file = null }) => ({
+      const merge = ({
+        id, kind, transport, url, timeoutMs, enabled = true, platform,
+        memoryService, tools = [], presets = null, file = null,
+      }) => ({
         id,
         kind,
         transport,
         url,
         timeoutMs,
         enabled,
+        // consumer 平台声明（其余 kind 恒 null）。
+        platform,
+        // 记忆服务声明原样透出（boolean|{saveTool}；selectMemoryService 选路依据，
+        // 控制台记忆徽标只看真值）。
+        memoryService,
         // 登记服务携带的工具名。
         tools: tools.map((tool) => tool.name),
+        // 平台→预设声明（{qq:'qq-chat'}）。建会话时网关按它选 preset——
+        // 平台身份知识归适配器，网关不持有任何平台映射表。
+        presets: presets ?? null,
         // 来源文件（排障「这个服务从哪来的」）。
         file: file ? path.basename(file) : null,
         // 连接状态只有挂了 ws-hub 之后才有意义；http-only 服务恒为 false。
@@ -586,21 +721,86 @@ export function createServiceRegistry({
     resolveService(id) { return registeredById.get(id) ?? null; },
 
     /**
-     * 供 ws-hub 握手用的身份合并表（形状与 config.adapters 条目一致）。
-     * enabled=false 的登记服务不开放连接（工具面/服务调用同样跳过它）。
+     * 控制台「编辑消费端预设」（2026-11-17）：只写 presets 一个字段。
+     *
+     * 声明只是名字（内容归消费端），但它是登记文件的一部分——写回必须保留
+     * 其它字段原样：读文件 → 合并 → 0600 原子写 → scanRegistrations('operator')
+     * 重载内存并记台账（与 POST 注册同一口径，热生效、无需重启网关）。
+     *
+     * @param {string} id consumer id（svc-*）
+     * @param {Record<string,string>|null} presets null = 清除声明（回退 minimal）
+     * @returns {{ok:true, id:string, presets:(object|null)}|
+     *           {ok:false, status:number, error:string}}
      */
-    clients() {
-      const visible = [...registeredById.values()].filter((s) => s.enabled !== false);
-      return new Map(visible.map((service) => [
-        service.id,
-        { id: service.id, kind: service.kind, platform: null, secret: service.secret },
-      ]));
+    updateRegistrationPresets(id, presets) {
+      const entry = registeredById.get(String(id ?? ''));
+      if (!entry) return { ok: false, status: 404, error: `登记不存在：${id}` };
+      if (entry.kind !== 'consumer') {
+        return { ok: false, status: 400, error: `${id} 的 kind=${entry.kind}，preset 声明只对 consumer 有意义` };
+      }
+      let normalized = null;
+      if (presets !== null && presets !== undefined) {
+        const parsed = presetsDeclarationSchema.safeParse(presets);
+        if (!parsed.success) {
+          const issue = parsed.error.issues[0];
+          return {
+            ok: false,
+            status: 400,
+            error: `presets 形状非法（${issue?.path?.join('.') || 'body'}）：${issue?.message ?? 'schema 校验失败'}`,
+          };
+        }
+        normalized = parsed.data;
+      }
+      if (!entry.file) return { ok: false, status: 500, error: '登记记录缺少 file 字段，无法写回' };
+      let raw;
+      try {
+        raw = JSON.parse(fs.readFileSync(entry.file, 'utf8'));
+      } catch (error) {
+        return { ok: false, status: 500, error: `登记文件不可读：${error?.message ?? error}` };
+      }
+      if (normalized === null) delete raw.presets;
+      else raw.presets = normalized;
+      try {
+        fs.writeFileSync(entry.file, `${JSON.stringify(raw, null, 2)}\n`, { encoding: 'utf8', mode: 0o600 });
+      } catch (error) {
+        return { ok: false, status: 500, error: `登记文件写入失败：${error?.message ?? error}` };
+      }
+      scanRegistrations('operator');
+      return { ok: true, id: String(id), presets: normalized };
     },
 
-    /** 登记目录视图（健康/排障用；与 services() 的区别是带文件名与原始状态）。 */
+    /**
+     * 消费端统一活视图（只由登记目录 kind=consumer 派生；条目形状与
+     * transport.deliverAction 的 adapter 参数同构）。HTTP 入站验签、WS 握手身份、
+     * 动作下行、清单拉取、编排门禁全部消费这一份视图。
+     */
+    consumers,
+
+    /** 单个消费端查视图（O(1) 入口；未命中 null）。 */
+    consumerById,
+
+    /**
+     * 登记目录视图（健康/排障用；与 services() 的区别是带文件名与原始状态）。
+     * platform 只对 kind=consumer 有意义（动作会话定位 + 入站验签）。
+     */
     registrations() {
-      return [...registeredById.values()].map(({ id, name, kind, enabled, file, tools }) => ({
-        id, name, kind, enabled, file: path.basename(file), tools: tools.map((tool) => tool.name),
+      return [...registeredById.values()].map(({
+        id, name, kind, transport, url, platform, enabled, memoryService, file, tools = [], presets = null,
+      }) => ({
+        id,
+        name,
+        kind,
+        // 与 services() 字段对齐（同一服务的两条视图路径同形）：transport 缺省
+        // 'http'（resource 契约强制 http，consumer 合法 auto/ws/http）；url 缺省
+        // null——控制台 svcCard 的徽标裸插值依赖这里输出完整字段。
+        transport: transport ?? 'http',
+        url: url ?? null,
+        platform: platform ?? null,
+        enabled,
+        memoryService: Boolean(memoryService),
+        file: path.basename(file),
+        tools: tools.map((tool) => tool.name),
+        presets: presets ?? null,
       }));
     },
 
@@ -615,8 +815,8 @@ export function createServiceRegistry({
             name: tool.name,
             description: tool.description,
             inputSchema: tool.inputSchema,
-            // 角色随声明透出：tool-host 只关心 tool 角色，管线解析看 decorator/filter。
-            roles: tool.roles,
+            // 单值角色随声明透出：tool-host 只关心 tool，管线解析看 decorator/filter。
+            role: tool.role,
           });
         }
       }
@@ -624,15 +824,16 @@ export function createServiceRegistry({
     },
 
     /**
-     * 管线步骤解析的第三级：装饰器/过滤器角色的登记工具名（工具即步骤）。
-     * 管线步骤名直接写工具名（如 chat_memory_recall）即可把该工具编排为步骤，
-     * 工具调用与装饰器注入共用服务侧同一实现。返回 { service, kind, tool } 或 null。
+     * 管线步骤解析的第二级：decorator/filter 角色的登记工具名（工具即步骤）。
+     * 管线步骤名直接写工具名（如 chat_memory_get）即可把该工具编排为步骤，
+     * 工具调用与装饰器注入共用服务侧同一实现（全部走 tool.call）。
+     * 返回 { service, kind, tool } 或 null。
      */
     resolveToolStep(name) {
       for (const entry of registeredById.values()) {
         if (entry.enabled === false) continue;
         const tool = entry.tools.find((candidate) => candidate.name === name
-          && (candidate.roles.includes('decorator') || candidate.roles.includes('filter')));
+          && (candidate.role === 'decorator' || candidate.role === 'filter'));
         if (tool) return { service: entry, kind: entry.kind, tool };
       }
       return null;
@@ -746,62 +947,23 @@ export function createServiceRegistry({
     returnPipelineKeys() { return [...returnPipelines.keys()]; },
 
     /**
-     * 统一 service.call 出站入口（管线引擎唯一依赖的调用面）。
-     * transport 判定：ws 直连；auto = WS 有连接走 WS、否则回落 HTTP；http 钉死。
-     * 契约在网关侧收口：响应过 parseServiceCallResult 并核对 callId，
-     * 一切失败抛 ContractError（管线捕获后记 degraded，fail-safe 放行）。
+     * V2 P3 → tool.call 统一改造：向已登记服务发起一次工具调用（tool.call），
+     * 返回 parseToolResult 形状（{ ok, data?, error? }）。业务失败（ok:false）
+     * 是正常结果，只有传输/契约问题抛 ContractError——调用方（ToolHost 服务
+     * 执行器 / 管线引擎）把传输失败翻译成 degraded 结果。
      *
-     * @param {object} request parseServiceCallRequest 形状的请求（含 callId）
-     */
-    async callService(id, request) {
-      const service = registeredById.get(id);
-      if (!service) throw new ContractError('E_SCHEMA', `unknown service: ${id}`);
-      // 登记服务被编排禁用（enabled=false）时按失效步骤处理，调用方 degraded。
-      if (service.enabled === false) {
-        throw new ContractError('E_DISABLED', `service "${id}" is disabled by its registration`);
-      }
-
-      let body;
-      if (service.transport === 'ws' || (service.transport === 'auto' && wsHub?.isConnected(id))) {
-        assertOpenWs(service);
-        // ws-hub.callService 自带 callId 关联与超时，返回 result 帧的 result 对象。
-        body = await wsHub.callService(id, request, service.timeoutMs);
-      } else {
-        const response = await httpClientFor(service)
-          .post('/v1/service/call', request, { timeoutMs: service.timeoutMs });
-        if (!response.ok) {
-          throw new ContractError(
-            response.code === 'E_NETWORK' ? 'E_NETWORK' : response.code,
-            `service.call to "${id}" failed: ${response.error}`,
-          );
-        }
-        body = response.body;
-      }
-
-      let result;
-      try {
-        result = parseServiceCallResult(body);
-      } catch (error) {
-        // 非法响应 = 服务坏了，不是消息该死：抛给管线记 degraded（放行）。
-        throw new ContractError('E_SCHEMA', `service "${id}" returned an invalid result: ${error?.message ?? error}`);
-      }
-      if (result.callId !== request.callId) {
-        throw new ContractError('E_SCHEMA', `service "${id}" result callId mismatch (got ${result.callId})`);
-      }
-      return result;
-    },
-
-    /**
-     * V2 P3：向已登记服务发起一次工具调用（tool.call），返回 parseToolResult
-     * 形状（{ ok, data?, error? }）。业务失败（ok:false）是正常结果，只有
-     * 传输/契约问题抛 ContractError——与 callService 的 fail-safe 分工一致，
-     * 调用方（ToolHost 服务执行器）把传输失败翻译成 degraded 工具结果。
+     * 这是服务间调用的唯一信封（service.call 已全链路下线）：HTTP POST
+     * /v1/tools/call（资源服务纯被动，传输非对称后 HTTP 是唯一通道——
+     * WS tool.call 帧已随资源侧连接器退役），响应复用 toolResultSchema
+     * （callId 关联 + ok/data/error 形状），网关侧核对 callId。
      *
      * 安全边界：request 不含 turnToken——安全链不下放（不变量 §5.2），
-     * 令牌校验在网关 ToolHost 层完成，这里只下发会话标识。
+     * 令牌校验在网关 ToolHost 层完成，这里只下发会话标识与 context。
      *
      * @param {string} id 服务 id（登记目录）
-     * @param {{tool: string, args?: object, sessionKey?: string, turnId?: string}} request
+     * @param {{tool: string, args?: object, sessionKey?: string, turnId?: string,
+     *          context?: {senderId?: string, text?: string}}} request
+     *        context.text 仅 filter 步骤下发（当前工作文本）；decorator/tool 不带。
      */
     async callServiceTool(id, request) {
       const service = registeredById.get(id);
@@ -817,24 +979,20 @@ export function createServiceRegistry({
         args: request?.args ?? {},
         sessionKey: request?.sessionKey,
         turnId: request?.turnId,
+        context: request?.context,
       };
 
-      let raw;
-      if (service.transport === 'ws' || (service.transport === 'auto' && wsHub?.isConnected(id))) {
-        assertOpenWs(service);
-        raw = await wsHub.callService(id, body, service.timeoutMs, 'tool.call');
-      } else {
-        // HTTP 备用通道：POST <url>/v1/tools/call（与 service.call 同端口同签名）。
-        const response = await httpClientFor(service)
-          .post('/v1/tools/call', body, { timeoutMs: service.timeoutMs });
-        if (!response.ok) {
-          throw new ContractError(
-            response.code === 'E_NETWORK' ? 'E_NETWORK' : response.code,
-            `tool.call to "${id}" failed: ${response.error}`,
-          );
-        }
-        raw = response.body;
+      // HTTP-only（传输非对称）：资源服务 transport 已强制 http，恒走
+      // POST <url>/v1/tools/call（HMAC 头验签 + 幂等 callId）。
+      const response = await httpClientFor(service)
+        .post('/v1/tools/call', body, { timeoutMs: service.timeoutMs });
+      if (!response.ok) {
+        throw new ContractError(
+          response.code === 'E_NETWORK' ? 'E_NETWORK' : response.code,
+          `tool.call to "${id}" failed: ${response.error}`,
+        );
       }
+      const raw = response.body;
 
       let result;
       try {
@@ -846,6 +1004,71 @@ export function createServiceRegistry({
         throw new ContractError('E_SCHEMA', `service "${id}" tool result callId mismatch (got ${result.callId})`);
       }
       return result;
+    },
+
+    /**
+     * 拉取 resource 服务的工具清单（GET /v1/tools，控制台「拉取清单预填」数据源）。
+     * 只读：不写登记、不进 toolHost 词典；凭据直接用登记自身的 url+secret——
+     * 调用方（operator）无需也无法经 UI 提供凭据，安全面不变。
+     * consumer 不适用：能力面由适配器 manifest 现拉，静态声明反而是错误形态。
+     */
+    async fetchServiceManifest(id) {
+      const service = registeredById.get(String(id ?? ''));
+      if (!service) return { ok: false, status: 404, error: `登记不存在：${id}` };
+      if (service.enabled === false) return { ok: false, status: 400, error: `服务 "${id}" 已被登记停用` };
+      if (service.kind === 'consumer') {
+        return { ok: false, status: 400, error: 'consumer 的能力面由适配器 manifest 现拉，无需静态声明工具清单' };
+      }
+      const response = await httpClientFor(service).get('/v1/tools', { timeoutMs: 5000 });
+      if (!response.ok) {
+        return { ok: false, status: 502, error: `拉取清单失败（${response.code}）：${response.error}——服务未在线或未升级清单端点` };
+      }
+      const raw = response.body;
+      if (raw?.ok !== true || !Array.isArray(raw?.tools)) {
+        return { ok: false, status: 502, error: '服务清单形状不符（期望 {ok:true, tools:[…]}）' };
+      }
+      const named = raw.tools.filter((tool) => tool && typeof tool.name === 'string');
+      // 与登记 schema 对齐：≤32 条；超出截断并如实标记（不静默丢弃）。
+      return { ok: true, id: service.id, tools: named.slice(0, 32), truncated: named.length > 32 };
+    },
+
+    /**
+     * 写回登记的 tools 声明（PUT /v1/console/services/<id>/tools）。镜像
+     * updateRegistrationPresets：只动 tools 字段、逐条 schema 校验、原子写回 +
+     * 立即重扫（热加载生效——编排步骤/registeredTools 下一拍可用，无需重启）。
+     */
+    updateRegistrationTools(id, tools) {
+      const entry = registeredById.get(String(id ?? ''));
+      if (!entry) return { ok: false, status: 404, error: `登记不存在：${id}` };
+      if (entry.kind === 'consumer') {
+        return { ok: false, status: 400, error: 'consumer 登记不声明工具清单（能力面走适配器 manifest）' };
+      }
+      if (!Array.isArray(tools)) return { ok: false, status: 400, error: 'body 需要 tools 数组' };
+      if (tools.length > 32) return { ok: false, status: 400, error: 'tools 超过 32 条上限（与登记 schema 对齐）' };
+      const normalized = [];
+      for (const [i, tool] of tools.entries()) {
+        const parsed = serviceToolDeclarationSchema.safeParse(tool);
+        if (!parsed.success) {
+          const issue = parsed.error.issues[0];
+          return { ok: false, status: 400, error: `tools[${i}] 形状非法：${issue?.message ?? 'schema 校验失败'}` };
+        }
+        normalized.push(parsed.data);
+      }
+      if (!entry.file) return { ok: false, status: 500, error: '登记记录缺少 file 字段，无法写回' };
+      let doc;
+      try {
+        doc = JSON.parse(fs.readFileSync(entry.file, 'utf8'));
+      } catch (error) {
+        return { ok: false, status: 500, error: `登记文件不可读：${error?.message ?? error}` };
+      }
+      doc.tools = normalized;
+      try {
+        fs.writeFileSync(entry.file, `${JSON.stringify(doc, null, 2)}\n`, { encoding: 'utf8', mode: 0o600 });
+      } catch (error) {
+        return { ok: false, status: 500, error: `登记文件写入失败：${error?.message ?? error}` };
+      }
+      scanRegistrations('operator');
+      return { ok: true, id: entry.id, tools: normalized };
     },
   };
 }

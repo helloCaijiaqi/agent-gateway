@@ -20,6 +20,9 @@ const { createNonceCache, signRequest, verifyRequest } = await import(
   new URL('../src/core/auth.mjs', import.meta.url).href
 );
 const { loadConfig } = await import(new URL('../src/core/config.mjs', import.meta.url).href);
+const { createConsumerRegistry } = await import(
+  new URL('./support/consumer-registration.mjs', import.meta.url).href
+);
 
 const SCRIPT = new URL('./gen-secret.mjs', import.meta.url).href;
 
@@ -91,42 +94,61 @@ test('writeSecretFile: 创建目录写入；重复拒绝；force 覆盖；指纹
 
 // ── buildConfigSnippets ────────────────────────────────────────────────────
 
-test('adapter kind: 双片段 + capabilities 提示；wx kind: enabled:false；mcp-bus: 无 adapters 条目', () => {
+test('adapter kind: 消费端登记条目（kind=consumer，svc id 语义）+ 交接文件提示；wx: enabled:false；mcp-bus: 无条目/交接', () => {
   const secret = generateSecret();
   const caps = ['send_text', 'mark_read'];
 
-  const adapter = buildConfigSnippets({ kind: 'adapter', id: 'qq-main', secret, capabilities: caps });
-  assert.deepEqual(adapter.adaptersEntry, {
-    id: 'qq-main', platform: 'qq', secretFile: 'qq-main.secret',
-    callbackBase: 'http://127.0.0.1:3100', capabilities: caps,
+  // 历史调用方可能仍传 capabilities（旧脚本/MCP 封装），必须被忽略而不是写进条目：
+  // 工具面唯一事实源是适配器的 actions-manifest。
+  const adapter = buildConfigSnippets({ kind: 'adapter', id: 'svc-1a2b3c4d5e6f', secret, capabilities: caps });
+  assert.deepEqual(adapter.consumerEntry, {
+    v: 1,
+    id: 'svc-1a2b3c4d5e6f',
+    name: 'svc-1a2b3c4d5e6f',
+    kind: 'consumer',
+    transport: 'auto',
+    url: 'http://127.0.0.1:3100',
+    platform: 'qq',
+    secretFile: 'svc-1a2b3c4d5e6f.secret',
   });
-  assert.equal(adapter.bridgeGateway.secret, secret);
+  assert.equal('capabilities' in adapter.consumerEntry, false);
+  // 网关连接信息不再以「桥接 config.json 片段」形式给出：改为指向交接文件。
+  assert.equal('bridgeGateway' in adapter, false);
+  assert.equal(adapter.handoff.fileName, 'gateway.json');
+  assert.equal(adapter.handoff.copyFrom, 'handoff/svc-1a2b3c4d5e6f.gateway.json');
+  assert.equal(JSON.stringify(adapter.handoff).includes(secret), false, '片段不得回显密钥明文');
   assert.equal(adapter.mcpToken, null);
 
-  const wx = buildConfigSnippets({ kind: 'wx', id: 'wx-main', secret });
-  assert.equal(wx.adaptersEntry.platform, 'wx');
-  assert.equal(wx.adaptersEntry.enabled, false);
-  assert.equal(wx.adaptersEntry.callbackBase, 'http://127.0.0.1:7192');
+  const wx = buildConfigSnippets({ kind: 'wx', id: 'svc-9f8e7d6c5b4a', secret });
+  assert.equal(wx.consumerEntry.platform, 'wx');
+  assert.equal(wx.consumerEntry.enabled, false);
+  assert.equal(wx.consumerEntry.url, 'http://127.0.0.1:7192');
   assert.ok(wx.notes.some((note) => note.includes('enabled:false')));
 
   const bus = buildConfigSnippets({ kind: 'mcp-bus', id: 'mcp-bus', secret });
-  assert.equal(bus.adaptersEntry, null);
-  assert.equal(bus.bridgeGateway, null);
+  assert.equal(bus.consumerEntry, null);
+  assert.equal(bus.handoff, null);
   assert.equal(bus.mcpToken.value, secret);
-  assert.ok(bus.notes.some((note) => note.includes('GATEWAY_MCP_TOKEN')));
+  // 文件单源：指引指向密钥文件，不再有 env 通道。
+  assert.equal(bus.mcpToken.file, 'state/gateway/mcp-bus.secret');
+  assert.ok(bus.notes.some((note) => note.includes('state/gateway/mcp-bus.secret')));
 });
 
-// ── 集成：脚本产物 → loadConfig(secretFile) → 网关鉴权 ─────────────────────
+// ── 集成：脚本产物 → 登记目录(secretFile) → 网关鉴权 ───────────────────────
 
-test('端到端：生成的 secret 文件经 loadConfig 解析并可通过 verifyRequest', () => {
+test('端到端：生成的 secret 文件经登记目录装载并可通过 verifyRequest', () => {
   const dir = tmpDir();
   const { filePath } = writeSecretFile({ dir, id: 'probe-main', secret: generateSecret() });
-  fs.writeFileSync(path.join(dir, 'adapters.json'), JSON.stringify({
-    adapters: [{ id: 'probe-main', platform: 'qq', secretFile: 'probe-main.secret' }],
+  // 消费端身份只认登记目录：写 services/probe-main.json（secretFile 相对 stateDir）。
+  fs.mkdirSync(path.join(dir, 'services'), { recursive: true });
+  fs.writeFileSync(path.join(dir, 'services', 'probe-main.json'), JSON.stringify({
+    v: 1, id: 'probe-main', name: 'probe', kind: 'consumer', transport: 'http',
+    platform: 'qq', url: 'http://127.0.0.1:3100', secretFile: 'probe-main.secret',
   }));
-  const config = loadConfig({ stateDir: dir, env: {} });
-  const adapter = config.adapters.find((entry) => entry.id === 'probe-main');
-  assert.ok(adapter, 'adapter registered');
+  loadConfig({ stateDir: dir, env: { GATEWAY_MODE: 'off' } });
+  const registry = createConsumerRegistry({ stateDir: dir });
+  const adapter = registry.consumers().find((entry) => entry.id === 'probe-main');
+  assert.ok(adapter, 'consumer registered');
   assert.equal(adapter.secret, fs.readFileSync(filePath, 'utf8').trim());
 
   const body = '{}';
@@ -152,7 +174,7 @@ test('CLI: --json 可解析；重复执行退出非零；--force 覆盖成功', 
   const parsed = JSON.parse(first.stdout);
   assert.equal(parsed.ok, true);
   assert.match(parsed.file, /probe-main\.secret$/);
-  assert.equal(parsed.snippets.adaptersEntry.id, 'probe-main');
+  assert.equal(parsed.snippets.consumerEntry.id, 'probe-main');
   assert.ok(fs.existsSync(parsed.file));
 
   const repeat = run(['--id', 'probe-main', '--out', dir, '--json']);

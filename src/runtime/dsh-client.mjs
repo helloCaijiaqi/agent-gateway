@@ -28,6 +28,10 @@ const rawHttp = createHttpClient({});
 
 export const MINTED_COOKIE_LIFETIME_MS = 60 * 60 * 1000;
 const MINTED_COOKIE_REFRESH_MARGIN_MS = 5 * 60 * 1000;
+// mux 连接「健康」门槛：存活不足这个时长的连接（对端握手后立即关闭）按失败处理
+// 并退避。缺了这道闸，对端一拒绝就是无延迟重连风暴——2026-11-16 实测 30s 内
+// 堆到 3 万条 ESTABLISHED，占满本机临时端口，整机所有新出站连接失败。
+const MUX_MIN_HEALTHY_MS = 5000;
 const BROWSER_SESSION_KEY = 'client-connection/browser-session';
 const COOKIE_PAYLOAD_VERSION = 1;
 const COOKIE_PREFIX = 'dsh-auth-';
@@ -456,20 +460,42 @@ export class DshClient {
   async _connectLoop() {
     const generation = ++this._muxGeneration;
     while (this._muxWanted && generation === this._muxGeneration) {
+      let livedMs = 0;
       try {
+        const startedAt = Date.now();
+        // _connectOnce 只在「本次连接结束」时结算，因此这里永远不会在旧连接存活时
+        // 再建新连接（socket 风暴的根因修复）。
         await this._connectOnce(generation);
-        this._backoffMs = 3000;
+        livedMs = Date.now() - startedAt;
       } catch (error) {
         if (generation !== this._muxGeneration) return;
         this.logger(`mux connection failed: ${error?.message ?? error}; retry in ${this._backoffMs}ms`);
         await new Promise((r) => setTimeout(r, this._backoffMs));
         this._backoffMs = Math.min(this._backoffMs * 2, 60000);
+        continue;
+      }
+      if (generation !== this._muxGeneration) return;
+      if (livedMs < MUX_MIN_HEALTHY_MS) {
+        // 秒断（握手后被对端立即关闭/踢掉）= 失败信号，必须退避；
+        // 否则对端一拒绝就是无延迟重连风暴。
+        this.logger(`mux connection dropped after ${livedMs}ms (unhealthy); retry in ${this._backoffMs}ms`);
+        await new Promise((r) => setTimeout(r, this._backoffMs));
+        this._backoffMs = Math.min(this._backoffMs * 2, 60000);
+      } else {
+        // 稳定连接断开：快速重连（仍留 1s 间隔，给对端与内核释放资源）。
+        this._backoffMs = 3000;
+        await new Promise((r) => setTimeout(r, 1000));
       }
     }
   }
 
   async _connectOnce(generation) {
     await this.ensureAuth();
+    // 兜底：绝不并存两条 mux 连接（旧连接残留就先关掉）。正常路径上
+    // _connectLoop 已保证串行，这里是防未来回归的最后一道闸。
+    if (this._muxSocket && this._muxSocket.readyState === 1) {
+      try { this._muxSocket.close(); } catch { /* 已断开 */ }
+    }
     const url = new URL('/api/remote.mux', this.baseUrl);
     url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:';
     const socket = new WebSocket(url, { headers: { cookie: this.cookie } });
@@ -493,10 +519,23 @@ export class DshClient {
 
     const emit = (payload) => { try { this._onFrame?.(payload); } catch (error) { this.logger(`onFrame handler error: ${error?.message ?? error}`); } };
 
+    // 关键不变量：这个 Promise 只在「本次连接生命周期结束」时结算（close/error），
+    // 绝不在 open 时 resolve——否则 _connectLoop 会在旧连接仍然存活时立刻再建一条，
+    // 形成每秒几十条的无延迟重连风暴（实测 30s 内堆到 3 万条 ESTABLISHED，
+    // 占满本机临时端口，整机所有新出站连接失败、浏览器打不开任何网站）。
     await new Promise((resolveConnected, rejectFailed) => {
+      let settled = false;
+      const settle = (fn, value) => {
+        if (settled) return;
+        settled = true;
+        fn(value);
+      };
       const onOpen = () => {
         if (generation !== this._muxGeneration) { try { socket.close(); } catch {} return; }
         this._muxState = 'open';
+        // 事件流是回合完成的唯一通道（awaitTurn 等的是 mux 帧）：连上/断开必须留痕，
+        // 否则「回合静默卡住」的排障只能靠猜。
+        this.logger(`mux connected: ${this.baseUrl}（事件流就绪，follow ${this._desiredFollows.size} 个会话）`);
         // 重放全部期望 follow（跨重连保留）——少了这步，DSH 重启后所有会话静默失联。
         for (const sessionId of this._desiredFollows) openFollow(sessionId);
         const eventsStreamId = randomUUID();
@@ -504,10 +543,9 @@ export class DshClient {
         try {
           socket.send(JSON.stringify({ type: 'open', streamId: eventsStreamId, endpoint: '$events', payload: { args: {} } }));
         } catch (error) {
-          rejectFailed(error);
-          return;
+          try { socket.close(); } catch { /* 已断开 */ }
+          settle(rejectFailed, error);
         }
-        resolveConnected();
       };
       const onMessage = (event) => {
         let msg;
@@ -575,20 +613,26 @@ export class DshClient {
       };
       const onDown = () => {
         socket.removeEventListener('message', onMessage);
+        const wasOpen = this._muxState === 'open';
         this._muxState = 'connecting';
         this.invalidateAuth();
-        // resolve 交给 _connectLoop 走下一轮重连；已连接后断开不算失败。
-        resolveConnected();
+        if (wasOpen) this.logger('mux disconnected; reconnecting with fresh auth');
+        // 连接结束才 resolve：_connectLoop 据此进入下一轮（并按其存活时长决定退避）。
+        // 已连接后断开不算失败——下次重连照常。
+        settle(resolveConnected);
       };
       socket.addEventListener('open', onOpen, { once: true });
       socket.addEventListener('message', onMessage);
       socket.addEventListener('close', onDown, { once: true });
       socket.addEventListener('error', (event) => {
-        if (this._muxState !== 'open') rejectFailed(event?.message ? new Error(String(event.message)) : new Error('websocket error'));
+        if (this._muxState !== 'open') settle(rejectFailed, event?.message ? new Error(String(event.message)) : new Error('websocket error'));
         onDown();
       }, { once: true });
     });
   }
 }
 
-const WRAPPERS_NULL = new Set(['agentPresets/list', 'settings/describe']);
+// 这些方法的 descriptor **不接受** `request` 包裹：多包一层就是
+// `gateway/arguments-invalid: … args fields do not match the descriptor: unexpected "request"`
+// （2026-11-16 实测：session/modelCatalog 因此一直回退，控制台看不到真实模型目录）。
+const WRAPPERS_NULL = new Set(['agentPresets/list', 'settings/describe', 'session/modelCatalog']);

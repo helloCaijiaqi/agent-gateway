@@ -21,14 +21,35 @@ import { z } from 'zod';
 
 export const PROTOCOL_VERSION = 1;
 
+/**
+ * 平台→DSH agent preset 声明（{ qq: 'qq-chat' }）。
+ *
+ * 单独导出：登记契约（serviceRegistrationSchema）与控制台的「编辑消费端预设」
+ * 端点共用同一份校验，避免两处漂移。键=平台（小写单段），值=preset 名
+ * （lowercase kebab）——**只是名字**，内容归消费端适配器。
+ */
+export const presetsDeclarationSchema = z.record(
+  z.string().regex(/^[a-z][a-z0-9-]{0,31}$/),
+  z.string().regex(/^[a-z][a-z0-9-]{0,63}$/, 'preset id must be lowercase kebab-case'),
+);
+
+/**
+ * 声明的 preset 没装时的回退目标（DSH 内置、无人格、无本地工具）。
+ *
+ * 属于 DSH 语义常量而非平台知识，所以放在 core：server.mjs（控制台回显）与
+ * session-registry（建会话回退）共用同一份，不会漂移。
+ */
+export const FALLBACK_PRESET = 'minimal';
+
 export const PLATFORMS = Object.freeze(['qq', 'wx']);
 export const CONVERSATION_KINDS = Object.freeze(['group', 'private', 'room']);
 export const SENDER_ROLES = Object.freeze(['owner', 'member', 'bot']);
 export const MEDIA_KINDS = Object.freeze(['image', 'voice', 'video', 'file', 'sticker']);
 
 /**
- * 动作类型。新增类型必须同时补三处：这里、`ACTION_PAYLOAD_RULES`、
- * 适配器的 `capabilities`。少任何一处都会变成「模型说了但没发生」。
+ * 动作类型。新增类型必须同时补两处：这里、`ACTION_PAYLOAD_RULES`，
+ * 并在适配器的 actions-manifest 里声明（wired + payloadSchema）。
+ * 少任何一处都会变成「模型说了但没发生」。
  *
  * 阶段 1 清单驱动扩容：qq 适配器的能力面改为 actions-manifest.json 声明
  * （桥接侧唯一事实源），这里的清单只扩「网关认识的线缆词汇表」，让
@@ -76,9 +97,20 @@ const conversationSchema = z.strictObject({
   id: idText(128),
 });
 
+/**
+ * 发送者展示名（V2 统一改造新增）：nickname = 平台昵称，card = 群名片。
+ * name 保留兼容 = card || nickname（适配器未升级时的单一展示名）。
+ * subject 身份层据此登记别名索引（群名片 → 会话内别名，昵称 → 全局别名）。
+ */
+const senderNamesSchema = z.strictObject({
+  nickname: z.string().max(64).optional(),
+  card: z.string().max(64).optional(),
+});
+
 const senderSchema = z.strictObject({
   id: idText(128),
   name: z.string().max(64),
+  names: senderNamesSchema.optional(),
   roles: z.array(z.enum(SENDER_ROLES)).max(3),
 });
 
@@ -115,11 +147,14 @@ const authSchema = z.strictObject({
  * 合成唤醒标记（阶段 2）：适配器把「模型登记过的等待已满足」这类**事件**随入站
  * 信封一起送来。它不是用户消息，网关据此决定这一轮是「唤醒回推」而不是普通聊天：
  *   · kind=wait：chat_qq_wait 登记的消息到了；
- *   · kind=proactive：适配器侧定时器（冒泡）合成的事件。
+ *   · kind=proactive：适配器侧定时器（冒泡）合成的事件；
+ *   · kind=user：适配器侧判定「这一轮是被真实用户消息触发」的唤醒（2026-11-18）。
+ *     曾经 user 消息唤醒也误标 proactive，提示词写着「不是有人点名你，可以不说话」，
+ *     直接压制模型回复意愿（间歇性 sent=0 忘发的根因）。
  * status 缺省视为 arrived（正常到达），timeout 只用于将来「等待超时也回推」的扩展。
  */
 const wakeSchema = z.strictObject({
-  kind: z.enum(['wait', 'proactive']),
+  kind: z.enum(['wait', 'proactive', 'user']),
   status: z.enum(['arrived', 'timeout']).optional(),
   purpose: z.enum(['messages', 'reply']).optional(),
   registeredAt: z.number().int().nonnegative().optional(),
@@ -212,7 +247,10 @@ export const toolCallSchema = z.strictObject({
   callId: idText(128),
   tool: idText(128),
   args: z.record(z.string(), z.unknown()).default({}),
-  turnToken: idText(256),
+  // 2026-11-20 放宽为 optional：内部白名单通道（ToolHost INTERNAL_TOOLS，如
+  // persona 插件装配期拉渲染）不带会话令牌。真正的校验权在 ToolHost.handle——
+  // 无 token 且不在白名单一律 E_FORBIDDEN，语义不变；模型调用面仍恒带 token。
+  turnToken: idText(256).optional(),
   sessionKey: idText(256).optional(),
   turnId: idText(128).optional(),
 });
@@ -228,67 +266,59 @@ export const toolResultSchema = z.strictObject({
   path: ['error'],
 });
 
-// ── V2 P2：管线服务调用（装饰器/过滤器，service.call）────────────────────────
-// 服务与消费者同构登记（登记目录 + HMAC 身份），但契约刻意收窄到
-// 「一个入口一个出口」：网关把当前消息推给它，它返回放行/丢弃判定与增强内容。
-// 与 toolResult 同哲学：响应在网关侧 fail-safe——schema 不过或 verdict 非法
-// 一律记 degraded 放行，绝不让一个坏响应变成误杀消息。
-export const SERVICE_KINDS = Object.freeze(['decorator', 'filter', 'shadow']);
+// ── V2 统一改造：管线步骤结果契约（decorator / filter，经 tool.call 承载）────
+// service.call 信封已全链路下线：decorator/filter 步骤一律走 tool.call（HTTP
+// /v1/tools/call + WS tool.call 帧），结果装在 toolResult.data 里，网关按工具
+// role 用下面的 schema 解析。与 toolResult 同哲学：响应在网关侧 fail-safe——
+// schema 不过一律记 degraded 放行，绝不让一个坏响应变成误杀消息。
+//
+// 角色契约（三选一，单值 role）：
+//   tool      = 模型可调的工具面，result 不透明（网关原样透传）；
+//   decorator = 仅网关管线，纯注入，result = { sections[]?, epoch? }；
+//   filter    = 仅网关管线（入站 + returnPipelines），改写器，result = { text, reason? }，
+//               text 空串 = 丢弃该消息（入站不建 turn；出站不发送）。
 
-export const serviceCallRequestSchema = z.strictObject({
-  v: z.literal(PROTOCOL_VERSION),
-  callId: idText(128),
-  // 目标服务与管线步骤身份：服务按 step/kind 判断自己被编排成什么角色（诊断
-  // 用），网关不依赖它们做路由——路由靠连接（WS）或 URL（HTTP）。
-  service: idText(64),
-  step: idText(64),
-  kind: z.enum(SERVICE_KINDS),
-  sessionKey: idText(256),
-  turnId: idText(128).optional(),
-  // 当前累积 prompt 文本。允许缺省/空：唤醒事件轮 prompt 可为空，装饰器照样
-  // 可以追加 sections；filter 在空文本上同样可以判 drop。
-  text: z.string().max(20000).optional(),
-  // P4.x 会话首轮标记（仅首轮为 true）：加工型装饰器可据此自治实现「仅首轮
-  // 注入」——判定数据源（turn store 会话历史）归网关，服务保持无状态。
-  firstTurn: z.boolean().optional(),
-  // P5 管线方向：forward = 入站（consumer → DSH，含 protocol 令牌注入）；
-  // return = 出站（DSH 产出 → consumer，发送动作外发文本过链，无 protocol）。
-  // 缺省 forward——既有服务无需感知此字段即可继续工作。
-  direction: z.enum(['forward', 'return']).default('forward'),
-});
-
-const serviceSectionSchema = z.strictObject({
+/** decorator 产出：具名文本块（拼接顺序与预算裁剪都在网关做）。 */
+const decoratorSectionSchema = z.strictObject({
   name: idText(64),
   text: z.string().max(20000),
   // 与 context section 词典同义：预算超限时整段丢弃最低优先级。
   priority: z.number().int().optional(),
 });
 
-export const serviceCallResultSchema = z.strictObject({
-  v: z.literal(PROTOCOL_VERSION),
-  callId: idText(128),
-  verdict: z.enum(['pass', 'drop']),
-  // decorator 产出：message = 改写后的整段消息（缺省 = 原样保留）；
-  // sections = 追加的具名文本块。拼接顺序与预算裁剪都在网关做——服务只表达
-  // 「我想加什么」，不决定最终 prompt 形状（protocol 段永不经过服务）。
-  message: z.string().max(20000).optional(),
-  sections: z.array(serviceSectionSchema).max(16).optional(),
-  // 判定理由（drop 时进日志/诊断；约定不含消息正文，服务自行保证）。
+export const decoratorResultSchema = z.strictObject({
+  sections: z.array(decoratorSectionSchema).max(16).optional(),
+  // 会话纪元（§6.4，记忆装饰器专用，可选）：服务端在 save 事务推进。网关按
+  // (sessionKey, senderId, epoch) 去重 identity 类 block，实现「会话首轮注入一次」。
+  // 缺省 = 服务不区分纪元，此时按 sections 全量拼接；null 是
+  // 「本次渲染失败/无纪元状态」的既有表示（记忆服务降级路径会发 null）。
+  epoch: z.number().int().nonnegative().nullable().optional(),
+});
+
+/** filter 产出：过滤后的消息文本（无 verdict 枚举）。 */
+export const filterResultSchema = z.strictObject({
+  text: z.string().max(20000),
+  // 判定/改写理由（仅进日志/诊断；约定不含消息正文，服务自行保证）。
   reason: z.string().max(300).optional(),
-}).refine((value) => value.verdict === 'pass'
-  || (value.message === undefined && (value.sections ?? []).length === 0), {
-  message: 'a "drop" verdict must not carry message or sections',
-  path: ['verdict'],
 });
 
 // ── V2 P3：服务自主登记（登记文件 / 工具声明 / 注册台账）─────────────────────
 // 服务像消费端一样向网关注册自身：一份登记文件声明类型、transport、密钥引用
 // 与自有工具；注册 = 文件进入登记目录，卸载 = 文件移除，网关校验装载并落台账。
-// 注册 kind 与管线编排 kind 是两套词典：登记 kind 说「我是什么」（decorator /
-// filter / shadow / consumer），编排 kind（SERVICE_KINDS，含 shadow）说「这条
-// 管线步骤怎么用我」。shadow 可直接登记：它天生只产 diff 不改流量，编排成
-// 通路/回路步骤即灰度对账（内联 services.json 退役后这里是唯一入口）。
-export const SERVICE_REGISTRATION_KINDS = Object.freeze(['decorator', 'filter', 'shadow', 'consumer']);
+// 注册 kind 与工具 role 是两套概念：登记 kind 说「我是什么」（resource =
+// 提供能力的资源服务——记忆/角色卡/灰度对账皆属此类；consumer = 消息来源/
+// 动作下行端），工具 role 说「这个工具怎么被使用」（tool / decorator / filter）。
+// 装饰/过滤职责完全由 role 承担（管线步骤解析、编排候选过滤均按 role 驱动），
+// 旧 kind 取值 decorator/filter/shadow 已退役（parseServiceRegistration 对其
+// fail-closed 拒载并给迁移文案 → resource）。
+//
+// 传输层按角色非对称（传输与 kind 的交叉约束，见 schema refine）：
+//   - consumer（双向流：入站信封 ↑ / 动作下行 ↓）→ ws/http/auto 三态保留
+//     （auto = WS 优先、失败回落 HTTP，与桥接侧 gateway-client 同语义）；
+//   - resource（纯被动被调方）→ 仅 http：网关 → 资源的 POST /v1/tools/call
+//     是唯一通道，资源服务不向网关发消息，WS 能力已整体退役。
+
+export const SERVICE_REGISTRATION_KINDS = Object.freeze(['consumer', 'resource']);
 
 /**
  * 登记身份：自主登记默认随机 hash（数据库主键风格）= crypto.randomUUID() 去
@@ -303,24 +333,37 @@ export function newRegistrationId() {
 }
 
 /**
- * 工具角色（两层声明：服务级 kind 说「我是什么」，工具级 roles 说「这个工具能
- * 以什么身份被使用」）。tool = 模型可调的工具面（默认）；decorator / filter =
- * 该工具同时是管线可编排的步骤——如 memory 的 recall 既是 chat_memory_recall
- * 工具（模型主动调，tool.call 路由），又是装饰器（管线被动注入回忆段，
- * service.call 编排），两条出路共用同一实现。同一服务可以有多个工具标
- * decorator/filter；管线步骤名直接写工具名即可选中（见 pipeline resolveStep）。
+ * 消费端登记 id 词法（多消费端收编）：`svc-<12hex>`。id 只标识「这个注册的
+ * 服务实例」，与平台无关（平台是独立字段 platform）——`qq-main` 这类与平台名
+ * 混义的 id 不再新发（存量兼容读取 + 迁移告警，见 service-registry 装载警告）。
+ * 同平台多账号 = 多份登记文件、各自的 svc- id 与密钥，互不冲突。
+ */
+export const CONSUMER_ID_RE = /^svc-[a-z0-9]{6,32}$/;
+
+export function newConsumerRegistrationId() {
+  return `svc-${crypto.randomBytes(6).toString('hex')}`;
+}
+
+/**
+ * 工具角色（单值，三选一硬切）：服务级 kind 说「我是什么」，工具级 role 说
+ * 「这个工具以什么身份被使用」。tool = 模型可调的工具面（默认）；decorator /
+ * filter = 仅网关管线可编排的步骤——管线步骤名直接写工具名即可选中
+ * （见 pipeline resolveStep）。一个工具只能有一个 role：改写/丢弃职责归
+ * filter、纯注入归 decorator，不再允许一个工具身兼数职。
+ * 历史形态 `roles` 数组一律非法：parseServiceRegistration 对其显式报错并给
+ * 迁移文案（如 "roles":["tool","decorator"] → "role":"decorator"）。
  */
 export const SERVICE_TOOL_ROLES = Object.freeze(['tool', 'decorator', 'filter']);
 
-/** 登记文件里的一条工具声明：名字、描述、角色与 JSON-Schema 形状的参数定义。 */
+/** 登记文件里的一条工具声明：名字、描述、单值角色与 JSON-Schema 形状的参数定义。 */
 export const serviceToolDeclarationSchema = z.strictObject({
   // 工具名统一 chat_* 前缀（与 mcp-bus /v1/tools 既有词典一致，模型视角同一命名空间）。
   name: z.string().regex(/^chat_[a-z][a-z0-9_]{2,120}$/, 'tool name must be chat_* with lowercase snake case'),
   description: z.string().min(1).max(500),
   // JSON-Schema 形状的 loose record：字段语义由服务自行演进，网关只挡「不是对象」。
   inputSchema: z.record(z.string(), z.unknown()).default({}),
-  // 角色可多选（一个工具同时是工具面成员和管线步骤）；缺省纯工具面。
-  roles: z.array(z.enum(SERVICE_TOOL_ROLES)).min(1).default(['tool']),
+  // 单值角色（三选一）；缺省纯工具面。
+  role: z.enum(SERVICE_TOOL_ROLES).default('tool'),
 });
 
 export const serviceRegistrationSchema = z.strictObject({
@@ -333,23 +376,60 @@ export const serviceRegistrationSchema = z.strictObject({
   kind: z.enum(SERVICE_REGISTRATION_KINDS),
   transport: z.enum(['ws', 'http', 'auto']),
   // 服务基址（http/auto 必填，loopback 校验在装载器做——与 P2 adapters 同口径）。
+  // consumer 语义 = callbackBase（网关动作下行 POST <url>/v1/actions 与清单
+  // GET <url>/v1/actions/manifest 的基址；WS-only 消费者可缺省，缺省即无 HTTP 兜底）。
   url: z.string().max(256).optional(),
   timeoutMs: z.number().int().min(1000).max(60_000).optional(),
   // 密钥三选一（内联/文件/环境变量），口径与消费者同构（resolveSecret 校验）。
   secret: z.string().min(1).max(256).optional(),
   secretFile: z.string().min(1).max(256).optional(),
   secretEnv: z.string().min(1).max(64).optional(),
-  // 自有工具面：decorator/consumer 可声明（filter 纯管道判断，通常没有工具）。
+  // 自有工具面：resource 服务可声明 tool/decorator/filter 三种 role 的工具；
+  // consumer 通常不声明工具（只允许 role:'tool'，见 schema refine）。
   tools: z.array(serviceToolDeclarationSchema).max(32).optional(),
+  // 记忆服务能力声明（会话缓冲的 save 目标选路依据，selectMemoryService 三级
+  // 选路的第二级）。两种形态：
+  //   true                         旧布尔形态（兼容读取，运行时按内置缺省
+  //                                saveTool 处理并告警提示迁移——平滑存量）；
+  //   { saveTool: 'chat_memory_*' } 权威形态：saveTool = 该服务承接会话缓冲
+  //                                落地的工具名，网关 session-save 按声明动态
+  //                                调用（网关 src 不含具体工具名字面量）。
+  //                                loose() 允许后续扩展字段（如 batchSize）。
+  memoryService: z.union([
+    z.boolean(),
+    z.object({ saveTool: z.string().regex(/^chat_[a-z][a-z0-9_]{2,120}$/, 'memoryService.saveTool must be a chat_* tool name') }).loose(),
+  ]).optional(),
+  // 消费端平台（kind=consumer 必填）：动作会话定位（resolveTarget 按平台派生
+  // 会话）与 HTTP 入站 expectedPlatform 验签的声明来源；一个平台同时只允许
+  // 一个 enabled 的动作接收者（装载器校验）。resource 服务不声明。
+  platform: z.string().regex(/^[a-z][a-z0-9-]{0,31}$/).optional(),
+  // 平台→DSH agent preset 声明（形如 { qq: 'qq-chat' }）。
+  //
+  // 为什么在适配器侧：预设是「这个平台该用哪个人设」，属于平台知识；网关若自己
+  // 维护平台映射表，就等于把身份知识抄了一份（2026-11-16 起单一来源）。
+  // 网关只做两件事：按 adapter 的声明去 DSH 清单里核对，不在清单里就回退 minimal。
+  // 注意：这里只是**名字**；预设内容的编辑与安装归消费端适配器（dsh/<平台>/**
+  // + install:preset）。
+  presets: presetsDeclarationSchema.optional(),
   enabled: z.boolean().default(true),
 }).refine((value) => value.transport !== 'http' || (typeof value.url === 'string' && value.url.length > 0), {
   message: 'transport "http" requires url',
   path: ['url'],
+}).refine((value) => value.kind !== 'consumer' || typeof value.platform === 'string', {
+  message: 'consumer registrations must declare "platform" (action session targeting + inbound signature check)',
+  path: ['platform'],
 }).refine(
-  // 带 decorator/filter 角色的工具要求服务级 kind 对应：filter 服务不该声明
-  // decorator 工具，反之亦然——两层声明不能互相矛盾。
-  (value) => (value.tools ?? []).every((tool) => tool.roles.every((role) => role === 'tool' || role === value.kind)),
-  { message: 'tools with "decorator"/"filter" roles require the service kind to match', path: ['tools'] },
+  // 资源服务纯被动：只接受网关的 HTTP tool.call，不向网关发消息——WS 能力
+  // 已退役（网关侧 ws-hub 的 tool.call 帧与资源侧连接器均已拆除），配置
+  // ws/auto 属配置错误（迁移文案由 parseServiceRegistration 前置给出）。
+  (value) => value.kind !== 'resource' || value.transport === 'http',
+  { message: 'resource registrations only support transport "http" (gateway → service tool.call)', path: ['transport'] },
+).refine(
+  // 管线型工具（decorator/filter role）只属于 resource 服务：装饰/过滤职责
+  // 由 role 声明，服务级 kind 只区分 consumer/resource——consumer 不该声明
+  // 管线型工具（两层声明不能互相矛盾）。
+  (value) => (value.tools ?? []).every((tool) => tool.role === 'tool' || value.kind === 'resource'),
+  { message: 'tools with "decorator"/"filter" roles require kind "resource"', path: ['tools'] },
 );
 
 /**
@@ -585,10 +665,6 @@ export function parseToolResult(value) {
   return parseWith(toolResultSchema, value, 'toolResult');
 }
 
-export function parseServiceCallRequest(value) {
-  return parseWith(serviceCallRequestSchema, value, 'serviceCallRequest');
-}
-
 // V2 P3：网关 → 已登记服务的工具调用（tool.call）。形状与 DSH→网关的
 // toolCallSchema 同构，但有两点刻意差异：**没有 turnToken**——安全链不下放
 //（不变量 §5.2：令牌铸造与校验永远在网关侧完成，服务只见会话标识不见凭据）；
@@ -602,10 +678,25 @@ export const serviceToolCallSchema = z.strictObject({
   // 会话上下文随调用下发（服务按 sessionKey 隔离数据）；不含任何凭据字段。
   sessionKey: idText(256).optional(),
   turnId: idText(128).optional(),
+  // 统一改造新增：调用方身份与工作文本。senderId = 发送者平台用户 id（QQ 号/
+  // OneBot user_id，来自 message.sender.id；出站消息与合成事件可缺省）；
+  // text = 仅 filter 调用时由网关下发的当前工作文本（decorator/tool 调用不带）。
+  // firstTurn/direction 已随 service.call 下线（无服务端消费；首轮语义由网关
+  // once 规则 + epoch 去重覆盖）。
+  context: z.strictObject({
+    senderId: idText(128).optional(),
+    text: z.string().max(20000).optional(),
+  }).optional(),
 });
 
-export function parseServiceCallResult(value) {
-  return parseWith(serviceCallResultSchema, value, 'serviceCallResult');
+/** 管线 decorator 步骤结果解析（toolResult.data 的对偶校验）。 */
+export function parseDecoratorResult(value) {
+  return parseWith(decoratorResultSchema, value, 'decoratorResult');
+}
+
+/** 管线 filter 步骤结果解析（toolResult.data 的对偶校验）。 */
+export function parseFilterResult(value) {
+  return parseWith(filterResultSchema, value, 'filterResult');
 }
 
 export function parseServiceToolCall(value) {
@@ -613,6 +704,42 @@ export function parseServiceToolCall(value) {
 }
 
 export function parseServiceRegistration(value) {
+  // 资源服务传输非对称护栏：strictObject 对交叉约束的报错不够可操作，
+  // resource + ws/auto 在这里先行拦截并给迁移文案（fail-closed：启动装载/
+  // 热加载/控制台写入三处共用）。消费端不受限（ws/http/auto 三态合法）。
+  if (value?.kind === 'resource' && typeof value?.transport === 'string' && value.transport !== 'http') {
+    throw new ContractError(
+      'E_SCHEMA',
+      `serviceRegistration invalid: kind "resource" with transport "${value.transport}" is not supported — resource services are passive `
+        + `(gateway → service HTTP tool.call only, WS is retired for resources); migrate "transport": "${value.transport}" → "transport": "http"`,
+      [{ path: 'transport', message: 'resource transport ws/auto is no longer legal' }],
+    );
+  }
+  // 旧 kind fail-closed 拒载：strictObject 对非法 enum 的报错不够可操作，
+  // decorator/filter/shadow 在这里先行拦截并给迁移文案（fail-closed：启动
+  // 装载/热加载/控制台写入三处共用）。
+  const legacyKind = typeof value?.kind === 'string'
+    && ['decorator', 'filter', 'shadow'].includes(value.kind) ? value.kind : null;
+  if (legacyKind) {
+    throw new ContractError(
+      'E_SCHEMA',
+      `serviceRegistration invalid: kind "${legacyKind}" is retired — registration kinds are now consumer|resource `
+        + `(tool roles tool|decorator|filter carry the decorator/filter duties); migrate "kind": "${legacyKind}" → "kind": "resource"`,
+      [{ path: 'kind', message: 'kind decorator/filter/shadow is no longer legal' }],
+    );
+  }
+  // 单值 role 硬切护栏：strictObject 对未知键的报错不够可操作，roles 数组在这里
+  // 先行拦截并给出迁移文案（fail-closed：启动装载/热加载/控制台写入三处共用）。
+  for (const tool of Array.isArray(value?.tools) ? value.tools : []) {
+    if (tool && typeof tool === 'object' && 'roles' in tool) {
+      throw new ContractError(
+        'E_SCHEMA',
+        `serviceRegistration invalid: tool "${tool?.name ?? '?'}" declares a "roles" array — "role" is now a single value (one of tool|decorator|filter); `
+        + 'migrate e.g. "roles": ["tool","decorator"] → "role": "decorator" (one role per tool)',
+        [{ path: `tools.roles`, message: 'roles array is no longer legal' }],
+      );
+    }
+  }
   return parseWith(serviceRegistrationSchema, value, 'serviceRegistration');
 }
 
@@ -644,7 +771,20 @@ export function inboundIdempotencyKey(envelope, adapterId) {
   return adapterId ? `${adapterId}:${base}` : base;
 }
 
-/** 由入站推导会话键，例如 `qq:group:123`。记忆服务的 sessionId 用同一形状。 */
-export function sessionKeyOf(envelope) {
-  return `${envelope.platform}:${envelope.conversation.kind}:${envelope.conversation.id}`;
+/**
+ * 由入站推导会话键（多消费端收编）：带 consumerId 时为 4 段
+ * `platform:consumerId:kind:id`（如 `qq:svc-a3f2b9c1d4e5:group:123`）——**会话绑
+ * 消费端**（「dsh 开启会话是对应消费端的会话」）：同群双账号各自成会话，记忆/
+ * once 规则/白名单不串号；动作下行由会话键第 2 段直接定位消费端（见
+ * session.parseSessionKey 与 adapter-tools executor 的 byConsumer 路由）。
+ * 不带 consumerId 时为旧 3 段 `platform:kind:id`（无消费端上下文的调用方兼容；
+ * 存量数据按旧键读取）。记忆服务的 sessionId 用同一形状（session-id.js 已放宽
+ * 为 3/4 段皆可，platform 恒为首段——subject 身份层按 platform+subject_id 全局
+ * 共享，「物理一个人」不变式不受影响）。
+ */
+export function sessionKeyOf(envelope, { consumerId } = {}) {
+  const base = `${envelope.conversation.kind}:${envelope.conversation.id}`;
+  return consumerId
+    ? `${envelope.platform}:${consumerId}:${base}`
+    : `${envelope.platform}:${base}`;
 }

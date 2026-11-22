@@ -1,9 +1,11 @@
 /**
  * V2 客户端通道：WebSocket 长连接枢纽（core，基于 ws 包）。
  *
- * 为什么要 WS：消费者（V2 词典，原「适配器」）与装饰器/过滤器服务的通讯是
- * 高频双向流（入站、动作回执、service.call），HTTP 逐请求 HMAC 握手浪费大。
- * WS 建连一次、签名验一次，之后帧内走业务；HTTP 端点全部保留为备用。
+ * 为什么要 WS：消费者（kind=consumer，V2 词典原「适配器」）与网关是高频双向流
+ * （入站信封 ↑ / 动作下行 ↓），HTTP 逐请求 HMAC 握手浪费大——WS 建连一次、
+ * 签名验一次，之后帧内走业务；HTTP 端点全部保留为备用。
+ * 传输按角色非对称：资源服务（kind=resource）纯被动，只有网关 → 资源的 HTTP
+ * tool.call 一条通道，WS 是消费端专属（本枢纽的帧协议只有 inbound/action/ping）。
  *
  * 实现边界（读这里之前先读 docs/design/GATEWAY_V2_REFACTOR.md）：
  *   - 帧编解码/分片/ping-pong/close 交给 ws 包（v0.2 起不再手写 RFC6455，
@@ -30,7 +32,8 @@ const MAX_PAYLOAD_BYTES = 4 * 1024 * 1024;
  * @param {object} options
  * @param {import('node:http').Server} options.server     已存在的 http server
  * @param {string}   options.path                         upgrade 路径（如 /v1/ws）
- * @param {Map<string,object>} options.clientsById        消费者/服务登记表（config.adapters 建出）
+ * @param {Map<string,object>} options.clientsById        消费端身份表（server 由 service-registry.consumerById 建出，
+ *        仅 kind=consumer——资源服务无 WS 能力，握手在身份表层面即拒）
  * @param {ReturnType<import('./auth.mjs').createNonceCache>} options.nonceCache
  * @param {Function} options.onInbound                    (parsed envelope) → {turnId,status,...}
  * @param {Function} [options.logger]
@@ -47,7 +50,7 @@ export function createWsHub({
   const wss = new WebSocketServer({ noServer: true, maxPayload: MAX_PAYLOAD_BYTES });
   /** @type {Map<string, Set<object>>} adapterId → 连接集合（同客户端允许并发重连） */
   const byId = new Map();
-  /** V2 P2：service.call 在途请求（callId → pending）。连接断开/超时都要清理。 */
+  /** 在途请求（callId → pending）：action 下行。连接断开/超时都要清理。 */
   const pendingCalls = new Map();
   /** 进入过 handleUpgrade 的 socket 台账：upgrade 请求的 socket 会被 Node 摘出
    *  HTTP 连接追踪，server.closeAllConnections() 管不到它们；close() 必须自己清。 */
@@ -90,7 +93,7 @@ export function createWsHub({
     entry.ws.send(JSON.stringify(payload));
   }
 
-  /** 连接断开时拒掉该连接上的全部在途请求（service.call / action；调用方走 degraded 放行）。 */
+  /** 连接断开时拒掉该连接上的全部在途请求（action 下行；调用方回落 HTTP）。 */
   function rejectPendingFor(entry, error) {
     for (const [callId, pending] of pendingCalls) {
       if (pending.entry !== entry) continue;
@@ -201,33 +204,10 @@ export function createWsHub({
       sendJson(entry, { v: 1, type: 'pong', at: now() });
       return;
     }
-    if (message?.type === 'service.call/result' || message?.type === 'tool.call/result') {
-      const kind = message.type === 'tool.call/result' ? 'tool.call' : 'service.call';
-      const pending = typeof message.callId === 'string' ? pendingCalls.get(message.callId) : null;
-      // 未知/过期/连接不符的回执：只计数不打断——伪造帧不该影响别的调用。
-      if (!pending || pending.entry !== entry || (pending.kind && pending.kind !== kind)) {
-        inc('error');
-        return;
-      }
-      clearTimeout(pending.timer);
-      pendingCalls.delete(message.callId);
-      if (kind === 'tool.call') {
-        // tool.call 的业务失败（ok:false + error）是正常结果而非传输错误——
-        // 原样回传（与 toolResultSchema 同形状），callId 核对在 registry 做。
-        pending.resolve({
-          callId: message.callId,
-          ok: message.ok === true,
-          data: message.data,
-          error: message.error,
-        });
-      } else if (message.ok) {
-        pending.resolve(message.result ?? null);
-      } else {
-        pending.reject(new ContractError(
-          message.error?.code ?? 'E_INTERNAL',
-          String(message.error?.message ?? 'service.call failed'),
-        ));
-      }
+    if (message?.type === 'pong') {
+      // 应用层心跳对端回执：判活用的 lastFrameAt 已在 dispatch 开头刷新，这里静默
+      // 吸收即可。此前未处理会落到「unknown frame type」分支回 error 帧——每 30s
+      // 一次把消费端日志刷成 E_SCHEMA 噪音，并污染 metrics.error 计数。
       return;
     }
     if (message?.type === 'action/result') {
@@ -288,7 +268,7 @@ export function createWsHub({
 
   return {
     path,
-    /** 网关主动向某客户端推帧（P2 起用于 action / service.call；无连接返回 false）。 */
+    /** 网关主动向某客户端推帧（action 下行；无连接返回 false）。 */
     sendTo(id, payload) {
       const set = byId.get(id);
       if (!set || set.size === 0) return false;
@@ -309,48 +289,7 @@ export function createWsHub({
     },
 
     /**
-     * V2 P2：向客户端发起一次 service.call 并等待回执（请求-响应关联）。
-     * 帧形态：出 `{ v:1, type:'service.call', ...request }`，
-     * 回 `{ v:1, type:'service.call/result', callId, ok, result?|error? }`。
-     * 超时/连接断开/重复 callId 都以 ContractError 拒绝，由调用方（service-registry）
-     * 统一翻译成 degraded。响应体的契约校验在 registry 做（本层只管传输）。
-     *
-     * @param {string} id         客户端（服务）id
-     * @param {object} request    必须含 callId（调用方生成）
-     * @param {number} timeoutMs
-     * @param {'service.call'|'tool.call'} [kind] 帧类型（V2 P3 加 tool.call：
-     *        出 `{v:1, type:'tool.call', ...}`，回 `{v:1, type:'tool.call/result', callId, ok, data?|error?}`，
-     *        失败回执作为结果原样回传）
-     */
-    callService(id, request, timeoutMs = 8000, kind = 'service.call') {
-      return new Promise((resolve, reject) => {
-        const set = byId.get(id);
-        const entry = set ? [...set].find((e) => e.ws.readyState === 1) : null;
-        if (!entry) {
-          reject(new ContractError('E_DISABLED', `no open ws connection for "${id}"`));
-          return;
-        }
-        const callId = request?.callId;
-        if (typeof callId !== 'string' || !callId) {
-          reject(new ContractError('E_SCHEMA', 'service.call request requires callId'));
-          return;
-        }
-        if (pendingCalls.has(callId)) {
-          reject(new ContractError('E_DUP', `duplicate service.call id: ${callId}`));
-          return;
-        }
-        const timer = setTimeout(() => {
-          pendingCalls.delete(callId);
-          reject(new ContractError('E_TIMEOUT', `${kind} "${callId}" to "${id}" timed out after ${timeoutMs}ms`));
-        }, timeoutMs);
-        timer.unref?.();
-        pendingCalls.set(callId, { entry, resolve, reject, timer, kind });
-        sendJson(entry, { v: 1, type: kind, ...request });
-      });
-    },
-
-    /**
-     * 动作下行（网关 → 消费者，与 service.call 同构的请求-响应关联）：
+     * 动作下行（网关 → 消费者，请求-响应关联）：
      * 出 `{ v:1, type:'action', callId, envelope, sign }`，
      * 回 `{ v:1, type:'action/result', callId, ...receipt }`。
      *
@@ -398,7 +337,7 @@ export function createWsHub({
       // 先拒掉在途请求再拆连接，调用方不等 close 回调就能收到失败。
       for (const pending of pendingCalls.values()) {
         clearTimeout(pending.timer);
-        pending.reject(new ContractError('E_DISABLED', 'ws hub closed while service.call pending'));
+        pending.reject(new ContractError('E_DISABLED', 'ws hub closed while a call was pending'));
       }
       pendingCalls.clear();
       for (const set of byId.values()) {

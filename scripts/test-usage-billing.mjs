@@ -13,6 +13,9 @@ const { createTokenLedger } = await import(new URL('../src/core/usage-ledger.mjs
 const { resolvePriceTable } = await import(new URL('../src/core/prices.mjs', import.meta.url).href);
 const { loadConfig } = await import(new URL('../src/core/config.mjs', import.meta.url).href);
 const { createGatewayServer } = await import(new URL('../src/core/server.mjs', import.meta.url).href);
+const { seedConsumer, seedOperatorToken, createConsumerRegistry } = await import(
+  new URL('./support/consumer-registration.mjs', import.meta.url).href
+);
 
 const TOKEN = 'test-operator-token-0123456789';
 const ADAPTERS = [
@@ -78,11 +81,18 @@ test('usage-ledger: 空桶采样拒收 / reset 需走服务端确认 / 逐轮明
 
 async function startServer({ ledger, records = [] }) {
   const stateDir = mkdtempSync(path.join(os.tmpdir(), 'gw-billing-'));
+  // 消费端身份只认登记目录（两个账号 = 两份 kind=consumer 登记）。
+  for (const adapter of ADAPTERS) {
+    seedConsumer(stateDir, {
+      id: adapter.id, platform: adapter.platform, secret: adapter.secret, url: 'http://127.0.0.1:3100',
+    });
+  }
+  // 控制台凭据文件单源（env 通道已退役）。
+  seedOperatorToken(stateDir, TOKEN);
   const config = loadConfig({
     // GATEWAY_PORT=0：每个用例独立临时端口——同进程串行起多台服务器时，
     // 固定端口会让 undici 连接池复用到上一台（已关闭）的半死连接上，报 ECONNRESET。
-    env: { GATEWAY_MODE: 'shadow', GATEWAY_CONSOLE: 'on', GATEWAY_OPERATOR_TOKEN: TOKEN, GATEWAY_PORT: '0' },
-    adapters: ADAPTERS,
+    env: { GATEWAY_MODE: 'shadow', GATEWAY_CONSOLE: 'on', GATEWAY_PORT: '0' },
     stateDir,
   });
   if (records.length > 0) {
@@ -97,6 +107,7 @@ async function startServer({ ledger, records = [] }) {
     config,
     logger: () => {},
     runtime: { usageLedger: ledger },
+    services: createConsumerRegistry({ stateDir }),
   });
   await gateway.listen();
   return {
@@ -237,14 +248,12 @@ test('config: GATEWAY_PRICING 覆盖进价目表', () => {
   const stateDir = mkdtempSync(path.join(os.tmpdir(), 'gw-pricing-'));
   const config = loadConfig({
     env: { GATEWAY_PRICING: JSON.stringify({ peakMultiplier: 2 }) },
-    adapters: ADAPTERS,
     stateDir,
   });
   const table = resolvePriceTable(config.pricing);
   assert.equal(table.peakMultiplier, 2);
   assert.throws(() => loadConfig({
     env: { GATEWAY_PRICING: 'not-json' },
-    adapters: ADAPTERS,
     stateDir,
   }), /GATEWAY_PRICING/);
 });

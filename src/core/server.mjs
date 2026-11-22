@@ -25,13 +25,36 @@ import {
   safeEqualString, issueOperatorSession, verifyOperatorSession,
   operatorCookieHeader, OPERATOR_COOKIE, OPERATOR_TOKEN_PATTERN,
 } from './auth.mjs';
-import { ContractError, parseInbound, parseToolCall, parseToolResult, parseStateUpdate, parseServiceRegistration, newRegistrationId, inboundIdempotencyKey, sessionKeyOf } from './contracts.mjs';
+import { ContractError, parseInbound, parseToolCall, parseToolResult, parseStateUpdate, parseServiceRegistration, newRegistrationId, newConsumerRegistrationId, inboundIdempotencyKey, sessionKeyOf } from './contracts.mjs';
 import { assertLoopbackUrl } from './service-registry.mjs';
+import {
+  buildHandoffDocument, handoffPath, handoffExists, removeHandoff, resolveGatewayBaseUrl, writeHandoff,
+} from './gateway-json.mjs';
 import { createIdempotency } from './idempotency.mjs';
 import { createTurnStore } from './turn-store.mjs';
 import { createMetrics } from './metrics.mjs';
-import { configSummary, isConversationAllowed } from './config.mjs';
+import { configSummary } from './config.mjs';
+// FALLBACK_PRESET（'minimal'）现在从 contracts 取——它只是「声明的 preset 没装时
+// 回退到 DSH 内置无人格预设」的语义常量，不属于任何平台知识。
+import { FALLBACK_PRESET } from './contracts.mjs';
+import { generateSecret } from './secrets.mjs';
+import { upsertEnvValue } from './env-file.mjs';
 import { createWsHub } from './ws-hub.mjs';
+
+/**
+ * 控制台回显的平台 → 预设映射。
+ *
+ * 2026-11-16 起不再由网关持有映射表：只把**适配器登记的 presets 声明**摊平回显，
+ * 与 session-registry 建会话时的取值同源，不会漂移。没有声明就是空对象。
+ */
+function platformPresetSummary(services) {
+  const out = {};
+  for (const entry of services?.services?.() ?? []) {
+    if (entry.kind !== 'consumer' || !entry.presets) continue;
+    for (const [platform, preset] of Object.entries(entry.presets)) out[platform] = preset;
+  }
+  return out;
+}
 
 export function createGatewayServer({
   config, logger = () => {}, now = Date.now, runtime = null, services = null,
@@ -39,32 +62,42 @@ export function createGatewayServer({
   pipeline = null,
   // §6 记忆落库调度器（runtime 注入，core 不 import）：入站观察点。null = 不落库。
   memoryIngest = null,
+  // turn 索引：runner 与 server 必须共用同一实例（runner 写终态、server 读列表；
+  // 两份实例各写各的缓冲，轮转判断与读己之写都会错）。null = 自建（旧调用方/测试）。
+  turns: turnStore = null,
+  // GATEWAY_DATA_PLANE 开关的持久化目标：main 启动时实际装载的 env 文件路径
+  //（GATEWAY_ENV_FILE 或包根 .env）。null = 无法持久化（端点回 persisted:false）。
+  envFile = null,
 } = {}) {
-  const adaptersById = new Map(config.adapters.map((adapter) => [adapter.id, adapter]));
-  // V2 P2：装饰器/过滤器服务与消费者同构连入 WS（同一握手鉴权）。合并登记表
-  // 交给 ws-hub；HTTP 侧的 authenticate 不合并——服务不走 /v1/inbound（它们
-  // 是被调用方，回执走 service.call/result 帧）。
+  // 消费端身份统一活视图（登记目录 = 唯一事实源）：
+  //   services.consumerById（service-registry consumers()）：登记 kind=consumer
+  //   条目，自带 platform/secret。HTTP 入站验签（authenticate）、WS 握手身份等
+  //   所有「谁是合法消费端」的判定全部消费这一份视图。
+  // services 未装配时无消费端身份可用（mode=off 不置配 registry，也不受理入站）。
+  const consumerOf = (id) => services?.consumerById?.(id) ?? undefined;
+  // 消费端连入 WS（同一握手鉴权）。合并登记表交给 ws-hub。
   // V2 P3：登记是活的（服务可随时通过登记目录注册/卸载），握手身份表必须
   // 同样是活视图——启动时快照 Map 会让热注册的 WS 服务永远握不上手。
   // ws-hub 只用 clientsById.get(id)（握手取 secret），一个 get 视图即可。
-  const wsClientsById = services
-    ? {
-      get(id) {
-        if (adaptersById.has(id)) return adaptersById.get(id);
-        const service = services.resolveService(id);
-        return service && service.enabled !== false
-          ? { id: service.id, kind: service.kind, platform: null, secret: service.secret }
-          : undefined;
-      },
-    }
-    : adaptersById;
+  // 传输非对称：WS 是消费端专属（双向流）——资源服务（kind=resource）纯被动
+  // （网关 → 资源的 HTTP tool.call），其 id 不放行握手：get 返回 undefined →
+  // 401 unknown client（不泄露「谁存在」）。
+  const wsClientsById = {
+    get(id) {
+      const consumer = consumerOf(id);
+      if (consumer) {
+        return { id: consumer.id, kind: 'consumer', platform: consumer.platform ?? null, secret: consumer.secret };
+      }
+      return undefined;
+    },
+  };
   const nonceCache = createNonceCache({ windowMs: config.replayWindowMs });
   // P3：MCP 薄壳（mcp-bus）的独立 nonce 缓存——与适配器共用会互相挤占容量，
   // 分开还能在 metrics 里区分两类调用方的重放行为。
   const toolNonceCache = createNonceCache({ windowMs: config.replayWindowMs });
   const metrics = createMetrics();
   const idempotency = createIdempotency({ file: config.idempotencyFile, logger });
-  const turns = createTurnStore({ file: config.turnsFile, logger });
+  const turns = turnStore ?? createTurnStore({ file: config.turnsFile, logger });
   const startedAt = Date.now();
 
   /**
@@ -90,7 +123,8 @@ export function createGatewayServer({
     }
 
     const turnId = `turn_${randomUUID()}`;
-    const sessionKey = sessionKeyOf(envelope);
+    // 会话键带消费端维度（4 段）：同一群的双账号各自成会话（多账号收编）。
+    const sessionKey = sessionKeyOf(envelope, { consumerId: adapterId });
     // 路由决策在落盘前做出：status 是这条入站的最终归属，改口比改记录贵。
     let status;
     let note;
@@ -99,16 +133,17 @@ export function createGatewayServer({
     } else if (!runtime) {
       status = 'queued';
       note = 'dsh pipeline pending (P1)';
-    } else if (!isConversationAllowed(config, sessionKey)) {
-      status = 'unrouted';
-      note = 'conversation not whitelisted; adapter keeps local path';
     } else {
+      // 白名单不在这里：号码级放行由适配器裁决，能走到这儿的入站都已签名验过，
+      // 且适配器已按自己的 allow/deny 筛过一轮（2026-11-16 起单源）。
       status = 'accepted';
     }
     const record = {
       v: 1,
       turnId,
       sessionKey,
+      // 上报方消费端 id（观测投影/审计用；会话键第 2 段与其一致）。
+      adapterId: adapterId ?? null,
       status,
       // 信封整体保留：P1 管线需要 message 之外的字段（traceId、sender.roles）。
       // 在这里挑字段然后发现漏了，代价远高于存全量。
@@ -141,7 +176,9 @@ export function createGatewayServer({
 
   function authenticate(req, body, declaredPlatform) {
     const adapterId = req.headers['x-adapter-id'];
-    const adapter = typeof adapterId === 'string' ? adaptersById.get(adapterId) : undefined;
+    // 消费端统一活视图：登记目录 kind=consumer（热注册/卸载即时生效）。
+    // expectedPlatform 来自登记 platform 声明。
+    const adapter = typeof adapterId === 'string' ? consumerOf(adapterId) : undefined;
     // 不存在与签名错误返回同一个 code，避免枚举适配器。
     if (!adapter) throw new AuthError('E_AUTH', 'unknown adapter');
     return verifyRequest({
@@ -158,7 +195,7 @@ export function createGatewayServer({
   }
 
   /**
-   * P3：工具调用方的鉴权。mcp-bus 不是适配器（不占 adapters.json 名额），
+   * P3：工具调用方的鉴权。mcp-bus 不是消费端（不占登记名额），
    * 但走同一套 HMAC 签名格式——共享密钥来自 config.tools.busSecret，
    * adapterId 固定 'mcp-bus'。签名格式一致意味着将来用别的语言实现薄壳时
    * 不需要新的鉴权实现。
@@ -192,6 +229,13 @@ export function createGatewayServer({
 
   function verifyOperator(req) {
     const header = req.headers['x-operator-token'];
+    // fail-closed（2026-11-21 审计修复）：operatorToken 为空（GATEWAY_CONSOLE=off
+    // 且 token 文件缺失）时，safeEqualString('', '') 对空 header 恒真——必须先挡，
+    // 否则 off 状态下可达的 verifyOperator 路由被空头绕过。
+    if (!config.console.operatorToken) {
+      metrics.inc('console_auth_total', { result: 'disabled' });
+      throw new ContractError('E_FORBIDDEN', 'operator auth disabled (empty operator token)');
+    }
     if (typeof header === 'string' && safeEqualString(header, config.console.operatorToken)) {
       metrics.inc('console_auth_total', { result: 'ok' });
       return { via: 'token' };
@@ -236,24 +280,8 @@ export function createGatewayServer({
     return true;
   }
 
-  /** 预设备份目录：state/gateway/preset-backups（不在 DSH 子树内）。 */
-  function presetBackupDir() {
-    return path.join(config.stateDir, 'preset-backups');
-  }
-
-  /** 预设文件层错误 → HTTP：找不到 404；防呆拒绝 400 E_POLICY；其余 500。 */
-  function classifyPresetError(res, error) {
-    const message = String(error?.message ?? error);
-    if (/找不到预设文件|找不到 persona/.test(message)) {
-      sendError(res, 404, 'E_SCHEMA', message);
-      return;
-    }
-    if (/缺少安全不变量|过短|不能为空|过长|不一致，已放弃写入|没有可用的备份|拒绝还原|无法定位/.test(message)) {
-      sendError(res, 400, 'E_POLICY', message);
-      return;
-    }
-    sendError(res, 500, 'E_INTERNAL', message);
-  }
+  // 预设文件层（备份目录 presetBackupDir / 错误分类 classifyPresetError）已随
+  // 预设所有权迁到桥接（2026-11-16）；网关只回显活 DSH 的预设清单。
 
   /** 双通道鉴权（/v1/turns、/v1/usage 等控制台读端点）：适配器 HMAC 或 operator 二选一。 */
   function authenticateDual(req, rawBody, declaredPlatform) {
@@ -293,6 +321,50 @@ export function createGatewayServer({
     });
   }
 
+  /** 交接文件视图（控制台列表）：非法 id 不抛，降级为 exists:false。 */
+  function handoffView(id) {
+    try {
+      return {
+        file: handoffPath({ stateDir: config.stateDir, id }),
+        exists: handoffExists({ stateDir: config.stateDir, id }),
+      };
+    } catch {
+      return { file: null, exists: false };
+    }
+  }
+
+  /**
+   * 为登记服务生成可复制的 gateway.json（交接文件）。
+   *
+   * 落 `<stateDir>/handoff/`，**不是** `<stateDir>/services/`：后者只认 `<id>.json`，
+   * 多一个 `.gateway.json` 会被登记扫描当成「文件名与内部 id 不符」的坏登记。
+   * 内联密钥 → 文件引用 `secrets/<id>.secret`（明文不复制出去）；`secretEnv`
+   * 登记时网关没有明文 → 只留 authNote，让对端一眼看出缺什么。
+   */
+  function emitServiceHandoff({ id, secret, secretEnv, transport }) {
+    // 端口以「实际监听」为准：配置为 0 时由内核分配，写 0 进交接文件等于给对端一个死地址。
+    const port = server.address()?.port ?? config.port;
+    const doc = buildHandoffDocument({
+      kind: 'service',
+      id,
+      url: resolveGatewayBaseUrl({ host: config.host, port }),
+      // transport 与登记同源：resource 固定 http（对端 gateway-config 只认 http），
+      // consumer ws/http/auto 合法——硬编码 auto 会让 resource 的交接文件被对端拒载。
+      transport: transport ?? 'auto',
+      ...(typeof secret === 'string' && secret
+        ? { secretFile: path.join(config.stateDir, 'secrets', `${id}.secret`) }
+        : {}),
+      ...(secretEnv
+        ? { authNote: `登记使用 secretEnv=${secretEnv}（网关不落明文）：请在目标仓 gateway.json 里补 secret，或改用内联密钥重新注册。` }
+        : {}),
+    });
+    const { filePath } = writeHandoff({ stateDir: config.stateDir, doc, force: true });
+    return {
+      filePath,
+      auth: doc.secret ? 'inline' : (doc.secretFile ? 'secretFile' : 'missing'),
+    };
+  }
+
   function sendJson(res, status, payload) {
     const body = JSON.stringify(payload);
     res.writeHead(status, {
@@ -325,7 +397,12 @@ export function createGatewayServer({
     if (req.method !== 'GET') return false;
     let rel = null;
     if (pathname === '/' || pathname === '/console' || pathname === '/console/') rel = 'index.html';
-    else if (pathname.startsWith('/console/')) rel = decodeURIComponent(pathname.slice('/console/'.length));
+    else if (pathname.startsWith('/console/')) {
+      // 2026-11-21 审计修复：畸形百分号序列（%ZZ）会让 decodeURIComponent 抛
+      // URIError → 未捕获 500；降级用原样路径（404 由后续读取失败兜底）。
+      try { rel = decodeURIComponent(pathname.slice('/console/'.length)); }
+      catch { rel = pathname.slice('/console/'.length); }
+    }
     else return false;
     if (config.console.mode !== 'on') {
       sendError(res, 404, 'E_SCHEMA', 'not found');
@@ -395,6 +472,9 @@ export function createGatewayServer({
             service: 'agent-gateway',
             version: 1,
             mode: config.mode,
+            // 数据面（消息管线）是否放行：常驻装配后 mode 只是请求期门禁，
+            // 探针据此区分「运行时没装」和「门禁关着」。
+            dataPlane: config.mode !== 'off' ? 'active' : 'disabled',
             turns: turns.size,
             ws: wsHub ? { mode: 'on', path: config.ws.path, clients: wsHub.status().clients } : { mode: 'off' },
             // 只回开关状态：部署探针要能区分「管线没开」和「服务没连上」，
@@ -417,7 +497,6 @@ export function createGatewayServer({
             ? { connected: runtime.connected === true, managed: true, runtime: runtime.status() }
             : { connected: false, managed: false },
           turns: turns.size,
-          whitelistedConversations: config.conversations.length,
           tools: config.tools.mode === 'on'
             ? { mode: 'on', ...(runtime?.toolStatus?.() ?? {}) }
             : { mode: 'off' },
@@ -431,9 +510,15 @@ export function createGatewayServer({
           pipeline: config.pipeline.mode === 'on'
             ? { mode: 'on', ...(runtime?.pipelineStatus?.() ?? {}) }
             : { mode: 'off' },
-          // 与 /v1/metrics 的 configSummary 同源：健康检查要能看出「谁登记了、
-          // 声明了哪些能力、动作回投到哪」，否则灰度期只能靠猜。
-          adapters: configSummary(config).adapters,
+          // 消费端视图（登记目录 kind=consumer）：健康检查要能看出「谁登记了、
+          // 平台是什么、启停状态」，否则灰度期只能靠猜。
+          adapters: services?.consumers?.().map(({ id, platform, callbackBase, transport, source }) => ({
+            id,
+            platform,
+            transport,
+            source,
+            actionsEndpoint: callbackBase ? `${callbackBase}/v1/actions` : null,
+          })) ?? [],
         });
         return;
       }
@@ -513,7 +598,10 @@ export function createGatewayServer({
           return;
         }
         authenticate(req, rawBody);
-        const sessionKey = decodeURIComponent(pathname.slice('/v1/state/'.length));
+        // 2026-11-21 审计修复：畸形百分号序列 → URIError 未捕获 500；包 try 返 400。
+        let sessionKey;
+        try { sessionKey = decodeURIComponent(pathname.slice('/v1/state/'.length)); }
+        catch { sendError(res, 400, 'E_SCHEMA', 'malformed percent-encoding in session key'); return; }
         if (!sessionKey) {
           sendError(res, 400, 'E_SCHEMA', 'sessionKey is required');
           return;
@@ -661,107 +749,31 @@ export function createGatewayServer({
         }
       }
 
-      // ── DSH 控制面：预设清单 + 仿真提示词（docs/console/dsh-presets/PLAN.md）──
-      // 数据源：清单 = DSH agentPresets.list（活 DSH）；文件 = DSH home 的
-      // agent-presets 子树（preset-files.mjs，防呆在文件层）。白名单与
+      // ── DSH 控制面：预设清单（只读回显）────────────────────────────────────
+      // 预设**文件层**（仿真提示词编辑/备份/还原）随预设所有权一起迁到了桥接
+      // （2026-11-16），网关这里只回显活 DSH 的 agentPresets.list——它与
       // session-registry 的 ensurePresetAllowed 同源（同一个活 DSH 清单）。
-      if (pathname === '/v1/console/dsh/presets' || pathname.startsWith('/v1/console/dsh/presets/')) {
+      if (pathname === '/v1/console/dsh/presets') {
         if (consoleDisabled(res)) return;
         verifyOperator(req);
-        const presetFiles = runtime?.presetFiles;
         const listLive = runtime?.consoleDsh?.presetsList;
-        const presetMatch = /^\/v1\/console\/dsh\/presets\/([A-Za-z0-9_-]{1,64})(\/sim-prompt)?(\/backups|\/restore)?$/.exec(pathname);
-        if (req.method === 'GET' && pathname === '/v1/console/dsh/presets') {
-          let ids = null;
-          let dshError = null;
-          try {
-            ids = await listLive();
-          } catch (error) {
-            dshError = String(error?.message ?? error);
-          }
-          if (ids === null) {
-            sendError(res, 503, 'E_DSH_DOWN', `DSH 预设清单不可用：${dshError ?? '未知原因'}`);
-            return;
-          }
-          sendJson(res, 200, {
-            ok: true,
-            source: 'dsh',
-            presets: ids.map((id) => ({
-              id,
-              editable: presetFiles ? Boolean(presetFiles.describePreset(id).installed) : false,
-              ...(presetFiles ? presetFiles.describePreset(id) : {}),
-            })),
-          });
+        let ids = null;
+        let dshError = null;
+        try {
+          ids = await listLive();
+        } catch (error) {
+          dshError = String(error?.message ?? error);
+        }
+        if (ids === null) {
+          sendError(res, 503, 'E_DSH_DOWN', `DSH 预设清单不可用：${dshError ?? '未知原因'}`);
           return;
         }
-        if (presetMatch) {
-          const presetId = presetMatch[1];
-          const sub = presetMatch[2] ?? '';
-          const tail = presetMatch[3] ?? '';
-          if (!presetFiles) {
-            sendError(res, 503, 'E_DISABLED', 'preset file layer not wired (runtime.presetFiles missing)');
-            return;
-          }
-          if (req.method === 'GET' && !sub) {
-            sendJson(res, 200, { ok: true, ...presetFiles.describePreset(presetId) });
-            return;
-          }
-          if (req.method === 'GET' && sub === '/sim-prompt' && !tail) {
-            try {
-              sendJson(res, 200, { ok: true, ...presetFiles.readSimPrompt(presetId) });
-            } catch (error) {
-              classifyPresetError(res, error);
-            }
-            return;
-          }
-          if (req.method === 'PUT' && sub === '/sim-prompt' && !tail) {
-            assertConsoleCsrf(req);
-            let body;
-            try {
-              body = JSON.parse(rawBody || '{}');
-            } catch {
-              throw new ContractError('E_SCHEMA', 'body is not valid JSON');
-            }
-            if (typeof body?.content !== 'string') {
-              throw new ContractError('E_SCHEMA', 'content must be a string');
-            }
-            try {
-              const result = presetFiles.writeSimPrompt(presetId, body.content, {
-                backupDir: presetBackupDir(),
-                now,
-              });
-              logger(`sim-prompt saved: preset=${presetId} changed=${result.changed}${result.backup ? ` backup=${path.basename(result.backup)}` : ''}`);
-              sendJson(res, 200, { ok: true, ...result });
-            } catch (error) {
-              classifyPresetError(res, error);
-            }
-            return;
-          }
-          if (req.method === 'GET' && sub === '/sim-prompt' && tail === '/backups') {
-            sendJson(res, 200, { ok: true, backups: presetFiles.listPresetBackups(presetId, presetBackupDir()) });
-            return;
-          }
-          if (req.method === 'POST' && sub === '/sim-prompt' && tail === '/restore') {
-            assertConsoleCsrf(req);
-            let body;
-            try {
-              body = JSON.parse(rawBody || '{}');
-            } catch {
-              throw new ContractError('E_SCHEMA', 'body is not valid JSON');
-            }
-            try {
-              const result = presetFiles.restorePresetBackup(presetId, body?.file, {
-                backupDir: presetBackupDir(),
-                now,
-              });
-              logger(`sim-prompt restored: preset=${presetId} from=${result.restoredFrom}`);
-              sendJson(res, 200, { ok: true, ...result });
-            } catch (error) {
-              classifyPresetError(res, error);
-            }
-            return;
-          }
-        }
+        sendJson(res, 200, {
+          ok: true,
+          source: 'dsh',
+          presets: ids.map((id) => ({ id })),
+        });
+        return;
       }
 
       // ── DSH 控制面：模型目录 / 思考强度 / 会话列表（docs/console/dsh-sessions/PLAN.md）──
@@ -789,7 +801,9 @@ export function createGatewayServer({
               provider: consoleDsh.chat.provider,
               model: consoleDsh.chat.model,
               reasoningEffort: consoleDsh.chat.reasoningEffort,
-              preset: consoleDsh.chat.preset,
+              // 预设不再全局配置：按平台映射，缺失回退 minimal（与 session-registry 同源）。
+              presets: platformPresetSummary(services),
+              presetFallback: FALLBACK_PRESET,
             },
             catalog: catalog ?? {
               efforts: consoleDsh.fallbackEfforts,
@@ -1037,7 +1051,11 @@ export function createGatewayServer({
           return;
         }
         if (req.method === 'GET' && convMatch) {
-          const view = ledger.conversation(decodeURIComponent(convMatch[1]), {
+          // 2026-11-21 审计修复：畸形百分号序列 → URIError 未捕获 500；包 try 返 400。
+          let conversationId;
+          try { conversationId = decodeURIComponent(convMatch[1]); }
+          catch { sendError(res, 400, 'E_SCHEMA', 'malformed percent-encoding in conversation id'); return; }
+          const view = ledger.conversation(conversationId, {
             turnLimit: Number(url.searchParams.get('limit')) || 200,
           });
           if (!view) {
@@ -1082,7 +1100,7 @@ export function createGatewayServer({
         for (const { record } of turns.recent(Math.min(turns.size, 5000))) {
           const at = record?.finishedAt ?? record?.at ?? 0;
           if (at < since) continue;
-          const aid = record?.envelope?.adapterId ?? '(unknown)';
+          const aid = record?.adapterId ?? record?.envelope?.adapterId ?? '(unknown)';
           let entry = byId.get(aid);
           if (!entry) {
             entry = { lastTurnAt: 0, turns: 0, errors: 0, errorCodes: {}, wakes: {} };
@@ -1098,40 +1116,38 @@ export function createGatewayServer({
           const wake = record?.envelope?.wake?.kind;
           if (wake) entry.wakes[wake] = (entry.wakes[wake] ?? 0) + 1;
         }
-        const registered = new Map(config.adapters.map((a) => [a.id, a]));
-        // P4.x 统一消费端总览：登记目录 kind=consumer 服务并入视图（多平台统筹
-        // 语义——「消费端」= adapters.json 适配器 ∪ 登记消费端，前者承载入站
-        // 认证，后者承载编排/工具 roles；同 id 双来源标注 both，认证语义不动）。
+        // P4.x 统一消费端总览：唯一来源 = 登记目录 kind=consumer。turn/用量记录里
+        // 出现但未登记的 id 仍以 unregistered 列出（幽灵适配器可发现）。
         const registryConsumers = (services?.registrations?.() ?? [])
           .filter((registration) => registration.kind === 'consumer')
           .map((registration) => ({
             id: registration.id,
             name: registration.name,
+            platform: registration.platform ?? null,
             enabled: registration.enabled !== false,
-            // roles 从该服务的登记工具声明聚合（编排能力面）。
+            // roles 从该服务的登记工具声明聚合（编排能力面；单值 role 去重）。
             roles: [...new Set((services.registeredTools?.() ?? [])
               .filter((tool) => tool.serviceId === registration.id)
-              .flatMap((tool) => tool.roles))],
+              .flatMap((tool) => (tool.role ? [tool.role] : [])))],
           }));
         const registryById = new Map(registryConsumers.map((consumer) => [consumer.id, consumer]));
         const consumption = new Map(ledger.byAdapter().map((row) => [row.adapterId, row]));
-        const ids = new Set([...registered.keys(), ...registryById.keys(), ...byId.keys(), ...consumption.keys()]);
+        const ids = new Set([...registryById.keys(), ...byId.keys(), ...consumption.keys()]);
         const adapters = [...ids].map((id) => {
           const flow = byId.get(id) ?? null;
           const cost = consumption.get(id) ?? null;
-          const inAdapters = registered.has(id);
           const inRegistry = registryById.has(id);
-          const source = inAdapters && inRegistry ? 'both' : (inRegistry ? 'registry' : 'adapters.json');
+          const source = inRegistry ? 'registry' : 'unregistered';
           return {
             id,
-            // 展示名：登记消费端用登记 name，adapters.json 适配器无展示名（id 即名）。
+            // 展示名：登记消费端用登记 name（id 即实例身份）。
             name: registryById.get(id)?.name ?? null,
-            platform: registered.get(id)?.platform ?? null,
-            // 来源标注（P4.x 只增字段）：adapters.json | registry | both。
+            platform: registryById.get(id)?.platform ?? null,
+            // 来源标注（P4.x 字段名不变，取值收敛为 registry | unregistered）。
             source,
-            registered: inAdapters,
-            unregistered: !inAdapters && !inRegistry,
-            enabled: inRegistry ? registryById.get(id).enabled : (inAdapters ? true : null),
+            registered: inRegistry,
+            unregistered: !inRegistry,
+            enabled: inRegistry ? registryById.get(id).enabled : null,
             roles: registryById.get(id)?.roles ?? [],
             lastTurnAt: flow?.lastTurnAt ?? cost?.lastAt ?? null,
             turns: flow?.turns ?? 0,
@@ -1148,6 +1164,67 @@ export function createGatewayServer({
         return;
       }
 
+      // ── 控制台：GATEWAY_DATA_PLANE 开关（常驻装配 + 请求期门禁，2026-11-16）────
+      // mode 是操作员显式意图（off = 「不要消息面」，绝不自动翻转）。切换即内存
+      // config.mode 翻转（全站闭包活读，零重启生效）+ 原子写回启动时装载的 env
+      // 文件（重启后 loadConfig 读回保持）。原启动期 fail-closed 校验挪到这里：
+      // 切 on 时消费端非空 + 编排键有主 + 步骤名合法，错误当场 400 回给 UI。
+      if (pathname === '/v1/console/mode') {
+        if (consoleDisabled(res)) return;
+        if (req.method !== 'POST') {
+          sendError(res, 405, 'E_METHOD', 'use POST /v1/console/mode');
+          return;
+        }
+        assertConsoleCsrf(req);
+        verifyOperator(req);
+        let body;
+        try {
+          body = JSON.parse(String(rawBody || '{}'));
+        } catch {
+          throw new ContractError('E_SCHEMA', 'body is not valid JSON');
+        }
+        const next = String(body?.mode ?? '').trim().toLowerCase();
+        if (!['on', 'off'].includes(next)) {
+          sendError(res, 400, 'E_SCHEMA', 'mode must be "on" | "off"（shadow 请改 env 后重启）');
+          return;
+        }
+        if (next === 'on') {
+          // 与原启动期校验同一套（消费端非空 + 编排键有主 + 步骤名合法）。
+          const consumers = services?.consumers?.() ?? [];
+          if (consumers.length === 0) {
+            sendError(res, 400, 'E_STATE',
+              'no consumer registration — register one in the console (kind=consumer) or run "npm run secrets:gen" first');
+            return;
+          }
+          try {
+            if (pipeline) pipeline.validate(consumers.map((entry) => entry.id));
+            services.assertPipelinePermissions();
+          } catch (error) {
+            sendError(res, 400, 'E_STATE', String(error?.message ?? error));
+            return;
+          }
+        }
+        const previous = config.mode;
+        config.mode = next;
+        let persisted = false;
+        let persistNote = null;
+        if (envFile) {
+          try {
+            upsertEnvValue(envFile, 'GATEWAY_DATA_PLANE', next);
+            persisted = true;
+          } catch (error) {
+            persistNote = String(error?.message ?? error);
+            logger(`警告：GATEWAY_DATA_PLANE=${next} 已在内存生效，但写回 ${envFile} 失败（重启后回退 env 值）: ${persistNote}`);
+          }
+        } else {
+          persistNote = 'env file path unknown（启动时未传入 envFile）';
+          logger(`警告：GATEWAY_DATA_PLANE=${next} 已在内存生效，但无 env 文件可持久化（重启后回退 env 值）`);
+        }
+        logger(`gateway mode switched: ${previous} -> ${next}${persisted ? ` (persisted to ${envFile})` : ' (NOT persisted)'}`);
+        sendJson(res, 200, { ok: true, mode: next, previous, persisted, ...(persistNote ? { persistNote } : {}) });
+        return;
+      }
+
       // ── P4 控制台：服务注册/卸载/台账（docs/console/registry-ui/PLAN.md）──────
       // 「文件系统就是登记 API 的磁盘形态」：注册 = 写 <id>.json（文件名即身份），
       // 卸载 = 删文件；写后 scanRegistrations('operator') 即时生效并落 append-only
@@ -1156,7 +1233,9 @@ export function createGatewayServer({
       if (pathname === '/v1/console/services' || pathname.startsWith('/v1/console/services/')) {
         if (consoleDisabled(res)) return;
         if (!services) {
-          sendError(res, 503, 'E_DISABLED', 'service registry not assembled (GATEWAY_PIPELINE and GATEWAY_TOOLS both off)');
+          // 防御分支：正常部署下 registry 只要登记目录配置就装配（含 off 模式，
+          // 供控制台自举）。触发即意味着登记目录未配置。
+          sendError(res, 503, 'E_DISABLED', 'service registry not assembled (registration directory not configured)');
           return;
         }
         if (req.method !== 'GET') assertConsoleCsrf(req);
@@ -1166,7 +1245,8 @@ export function createGatewayServer({
             ok: true,
             registrationsEnabled: Boolean(config.registrations),
             services: services.services(),
-            registrations: services.registrations(),
+            // 交接文件是否存在：UI 据此提示「复制到目标仓根目录」是否已完成。
+            registrations: services.registrations().map((entry) => ({ ...entry, handoff: handoffView(entry.id) })),
             tools: services.registeredTools(),
           });
           return;
@@ -1182,6 +1262,93 @@ export function createGatewayServer({
           sendJson(res, 200, { ok: true, ...view });
           return;
         }
+        // 编辑消费端预设声明（2026-11-17）：PUT /v1/console/services/<id>/presets。
+        // 只动 presets 字段——名字归网关管，内容归消费端适配器；写登记文件
+        // 后热生效（下一回合按新声明决定会话退役重建），无需重启网关。
+        if (req.method === 'PUT' && /^\/v1\/console\/services\/([a-z0-9][a-z0-9-]{1,62})\/presets$/.test(pathname)) {
+          if (!config.registrations) {
+            sendError(res, 503, 'E_DISABLED', 'registration directory not configured');
+            return;
+          }
+          verifyOperator(req);
+          assertConsoleCsrf(req);
+          let body;
+          try {
+            body = JSON.parse(String(rawBody || '{}'));
+          } catch {
+            throw new ContractError('E_SCHEMA', 'body is not valid JSON');
+          }
+          const id = /^\/v1\/console\/services\/([a-z0-9][a-z0-9-]{1,62})\/presets$/.exec(pathname)[1];
+          let presets = null;
+          if (body?.clear === true) {
+            presets = null;
+          } else if (body?.presets !== undefined && body.presets !== null) {
+            presets = body.presets;
+          } else if (typeof body?.preset === 'string' && body.preset.trim() !== '') {
+            const platform = services.resolveService(id)?.platform;
+            if (!platform) {
+              sendError(res, 400, 'E_SCHEMA', '该消费端未声明 platform，请改用 presets 对象（{平台: 预设名}）');
+              return;
+            }
+            presets = { [platform]: body.preset.trim() };
+          } else {
+            sendError(res, 400, 'E_SCHEMA', 'body 需要 preset（字符串）| presets（对象）| clear:true 三选一');
+            return;
+          }
+          const result = services.updateRegistrationPresets(id, presets);
+          if (!result.ok) {
+            sendError(res, result.status, result.status === 404 ? 'E_SCHEMA' : 'E_SCHEMA', result.error);
+            return;
+          }
+          logger(`console: presets updated: ${id} -> ${JSON.stringify(result.presets)}`);
+          sendJson(res, 200, { ok: true, id: result.id, presets: result.presets });
+          return;
+        }
+
+        // 拉取 resource 服务的工具清单（2026-11-19，只读）：凭据用登记自身的
+        // url+secret，operator 无需经 UI 提供凭据；consumer 显式 400（能力面走
+        // 适配器 manifest）。不写登记、不进词典——写回走下方 PUT tools。
+        if (req.method === 'POST' && /^\/v1\/console\/services\/([a-z0-9][a-z0-9-]{1,62})\/manifest$/.test(pathname)) {
+          assertConsoleCsrf(req);
+          verifyOperator(req);
+          const id = /^\/v1\/console\/services\/([a-z0-9][a-z0-9-]{1,62})\/manifest$/.exec(pathname)[1];
+          const result = await services.fetchServiceManifest(id);
+          if (!result.ok) {
+            sendError(res, result.status, result.status === 404 ? 'E_SCHEMA' : 'E_UPSTREAM', result.error);
+            return;
+          }
+          logger(`console: manifest fetched: ${id} (${result.tools.length} tools${result.truncated ? ', truncated' : ''})`);
+          sendJson(res, 200, { ok: true, id: result.id, tools: result.tools, truncated: result.truncated });
+          return;
+        }
+
+        // 把清单写回登记的 tools 声明（PUT …/<id>/tools）：逐条 schema 校验
+        // （role 缺省 tool），原子写回 + 立即重扫热生效——编排步骤与
+        // registeredTools 下一拍可用，无需重启网关。
+        if (req.method === 'PUT' && /^\/v1\/console\/services\/([a-z0-9][a-z0-9-]{1,62})\/tools$/.test(pathname)) {
+          if (!config.registrations) {
+            sendError(res, 503, 'E_DISABLED', 'registration directory not configured');
+            return;
+          }
+          verifyOperator(req);
+          assertConsoleCsrf(req);
+          let body;
+          try {
+            body = JSON.parse(String(rawBody || '{}'));
+          } catch {
+            throw new ContractError('E_SCHEMA', 'body is not valid JSON');
+          }
+          const id = /^\/v1\/console\/services\/([a-z0-9][a-z0-9-]{1,62})\/tools$/.exec(pathname)[1];
+          const result = services.updateRegistrationTools(id, body?.tools);
+          if (!result.ok) {
+            sendError(res, result.status, 'E_SCHEMA', result.error);
+            return;
+          }
+          logger(`console: tools updated: ${id} -> ${result.tools.map((tool) => `${tool.name}(${tool.role})`).join(', ')}`);
+          sendJson(res, 200, { ok: true, id: result.id, tools: result.tools });
+          return;
+        }
+
         if (req.method === 'POST' && pathname === '/v1/console/services') {
           if (!config.registrations) {
             sendError(res, 503, 'E_DISABLED', 'registration directory not configured');
@@ -1193,19 +1360,26 @@ export function createGatewayServer({
           } catch {
             throw new ContractError('E_SCHEMA', 'body is not valid JSON');
           }
-          const { name, kind, transport, url, timeoutMs, tools, secret, secretEnv } = body ?? {};
-          // secret 必填（二选一）：登记服务与网关之间是 HMAC（service.call 出站
-          // 签名 + WS 握手鉴权），没有凭据的服务装载必被 resolveSecret 拒载——
-          // 挡在落盘前（fail-closed），不让 UI 产出注定 reject 的登记文件。
+          const { name, kind, transport, url, timeoutMs, tools, memoryService, platform, preset: presetIn, presets: presetsIn, secret: secretIn, secretEnv: secretEnvIn } = body ?? {};
+          // 凭据三态：显式 secret / secretEnv / 都缺 → 服务端自动生成。
+          // secret 必须有（登记服务与网关之间是 HMAC——tool.call 出站签名 + WS
+          // 握手鉴权，没有凭据的服务装载必被 resolveSecret 拒载）；但「手填」不是
+          // 唯一入口：留空时由网关生成 hex48（0600 落盘 + 回执一次性明文回显 +
+          // 交接文件内嵌），UI 不必手抄随机串。空串视同未填。
+          const secretEnv = typeof secretEnvIn === 'string' && secretEnvIn.trim() !== '' ? secretEnvIn : undefined;
+          let secret = typeof secretIn === 'string' && secretIn.trim() !== '' ? secretIn : undefined;
+          let secretGenerated = false;
           if (secret !== undefined && secretEnv !== undefined) {
             sendError(res, 400, 'E_SCHEMA', 'provide exactly one of secret | secretEnv');
             return;
           }
           if (secret === undefined && secretEnv === undefined) {
-            sendError(res, 400, 'E_SCHEMA', 'registration requires a credential: provide secret or secretEnv (service HMAC)');
-            return;
+            secret = generateSecret();
+            secretGenerated = true;
           }
-          const id = newRegistrationId();
+          // 消费端 id 强制 hash 形态 svc-<12hex>（id 只标识服务实例，与平台解耦；
+          // 同平台多账号 = 多份登记、各自 svc- id）。工具服务沿用随机 hex id。
+          const id = kind === 'consumer' ? newConsumerRegistrationId() : newRegistrationId();
           // url 回环前置校验：与装载同口径（assertLoopbackUrl），错误先于落盘给出。
           if (typeof url === 'string' && url) {
             try {
@@ -1219,6 +1393,19 @@ export function createGatewayServer({
           if (url !== undefined) reg.url = url;
           if (timeoutMs !== undefined) reg.timeoutMs = timeoutMs;
           if (tools !== undefined) reg.tools = tools;
+          // consumer 平台声明（动作会话定位 + 入站验签 expectedPlatform；新契约必填）。
+          if (platform !== undefined) reg.platform = platform;
+          // 记忆服务声明：boolean 旧形态或 {saveTool} 能力对象（selectMemoryService）。
+          if (memoryService === true || (memoryService && typeof memoryService === 'object')) {
+            reg.memoryService = memoryService;
+          }
+          // 预设声明（非必填，2026-11-17）：只是名字，内容归消费端适配器。
+          // `presets` 对象优先；`preset` 单字符串配 platform 组成 {platform: preset}。
+          // 未声明 → 建会话时用 DSH 内置 minimal（session-registry 的 default 分支）。
+          if (presetsIn !== undefined && presetsIn !== null) reg.presets = presetsIn;
+          else if (typeof presetIn === 'string' && presetIn.trim() !== '' && platform !== undefined) {
+            reg.presets = { [String(platform)]: presetIn.trim() };
+          }
           if (secretEnv !== undefined) reg.secretEnv = secretEnv;
           try {
             parseServiceRegistration(reg);
@@ -1255,11 +1442,28 @@ export function createGatewayServer({
           // active=false 意味着装载被拒（如 secretEnv 未在环境里）——文件与台账
           // 留痕，UI 据此提示修复（登记按份 fail-safe：坏文件不拖垮网关）。
           const active = services.registrations().some((entry) => entry.id === id);
-          logger(`console: service registered via UI: ${id} (kind=${reg.kind} active=${active})`);
-          sendJson(res, 201, { ok: true, id, name: reg.name, kind: reg.kind, active });
+          // 交接文件：注册即产出，路径直接回给 UI——省掉「密钥怎么抄到对端」这一步。
+          let handoff = null;
+          try {
+            handoff = emitServiceHandoff({ id, secret, secretEnv, transport: reg.transport });
+          } catch (error) {
+            // 交接文件只是便利产物：写失败不该让注册回滚（登记已生效），但要留痕。
+            logger(`警告：handoff file 生成失败（登记仍有效）: ${error?.message ?? error}`);
+          }
+          logger(`console: service registered via UI: ${id} (kind=${reg.kind} active=${active}`
+            + `${handoff ? ` handoff=${handoff.filePath}` : ''})`);
+          sendJson(res, 201, {
+            ok: true, id, name: reg.name, kind: reg.kind, active,
+            // 自动生成的 secret 只在这里明文回显一次（secretGenerated 标记来源）；
+            // 显式 secret / secretEnv 路径维持「永不明文回显」。
+            ...(secretGenerated ? { secret, secretGenerated: true } : {}),
+            ...(handoff ? { handoffFile: handoff.filePath, handoffAuth: handoff.auth } : {}),
+          });
           return;
         }
-        const unregisterMatch = /^\/v1\/console\/services\/([0-9a-f]{32})$/.exec(pathname);
+        // 登记卸载：id 词法覆盖 32hex 工具服务 id 与 svc-<hash> 消费端 id（存在性
+        // 校验在 registrations().find，未知 id 404，不靠正则白名单卡语义）。
+        const unregisterMatch = /^\/v1\/console\/services\/([a-z0-9][a-z0-9-]{0,63})$/.exec(pathname);
         if (req.method === 'DELETE' && unregisterMatch) {
           if (!config.registrations) {
             sendError(res, 503, 'E_DISABLED', 'registration directory not configured');
@@ -1272,8 +1476,9 @@ export function createGatewayServer({
             return;
           }
           fs.rmSync(path.join(config.registrations.dir, entry.file), { force: true });
-          // 配套密钥文件一并撤销（登记已删，密钥无主）。
+          // 配套密钥文件一并撤销（登记已删，密钥无主）；交接文件同理。
           try { fs.rmSync(path.join(config.stateDir, 'secrets', `${id}.secret`), { force: true }); } catch { /* 尽力清理 */ }
+          try { removeHandoff({ stateDir: config.stateDir, id }); } catch { /* 尽力清理 */ }
           const changed = services.scanRegistrations('operator');
           metrics.inc('console_service_total', { action: 'unregister' });
           logger(`console: service unregistered via UI: ${id} (applied=${changed})`);
@@ -1284,6 +1489,61 @@ export function createGatewayServer({
         return;
       }
 
+        // ── 角色卡管理面（2026-11-20，控制台「角色卡」视图）────────────────────
+        // 后端经 runtime.rolecardAdmin 注入（core 不 import rolecard）；全部
+        // verifyOperator + CSRF，写/切动作经签名代理落 rolecard。apply 联动
+        // retireAllSessions（切角色 → 存量 DSH 会话整体退役，防身份精神分裂）。
+        if (runtime?.rolecardAdmin && pathname.startsWith('/v1/console/rolecards')) {
+          // 门禁（2026-11-21 审计修复）：与其它 /v1/console/* 路由同口径——console
+          // off 时不可达（否则 off + 空 token 是唯一可达的 verifyOperator 面）。
+          if (consoleDisabled(res)) return;
+          const rolecardRoute = /^\/v1\/console\/rolecards(?:\/([^/]+))?$/.exec(pathname);
+          if (req.method === 'GET' && pathname === '/v1/console/rolecards') {
+            verifyOperator(req);
+            try {
+              const result = await runtime.rolecardAdmin.call('chat_role_list');
+              // 2026-11-21 审计修复：上游业务失败（ok=false）不冒充 200——透传错误。
+              if (!result?.ok) {
+                sendError(res, 502, 'E_UPSTREAM', `角色卡服务返回失败：${result?.error?.message ?? 'unknown'}`);
+                return;
+              }
+              sendJson(res, 200, { ok: true, ...result.data });
+            } catch (error) {
+              sendError(res, 502, 'E_UPSTREAM', `角色卡服务不可用：${error?.message ?? error}`);
+            }
+            return;
+          }
+          // read/write 分支已删（2026-11-21）：编辑迁 rolecard 服务本体 /admin
+          // 回环管理页，网关不再代理读写——本路由只保留「列表 + 切换」控制面板。
+          if (req.method === 'POST' && pathname === '/v1/console/rolecards/apply') {
+            assertConsoleCsrf(req);
+            verifyOperator(req);
+            let body;
+            try {
+              body = JSON.parse(String(rawBody || '{}'));
+            } catch {
+              throw new ContractError('E_SCHEMA', 'body is not valid JSON');
+            }
+            try {
+              const switched = await runtime.rolecardAdmin.call('chat_role_switch', { name: String(body?.name ?? '') });
+              const switchedData = switched.data ?? switched;
+              // 业务失败判别（2026-11-21 审计修复）：serviceRegistry 只在传输层抛错，
+              // 上游业务失败（如 name 非法）回 HTTP 200 + ok:false——切卡失败绝不能
+              // 退役会话（误杀全部存量会话，用户可见故障）。
+              if (switched?.ok !== true) {
+                sendError(res, 502, 'E_UPSTREAM', `切换失败：${switched?.error?.message ?? switchedData?.error ?? '上游返回失败'}`);
+                return;
+              }
+              const retired = runtime.rolecardAdmin.retireAllSessions();
+              logger(`console: rolecard applied: ${switchedData.current} (sessions retired: ${retired})`);
+              sendJson(res, 200, { ok: true, current: switchedData.current, retiredSessions: retired, preview: null });
+            } catch (error) {
+              sendError(res, 502, 'E_UPSTREAM', `应用失败：${error?.message ?? error}`);
+            }
+            return;
+          }
+        }
+
       // ── P4/P5 控制台：通路/回路编排（per-consumer 管线读写）───────────────────
       // 双向完整闭环（保存即生效：updateConsumerPipeline 原子落盘 + 热加载）。
       // P5：回路引擎已接通（发送动作外发文本过 returnPipelines，deliverAction
@@ -1292,24 +1552,25 @@ export function createGatewayServer({
       if (pathname === '/v1/console/pipelines' || pathname.startsWith('/v1/console/pipelines/')) {
         if (consoleDisabled(res)) return;
         if (!services) {
-          sendError(res, 503, 'E_DISABLED', 'service registry not assembled (GATEWAY_PIPELINE and GATEWAY_TOOLS both off)');
+          sendError(res, 503, 'E_DISABLED', 'service registry not assembled (registration directory not configured)');
           return;
         }
         if (req.method !== 'GET') assertConsoleCsrf(req);
         verifyOperator(req);
-        // 步骤名三级解析的候选集：内置（pipeline 注入）→ 登记服务 id →
-        // 装饰器/过滤器角色的登记工具名。管线 off 时 builtin 为空表。
+        // 步骤名两级解析的候选集：内置（pipeline 注入）→ decorator/filter
+        // 角色的登记工具名。管线 off 时 builtin 为空表。
         const builtinSteps = new Set(pipeline ? pipeline.status().builtinSteps : []);
         const returnEffective = pipeline?.status?.().returnEffective === true;
         if (req.method === 'GET' && pathname === '/v1/console/pipelines') {
           const forwardBy = new Map(services.pipelinesView().map((entry) => [entry.key, entry.steps]));
           const returnBy = new Map(services.returnPipelinesView().map((entry) => [entry.key, entry.steps]));
-          const consumers = [
-            ...config.adapters.map((adapter) => ({ id: adapter.id, kind: 'adapter', platform: adapter.platform })),
-            ...services.registrations()
-              .filter((registration) => registration.kind === 'consumer' && registration.enabled !== false)
-              .map((registration) => ({ id: registration.id, kind: 'registered-consumer', platform: null })),
-          ];
+          const consumers = services.registrations()
+            .filter((registration) => registration.kind === 'consumer' && registration.enabled !== false)
+            .map((registration) => ({
+              id: registration.id,
+              kind: 'consumer',
+              platform: registration.platform ?? null,
+            }));
           sendJson(res, 200, {
             ok: true,
             pipelineMode: config.pipeline.mode,
@@ -1323,12 +1584,13 @@ export function createGatewayServer({
               forward: forwardBy.get('default') ?? [],
               return: returnBy.get('default') ?? [],
             },
+            // 可编排步骤只有 decorator/filter 角色的登记工具（单值 role）：
+            // builtin protocol 已退役、服务 id 自 V2 起不再是合法步骤——
+            // 两者曾暴露为选项但选了必失败（引擎报错），已从视图移除。
             available: {
-              builtin: [...builtinSteps],
-              services: services.services().map(({ id, kind }) => ({ id, kind })),
               tools: services.registeredTools()
-                .filter((tool) => tool.roles.includes('decorator') || tool.roles.includes('filter'))
-                .map(({ serviceId, name, roles }) => ({ serviceId, name, roles })),
+                .filter((tool) => tool.role === 'decorator' || tool.role === 'filter')
+                .map(({ serviceId, name, role }) => ({ serviceId, name, role })),
             },
           });
           return;
@@ -1365,12 +1627,13 @@ export function createGatewayServer({
             sendError(res, 400, 'E_SCHEMA', error?.message ?? String(error));
             return;
           }
-          // 步骤名三级解析前置校验（fail-closed，写盘前给出明细）：本地静态
-          // 供料条目（text）不解析，其余必须命中内置/登记服务/装饰器工具。
+          // 步骤名两级解析前置校验（fail-closed，写盘前给出明细）：本地静态
+          // 供料条目（text）不解析，其余必须命中内置步骤或 decorator/filter
+          // 工具名——服务 id 直接当步骤已不合法（tool.call 统一改造）。
           const unknown = [...forwardInspected, ...returnInspected]
             .filter((entry) => !entry.static)
             .map((entry) => entry.name)
-            .filter((name) => !builtinSteps.has(name) && !services.resolveService(name) && !services.resolveToolStep(name));
+            .filter((name) => !builtinSteps.has(name) && !services.resolveToolStep(name));
           if (unknown.length > 0) {
             sendError(res, 400, 'E_SCHEMA', `unknown pipeline step(s): ${unknown.join(', ')}`);
             return;
@@ -1442,8 +1705,8 @@ export function createGatewayServer({
             platform: record?.envelope?.platform ?? null,
             at: record.finishedAt ?? record.at ?? null,
             wake: record?.result?.wake ?? null,
-            // adapters-overview 的对账字段：行投影补齐 envelope.adapterId。
-            adapterId: record?.envelope?.adapterId ?? null,
+            // adapters-overview 的对账字段：行投影补齐 adapterId。
+            adapterId: record?.adapterId ?? record?.envelope?.adapterId ?? null,
             usage: record.result.usage,
           }));
         sendJson(res, 200, { ok: true, usage: rows });
@@ -1489,11 +1752,11 @@ export function createGatewayServer({
     });
   });
 
-  // V2 客户端通道（GATEWAY_WS=on 时）：与 HTTP 同一端口、同一消费者登记表、
-  // 同一 nonce 缓存语义。off 时不挂 upgrade 监听，行为与旧版完全一致。
-  // off 模式下 WS 入站直接回 E_DISABLED（对齐 /v1/inbound 的 503 语义）。
-  const wsHub = config.ws?.mode === 'on'
-    ? createWsHub({
+  // V2 客户端通道（常驻，2026-11-18 起）：与 HTTP 同一端口、同一消费者登记表、
+  // 同一 nonce 缓存语义。传输层不再有开关（消费端 WS 优先/HTTP 兜底自协商，
+  // GATEWAY_WS 开关已退役）；数据面关闭时帧级回 E_DISABLED（对齐 /v1/inbound
+  // 的 503 语义），连接保持，客户端切模式后无需重连。
+  const wsHub = createWsHub({
       server,
       path: config.ws.path,
       clientsById: wsClientsById,
@@ -1504,15 +1767,14 @@ export function createGatewayServer({
         if (config.mode === 'off') {
           // 帧级回 E_DISABLED（对齐 /v1/inbound 的 503 语义）；连接保持，
           // 客户端切模式后无需重连。
-          throw new ContractError('E_DISABLED', 'gateway mode is off');
+          throw new ContractError('E_DISABLED', 'data plane is off');
         }
         // entry.id = 握手身份：幂等键按消费者隔离，同一平台多适配器不互相吞消息。
         return handleInbound(parsed, { adapterId: entry?.id });
       },
       logger,
       metrics,
-    })
-    : null;
+  });
 
   return {
     server,

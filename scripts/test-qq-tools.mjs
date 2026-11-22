@@ -352,19 +352,40 @@ test('并存：qq 与 wx 清单同名 type 合并进单 executor，路由凭工�
   });
 });
 
-test('冲突拒绝：同平台两份清单装配显式失败（目录合并冲突不静默）', () => {
-  const a = { id: 'qq-a', platform: 'qq', secret: SECRET, callbackBase: 'http://127.0.0.1:9' };
-  const b = { id: 'qq-b', platform: 'qq', secret: SECRET, callbackBase: 'http://127.0.0.1:9' };
-  assert.throws(
-    () => createAdapterToolsExecutor({
-      adapters: [
-        { adapter: a, manifest: manifestFixture(), capabilities: capsFor(manifestFixture()) },
-        { adapter: b, manifest: manifestFixture(), capabilities: capsFor(manifestFixture()) },
-      ],
-      logger: () => {},
-    }),
-    /duplicate adapter platform/,
-  );
+test('多消费端共享：同平台两账号装配成功，调用按会话绑定的消费端路由', async () => {
+  // 多消费端收编：同平台多账号共享一套 chat_qq_* 工具（模型视角不变），
+  // 4 段会话键第 2 段（consumerId）决定动作发到哪个账号；3 段旧键回退字典序
+  // 首个消费端；会话所属账号未接线该动作 = 结构化失败（不借道别的账号）。
+  const a = { id: 'svc-aaaa00000001', platform: 'qq', secret: SECRET, callbackBase: 'http://127.0.0.1:9' };
+  const b = { id: 'svc-bbbb00000002', platform: 'qq', secret: SECRET, callbackBase: 'http://127.0.0.1:9' };
+  const manifest = manifestFixture();
+  const executor = createAdapterToolsExecutor({
+    adapters: [
+      { adapter: a, manifest, capabilities: capsFor(manifest) },
+      { adapter: b, manifest, capabilities: capsFor(manifest) },
+    ],
+    logger: () => {},
+  });
+  // 工具集只注册一份（共享命名空间，不翻倍）。
+  const toolNames = executor.tools.map((tool) => tool.name);
+  assert.equal(new Set(toolNames).size, toolNames.length, '工具名无重复');
+
+  const hits = [];
+  const deliver = async ({ adapter }) => { hits.push(adapter.id); return { ok: true, receipt: { data: { hit: adapter.id } } }; };
+  const routed = createAdapterToolsExecutor({
+    adapters: [
+      { adapter: a, manifest, capabilities: capsFor(manifest) },
+      { adapter: b, manifest, capabilities: capsFor(manifest) },
+    ],
+    deliver,
+    logger: () => {},
+  });
+  await routed.call({ action: 'send_text', ctx: { tool: 'chat_qq_send_text', sessionKey: `qq:svc-bbbb00000002:group:1`, payload: { key: 'group:1', text: 'x' } } });
+  assert.deepEqual(hits, ['svc-bbbb00000002'], '4 段键精确路由到会话所属账号');
+  await routed.call({ action: 'send_text', ctx: { tool: 'chat_qq_send_text', sessionKey: 'qq:group:1', payload: { key: 'group:1', text: 'x' } } });
+  assert.equal(hits[1], 'svc-aaaa00000001', '3 段旧键回退字典序首个消费端');
+  await routed.call({ action: 'send_text', ctx: { tool: 'chat_qq_send_text', sessionKey: 'qq:svc-gone0000003:group:1', payload: { key: 'group:1', text: 'x' } } });
+  assert.equal(hits[2], 'svc-aaaa00000001', '账号已下线回退首个消费端（有告警）');
 });
 
 test('覆盖完整性：孤儿条目 / 孤儿模块都拒绝装配（决策 12 的 1:1 硬标准）', async () => {

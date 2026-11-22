@@ -65,6 +65,9 @@ export function createDshGateway({ dsh, turnTimeoutMs = 300000, logger = () => {
               // provider usage 原样带出：turn-runner 落进 turn record，桥接的
               // token 账本改从 /v1/usage 取（桥接不再连 DSH mux）。
               usage: ended.usage,
+              // 结束原因必须带出去：只传 status='error' 的话，落盘就是
+              // `status:error / error:null`，排查时无从下手（实测遇到 4 条）。
+              reason: ended.reason ?? null,
             });
           }
         }

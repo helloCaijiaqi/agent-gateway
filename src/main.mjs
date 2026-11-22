@@ -13,13 +13,17 @@ import fs from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { createGatewayServer } from './core/server.mjs';
 import { configSummary, loadConfig } from './core/config.mjs';
-import { createServiceRegistry } from './core/service-registry.mjs';
-import { createPipeline } from './core/pipeline.mjs';
+import { loadEnvInto } from './core/env-file.mjs';
+import { checkRegistration, resolveDshPatchFile } from './core/dsh-patch.mjs';
+import { createServiceRegistry, selectMemoryService } from './core/service-registry.mjs';
+
+// memoryService 布尔旧形态的存量缺省 save 工具（兼容缺省只在此组合根存在；
+// 权威形态 = 登记文件 memoryService: { saveTool }，网关 core 无工具名字面量）。
+const LEGACY_MEMORY_SAVE_TOOL = 'chat_memory_save';
+import { createPipeline, protocolTokenLine } from './core/pipeline.mjs';
+import { createTurnStore } from './core/turn-store.mjs';
 import { createTokenLedger as createUsageLedger } from './core/usage-ledger.mjs';
 import { resolvePriceTable } from './core/prices.mjs';
-import {
-  describePreset, readSimPrompt, writeSimPrompt, listPresetBackups, restorePresetBackup,
-} from './runtime/preset-files.mjs';
 import { createPendingForwarder } from './runtime/pending-forwarder.mjs';
 import { PENDING_CAPACITY } from './runtime/dsh-gateway.mjs';
 import { deliverAction, deliverActionViaWs, prepareAction } from './executors/adapter-tools/common/transport.mjs';
@@ -58,9 +62,33 @@ function persistModelOverlay(config, next, logger) {
 }
 
 export async function main() {
+  // .env 装载先于 loadConfig：退役键（GATEWAY_OPERATOR_TOKEN / GATEWAY_MCP_BUS_TOKEN
+  // 等残留）的 fail-closed 校验在 loadConfig 里，若后装载则用户 .env 里有残留仍会
+  // 先报错。真实环境变量优先（loadEnvInto 只填未定义键），路径可用 GATEWAY_ENV_FILE
+  // 覆盖，默认包根 .env。凭据本身是文件单源（operator-token / mcp-bus.secret）。
+  const envFile = process.env.GATEWAY_ENV_FILE
+    || path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '.env');
+  const envResult = loadEnvInto(process.env, envFile, { logger: (l) => console.warn(`[gateway] ${l}`) });
   const config = loadConfig();
   const logger = (line) => console.log(`[gateway] ${line}`);
+  logger(envResult.missing
+    ? `env-file 未提供（${envFile}），仅用进程环境变量`
+    : `env-file 已装载 ${envResult.loaded} 项（跳过已定义 ${envResult.skipped} 项）: ${envFile}`);
   applyModelOverlay(config, logger);
+  // DSH 注册诊断（只读）：工具面开着但 DSH profile 里没有 mcp-bus 条目时，模型看到的
+  // 工具清单永远到不了网关。这里只告警不写文件——安装是显式动作（npm run setup:dsh），
+  // 因为 DSH 只在启动期读补丁，且那是另一个应用的配置文件。
+  if (config.tools?.mode === 'on') {
+    const dshPatchFile = resolveDshPatchFile({
+      file: process.env.GATEWAY_DSH_PATCH_FILE,
+      profile: process.env.GATEWAY_DSH_PROFILE || 'web',
+    });
+    const registration = checkRegistration(dshPatchFile);
+    if (!registration.registered) {
+      logger(`警告：DSH 未注册 mcp-bus（${registration.reason}）: ${dshPatchFile}`);
+      logger('      工具面当前不可用；运行 `npm run setup:dsh` 后重启 DSH 即可。');
+    }
+  }
 
   let runtime = null;
   // V2 P2：服务登记表在外层声明——createGatewayServer 需要它合并 WS 握手身份
@@ -69,26 +97,48 @@ export async function main() {
   // P3 管线引擎同理在外层声明——createGatewayServer 需要（/v1/health 数据源 +
   // P4 编排 UI 的步骤名三级解析校验）。
   let pipeline = null;
-  // §6 记忆落库调度器同理在外层声明（server/tool-host 的观察点都要引用）。
-  let memoryIngest = null;
+  // §6 会话缓冲管理器（session-save）同理在外层声明（server/tool-host 的观察点都要引用）。
+  let sessionSave = null;
   // V2 WS 动作下行：ws-hub 在 createGatewayServer 内建（晚于 executor 装配），
   // 用晚绑定引用注入投递包装——装配顺序不变，测试里 wsHubRef=null 时自动走 HTTP。
   let wsHubRef = null;
 
+  // ── 服务登记（登记目录 + 台账 + 热加载）────────────────────────────────────
+  // 消费端身份的唯一事实源：HTTP 入站验签、WS 握手身份、动作下行、清单拉取、
+  // 编排权限门禁全部从这一份视图取。因此只要登记目录已配置就装配——不依附
+  // mode/pipeline/tools/memorySave 任何开关：
+  //   - mode≠off：入站验签/WS 握手/动作下行都要用（缺了会被 401）；
+  //   - mode=off：控制台的登记/卸载/总览仍需它（否则「off 起控制台注册第一个
+  //     消费端」的自举路径不通）。入站/WS 在 off 下另有 mode 门禁 503，装配
+  //     registry 不改变回滚语义。
+  if (config.registrations) {
+    serviceRegistry = createServiceRegistry({
+      pipelinesFile: config.pipeline.file,
+      stateDir: config.stateDir,
+      defaultTimeoutMs: config.pipeline.stepTimeoutMs,
+      registrations: config.registrations,
+      logger,
+    });
+    logger(`service registry ready: services=${serviceRegistry.services().length} `
+      + `registrations=[${serviceRegistry.registrations().map((r) => r.id).join(', ') || '-'}] `
+      + `consumers=[${serviceRegistry.consumers().map((c) => c.id).join(', ') || '-'}] `
+      + `dir=${config.registrations.dir} reloadMs=${config.registrations.reloadMs}`);
+  }
+
   /**
-   * 动作投递（HTTP / WS 双栈，组合根注入到 executor 与 pendingForwarder）。
+   * 动作投递（WS 优先 / HTTP 兜底，组合根注入到 executor 与 pendingForwarder）。
    *
-   * 语义（与 docs/design/GATEWAY_V2_REFACTOR.md §2 对齐）：
-   *   - GATEWAY_WS=on 且该适配器有 WS 连接 → 先走帧（帧级签名 + callId 关联）；
+   * 语义（与 docs/design/GATEWAY_V2_REFACTOR.md §2 对齐；2026-11-18 起 WS 通道
+   * 常驻，GATEWAY_WS 开关已退役，本函数是唯一投递路径）：
+   *   - 该适配器有 WS 连接 → 先走帧（帧级签名 + callId 关联）；
    *   - WS 不可用/超时/断开/回执不符 → 回落 HTTP POST /v1/actions（永不因传输层
-   *     失败而丢失动作；两条路径共用 prepareAction 的回路链拦截结果，不重复执行）；
-   *   - GATEWAY_WS=off → 行为与旧版完全一致（纯 HTTP）。
+   *     失败而丢失动作；两条路径共用 prepareAction 的回路链拦截结果，不重复执行）。
    */
   const deliverActionWithWs = async ({ adapter, action, entry, ctx, timeoutMs, returnPipeline = null }) => {
     const prepared = await prepareAction({ adapter, action, entry, ctx, timeoutMs, returnPipeline });
     if (prepared.ok !== true || prepared.suppressed) return prepared;
     const hub = wsHubRef;
-    if (config.ws?.mode === 'on' && hub && hub.isConnected(adapter.id)) {
+    if (hub && hub.isConnected(adapter.id)) {
       const viaWs = await deliverActionViaWs({
         wsHub: hub,
         adapter,
@@ -101,13 +151,19 @@ export async function main() {
     return deliverAction({ adapter, action, entry, ctx, timeoutMs, prepared });
   };
 
-  if (config.mode === 'on') {
-    const [{ DshClient }, { createSessionRegistry }, { createPromptQueue },
+  // ── 消息面运行时：常驻装配（2026-11-16 起）──────────────────────────────────
+  // 不再按 mode==='on' 条件装配：mode 已收敛为纯请求期活读门禁（inbound/WS 帧/
+  // actions 各路由现场判 config.mode），控制台开关切换即时生效、零重启。off 下
+  // 这套运行时空转（DSH 未连接即无任何 IO），装配开销可忽略。控制台切换端点
+  // （POST /v1/console/mode）承担原启动期的 fail-closed 校验（消费端非空、
+  // 编排键有主、pipeline.validate）。
+  {
+    const [{ DshClient }, { createSessionRegistry, FALLBACK_PRESET }, { createPromptQueue },
       { createDshGateway }, { createTurnRunner }, { createToolHost }, { createMailbox },
       { createExecutorRegistry },
       { createWebSearchExecutor },
       { createAdapterToolsExecutor, fetchAdapterManifest },
-      { createMemoryIngest }, { createHttpClient }] = await Promise.all([
+      { createSessionSave }] = await Promise.all([
       import('./runtime/dsh-client.mjs'),
       import('./runtime/session-registry.mjs'),
       import('./runtime/prompt-queue.mjs'),
@@ -118,18 +174,37 @@ export async function main() {
       import('./executors/executor-interface.mjs'),
       import('./executors/web-search.mjs'),
       import('./executors/adapter-tools/index.mjs'),
-      import('./runtime/memory-ingest.mjs'),
-      import('./shared/http-client.mjs'),
+      import('./runtime/memory-ingest.mjs'), // createSessionSave：会话缓冲管理器
     ]);
     const dsh = new DshClient({ ...config.dsh, logger });
-    const registry = createSessionRegistry({ dsh, chat: config.chat, file: config.sessionsFile, logger });
+    // preset 声明来自适配器登记文件（平台知识归适配器）：热注册后即时生效，
+    // 网关这边不留任何「qq→某预设」的映射表。
+    //
+    // 三段会话键（无消费端段）按平台回退：装载器保证「一个平台同时只有一个
+    // enabled 的动作接收者」，所以按平台反查至多命中一份声明；多份 = 歧义，不猜。
+    const presetsFor = ({ platform, consumerId }) => {
+      if (!serviceRegistry) return null;
+      if (consumerId) {
+        const direct = serviceRegistry.resolveService?.(consumerId);
+        if (direct?.presets) return direct.presets;
+      }
+      if (!platform) return null;
+      const candidates = serviceRegistry.services()
+        .filter((entry) => entry.kind === 'consumer' && entry.platform === platform && entry.presets);
+      return candidates.length === 1 ? candidates[0].presets : null;
+    };
+    const registry = createSessionRegistry({
+      dsh, chat: config.chat, file: config.sessionsFile, logger, presetsFor,
+    });
     const queue = createPromptQueue({ logger });
     // pending 平台转发（docs/console/dsh-pending/PLAN.md 第二阶段）：off 时
     // forwarder 不装配（onPending 传 null，pending 仅控制台只读可见）。
+    // 消费端清单取登记视图的启动快照：热注册的消费端要重启才参与 pending 转发
+    //（转发器持有固定清单，避免每次 pending 都重建）。
     const pendingForwarder = config.pendingForward.mode === 'on'
       ? createPendingForwarder({
         deliver: deliverActionWithWs,
-        adapters: config.adapters.filter((entry) => entry.callbackBase),
+        adapters: serviceRegistry?.consumers().filter((entry) => entry.callbackBase) ?? [],
         registry,
         timeoutMs: config.pendingForward.timeoutMs,
         logger,
@@ -140,32 +215,62 @@ export async function main() {
       onPending: pendingForwarder ? (entry) => pendingForwarder.forward(entry) : null,
     });
     const executorRegistry = createExecutorRegistry();
-    // ── §6 记忆落库调度器（双向自动沉淀，默认 off）────────────────────────────
-    // 入站（server.handleInbound）+ 出站（tool-host 发送成功点）→ 按会话/时间窗
-    // 聚合 → 逐条 POST memory-mcp /api/memory/ingest（raw 全量落地；会话纪元模型
-    // 下长期记忆只由摘要与 record 产生，聊天消息不再进 memory 表）；幂等由服务端
-    // raw 表 UNIQUE(session_id, msg_id) 裁决；失败重试本地缓冲，绝不阻塞主链路。
-    // 出站投递走统一 HTTP 客户端（x-mcp-token 通道，非登记 HMAC 通道）。
-    if (config.memoryIngest.mode === 'on') {
-      const memoryHttp = createHttpClient({ baseUrl: config.memoryIngest.url, timeoutMs: 5000, logger });
-      memoryIngest = createMemoryIngest({
-        deliver: async (record) => {
-          const result = await memoryHttp.post('/api/memory/ingest', {
-            sessionId: record.sessionId,
-            msgId: record.msgId,
-            text: record.text,
-            senderId: record.senderId,
-            kind: record.kind,
-            createdAt: record.createdAt,
-          }, { headers: { 'x-mcp-token': config.memoryIngest.token } });
-          if (!result.ok) throw new Error(result.error ?? `HTTP ${result.status}`);
+    // ── §6 会话缓冲管理器（session-save，默认 off）────────────────────────────
+    // tool.call 统一改造：会话缓冲上移网关——入站（server.handleInbound）+ 出站
+    // （tool-host 发送成功点）追加进 <stateDir>/session-buffer/<sessionKey>.jsonl
+    // （逐条持久化，崩溃恢复），空闲超时/触顶分段/关停补发时经 tool.call
+    // chat_memory_save 整段落地。幂等由服务端 raw UNIQUE(session_id, msg_id)
+    // 裁决；失败退避重试、缓冲保留，绝不阻塞主链路。
+    if (config.memorySave.mode === 'on') {
+      if (config.memorySave.retired?.length) {
+        logger(`警告：${config.memorySave.retired.join(' / ')} 已退役（配置更名为 GATEWAY_MEMORY_SAVE*），当前值被忽略`);
+      }
+      // 目标服务选路（selectMemoryService 三级）：显式 GATEWAY_MEMORY_SERVICE >
+      // 唯一声明 memoryService 的登记服务 > 多声明取字典序首个 + 一次性告警。
+      // saveTool 按登记能力对象声明动态调用（权威形态 {"saveTool": "..."}）；
+      // 布尔旧形态按存量缺省工具处理（LEGACY_MEMORY_SAVE_TOOL，一次性迁移告警）
+      // ——网关 src/core 不含具体工具名字面量，字面量只在此处作为兼容缺省存在。
+      // 登记可热加载，所以每次 save 现算，不缓存——services() 只是小数组映射。
+      let warnedMissing = false;
+      const resolveMemoryRoute = () => {
+        const route = selectMemoryService(serviceRegistry?.services?.() ?? [], {
+          explicit: config.memorySave.serviceId,
+          defaultSaveTool: LEGACY_MEMORY_SAVE_TOOL,
+          warn: (message) => logger(`警告：${message}`),
+        });
+        if ((!route?.id || !route?.saveTool) && !warnedMissing) {
+          warnedMissing = true;
+          logger('警告：未找到可用的记忆登记服务（无 memoryService 声明，且未显式指定 GATEWAY_MEMORY_SERVICE），save 进入退避重试');
+        }
+        if (route?.id && route?.saveTool) warnedMissing = false;
+        return route;
+      };
+      sessionSave = createSessionSave({
+        deliver: async (payload) => {
+          const route = resolveMemoryRoute();
+          if (!route?.id || !route?.saveTool) {
+            throw new Error('memory service unavailable（未找到 memoryService 声明的登记服务或 saveTool）');
+          }
+          await serviceRegistry.callServiceTool(route.id, {
+            tool: route.saveTool,
+            args: {
+              sessionKey: payload.sessionKey,
+              messages: payload.messages,
+              partial: payload.partial === true,
+            },
+            sessionKey: payload.sessionKey,
+          });
         },
-        windowMs: config.memoryIngest.windowMs,
-        maxBatch: config.memoryIngest.maxBatch,
+        bufferDir: config.memorySave.bufferDir,
+        idleMs: config.memorySave.idleMs,
+        maxMessages: config.memorySave.maxMessages,
+        maxChars: config.memorySave.maxChars,
         logger,
       });
-      memoryIngest.start();
-      logger(`memory ingest ready: url=${config.memoryIngest.url} windowMs=${config.memoryIngest.windowMs} batch=${config.memoryIngest.maxBatch}`);
+      sessionSave.start();
+      const target = config.memorySave.serviceId ?? 'auto(memoryService)';
+      logger(`session-save ready: service=${target} bufferDir=${config.memorySave.bufferDir} `
+        + `idleMs=${config.memorySave.idleMs} maxMessages=${config.memorySave.maxMessages} maxChars=${config.memorySave.maxChars}`);
     }
     // 出站动作只有一条路径：模型 → adapter-tools → 适配器 /v1/actions。
     // （platform-actions 已删除：它唯一的用途是回合文本自动投递。）
@@ -175,13 +280,14 @@ export async function main() {
     // rolecard-tools executor 已随 P3 转正退役。
     let toolHost = null;
     if (config.tools.mode === 'on') {
-      // 清单驱动工具面（adapter-tools）：向每个配了 callbackBase 的适配器拉清单，
+      // 清单驱动工具面（adapter-tools）：向每个配了 callbackBase 的消费端拉清单，
       // 统一装配成单个 executor（目录命名空间 chat_<platform>_*）。清单的 enabled 字段
-      // 由适配器现算（实现 + 开关），因此工具面里不会出现「注册了但必失败」的动作。
-      // 单个适配器失败 = 该平台没有工具面（记日志，不阻塞启动）；全部失败 = 不注册。
+      // 由消费端现算（实现 + 开关），因此工具面里不会出现「注册了但必失败」的动作。
+      // 消费端来源 = 登记视图（kind=consumer 且启用）。
+      // 单个消费端失败 = 该平台没有工具面（记日志，不阻塞启动）；全部失败 = 不注册。
       // 新平台接入只动 adapter-tools/（平台子文件夹 + index.mjs 注册表一行），本文件不再改。
       const fetched = [];
-      for (const adapter of config.adapters.filter((entry) => entry.callbackBase)) {
+      for (const adapter of (serviceRegistry?.consumers?.() ?? []).filter((entry) => entry.callbackBase)) {
         try {
           fetched.push({
             adapter,
@@ -199,7 +305,7 @@ export async function main() {
         const adapterTools = createAdapterToolsExecutor({
           adapters: fetched,
           logger,
-          // 投递载体：WS 优先 / HTTP 兜底（GATEWAY_WS=off 时等价于 deliverAction）。
+          // 投递载体：WS 优先 / HTTP 兜底（WS 通道常驻，无传输层开关）。
           deliver: deliverActionWithWs,
           // P5 回路链：发送动作外发文本在 POST /v1/actions 前过 returnPipelines
           //（deliverAction 拦截点：drop 拦截 / 改写 / fail-safe 原文照发）。
@@ -242,8 +348,11 @@ export async function main() {
       const serviceTools = serviceRegistry
         ? {
           resolveTool: (name) => serviceRegistry.registeredTools().find((tool) => tool.name === name) ?? null,
-          listTools: () => serviceRegistry.registeredTools().map(({ serviceId, name, description, inputSchema }) => ({
+          listTools: () => serviceRegistry.registeredTools().map(({ serviceId, name, description, inputSchema, role }) => ({
             serviceId, name, description, inputSchema,
+            // 2026-11-22 修复：role 必须透传——tool-host 的模型面要按角色过滤
+            //（decorator 是管线内部步骤，出现在模型面只会诱发探索式死循环）。
+            role,
           })),
           call: (serviceId, request) => serviceRegistry.callServiceTool(serviceId, request),
         }
@@ -251,7 +360,7 @@ export async function main() {
       toolHost = createToolHost({
         executorRegistry,
         serviceTools,
-        memoryIngest,
+        memoryIngest: sessionSave,
         logger,
         maxCallsPerTurn: config.tools.maxCallsPerTurn,
         callTimeoutMs: config.tools.callTimeoutMs,
@@ -263,25 +372,6 @@ export async function main() {
     // persona/记忆等装饰能力由登记的装饰器服务承载（管线步骤写装饰器角色的
     // 工具名，如 chat_role_render / chat_memory_recall）；快照/时间段等旧内置
     // section 已随 P3 转正退役，同类能力由外部装饰器服务按需补齐。
-    if (config.pipeline.mode === 'on' || config.tools.mode === 'on') {
-      // 外部装饰器/过滤器服务登记（登记目录）：目录缺失 = 只有内置步骤，不算错。
-      // V2 P3：登记装载（登记目录 + 台账 + 热加载）随 registry 启用——工具面
-      // 动态路由（GATEWAY_TOOLS=on）也依赖它，所以两个开关任一开启即装配。
-      serviceRegistry = createServiceRegistry({
-        pipelinesFile: config.pipeline.file,
-        stateDir: config.stateDir,
-        reservedIds: config.adapters.map((entry) => entry.id),
-        // 既有消费端（过渡期身份来源）：登记目录 kind=consumer 的服务注册后
-        // 同样拥有编排权限（P3 门禁见 service-registry.pipelineFor）。
-        consumerIds: config.adapters.map((entry) => entry.id),
-        defaultTimeoutMs: config.pipeline.stepTimeoutMs,
-        registrations: config.registrations,
-        logger,
-      });
-      logger(`service registry ready: services=${serviceRegistry.services().length} `
-        + `registrations=[${serviceRegistry.registrations().map((r) => r.id).join(', ') || '-'}] `
-        + `dir=${config.registrations.dir} reloadMs=${config.registrations.reloadMs}`);
-    }
     if (config.pipeline.mode === 'on') {
       // 内置步骤（不变量 §5.2）：protocol 只补会话令牌行——消息本体由管线 text
       // 承载；令牌是安全凭据，由 pipeline.mjs 强制殿后且不可被编排移除。
@@ -297,10 +387,8 @@ export async function main() {
         budgetChars: config.pipeline.budgetChars,
         logger,
       });
-      // 编排错误挡在启动阶段（fail-closed）：步骤名必须内置或已登记；
-      // 编排权限（P3）：管线键必须对应消费端身份（登记 consumer 或既有 adapter）。
-      pipeline.validate(config.adapters.map((entry) => entry.id));
-      serviceRegistry.assertPipelinePermissions();
+      // 步骤名校验与编排权限校验已从启动期挪到切换点（POST /v1/console/mode
+      // 切 on 时执行同一套校验链）——off 启动/零消费端启动不再被编排问题拦住。
       logger(`pipeline ready: budget=${config.pipeline.budgetChars} file=${config.pipeline.file} pipelines=[${serviceRegistry.pipelineKeys().join(', ')}]`);
     } else {
       // 回滚通道（GATEWAY_PIPELINE=off）：prompt 原样透传（P3 起无旧 assembler，
@@ -321,21 +409,33 @@ export async function main() {
       // 且 createTokenLedger 的默认值是空函数，不会报错。
       log: logger,
     });
+    // turn 索引：runner（写终态、启动时播种首轮判定）与 HTTP 端点（列表/详情）
+    // 必须共用同一实例——同一文件建两份会各写各的内存缓冲并互相覆盖轮转。
+    const turnStore = createTurnStore({ file: config.turnsFile, logger });
     const runner = createTurnRunner({
       config, dsh, registry, gateway: dshGateway, queue, executorRegistry,
       pipeline, toolHost, mailbox, logger,
       ledger: usageLedger,
+      turns: turnStore,
+      // 回合结束 → ws 下行（给适配器释放唤醒防重入标志）。wsHubRef 晚绑定：
+      // hub 在 createGatewayServer 内建（晚于此处装配），闭包运行时才解引用。
+      notifyTurnEnded: ({ adapterId, payload }) => { wsHubRef?.sendTo?.(adapterId, payload); },
     });
     runtime = {
       submit: (record) => runner.submit(record),
+      // HTTP 端点（/v1/turns、控制台列表）复用 runner 的 turn 索引实例。
+      turns: turnStore,
       // 退出前把 mailbox 的去抖写落盘：state-store 默认 200ms 合并写，直接
       // process.exit() 会丢掉最后一批游标/水位镜像（P4 里这些是权威副本）。
       stop: async () => {
         await runner.stop();
         // 记忆落库：停掉兜底轮询并把缓冲/重试队列冲干净再退出（丢最后一批 =
         // 那批消息的记忆缺口，幂等语义下重放也补不回来）。
-        memoryIngest?.stop();
-        await memoryIngest?.flushAll();
+        // 会话缓冲：停掉定时器并关停补发（整段 chat_memory_save）再退出——
+        // 丢最后一批 = 那批消息的记忆缺口；flushAll 失败的缓冲留在磁盘，
+        // 重启后 recoverFromDisk 恢复定时器继续补发。
+        sessionSave?.stop();
+        await sessionSave?.flushAll();
         // pending 转发的重试定时器：不清的话关停后还会再投一次（且挂住事件循环）。
         pendingForwarder?.close();
         mailbox?.close();
@@ -373,7 +473,8 @@ export async function main() {
           },
         };
       })(),
-      presetFiles: { describePreset, readSimPrompt, writeSimPrompt, listPresetBackups, restorePresetBackup },
+      // 预设文件层（sim-prompt 编辑/备份/还原）随预设所有权迁到桥接（2026-11-16），
+      // runtime 不再注入 presetFiles；控制台的预设面只回显活 DSH 清单。
       // pending 查看（docs/console/dsh-pending）：只读快照 + 容量 + 转发状态；
       // respond 是应答阶段装配——操作者显式处置才调 $events/result，成功才出列，
       // 失败保留条目以便重试（红线：无任何自动应答路径）。
@@ -393,17 +494,58 @@ export async function main() {
         },
         entry: (eventId) => dshGateway.pendingEntry(eventId),
       },
+      // 角色卡管理面（2026-11-20，控制台「角色卡」视图的后端）：core 只认注入的
+      // handler。owner = 登记里声明了 chat_role_switch 的 resource 服务（唯一管理
+      // 写工具，2026-11-21 起 admin_* 全部收敛）；retireAll 供「一键应用（切角色）」
+      // 联动——system 内容突变，存量 DSH 会话必须整体退役，下回合全新开始。
+      rolecardAdmin: {
+        call: (tool, args = {}) => {
+          const list = serviceRegistry?.registrations?.() ?? [];
+          // 2026-11-21 审计修复：owner 只认 enabled 的 resource 服务——disabled/
+          // 停用登记不应被选中（切卡动作打到死服务只会 502）。
+          const owner = list.find((r) => r.kind === 'resource' && r.enabled !== false
+            && Array.isArray(r.tools) && r.tools.includes('chat_role_switch'))?.id ?? null;
+          if (!owner) throw new Error('没有登记 chat_role_switch 的角色卡服务');
+          return serviceRegistry.callServiceTool(owner, { tool, args, sessionKey: 'console:rolecard-admin' });
+        },
+        retireAllSessions: () => registry.retireAll(),
+      },
       // V2 P2：/v1/health 的 pipeline 块数据源（管线 off 时为 null，health 显式 mode:off）。
       pipelineStatus: pipeline ? () => pipeline.status() : null,
       usageLedger,
     };
     dshGateway.start();
-    logger(`runtime assembled: preset=${config.chat.preset} model=${config.chat.provider}/${config.chat.model} whitelisted=${config.conversations.length}`);
+    // 预设由适配器声明（registration.presets）：启动日志只回显「谁声明了什么」，
+    // 网关自己不再持有平台→预设的映射，出问题时看适配器登记文件即可。
+    const presetMap = (serviceRegistry?.services() ?? [])
+      .filter((entry) => entry.kind === 'consumer' && entry.presets)
+      .map((entry) => `${entry.id}:`
+        + Object.entries(entry.presets).map(([platform, preset]) => `${platform}=${preset}`).join(','))
+      .join(' ') || '(适配器未声明)';
+    if (process.env.GATEWAY_CONVERSATIONS) {
+      // 变量留着不改不会拦消息，但会让人以为白名单还在网关——把话说死。
+      logger('⚠️ GATEWAY_CONVERSATIONS 已废弃且被忽略：号码白名单由适配器负责'
+        + '（qq-bridge 的 allow/deny），不在白名单的消息在适配器侧就被拦下');
+    }
+    logger(`runtime assembled: presets=${presetMap} fallback=${FALLBACK_PRESET}`
+      + ` model=${config.chat.provider}/${config.chat.model}`);
   }
 
-  const gateway = createGatewayServer({ config, logger, runtime, services: serviceRegistry, pipeline, memoryIngest });
+  // 常驻装配下的可见性：mode≠off 但零消费端 = 消息面武装了也没人能进来
+  //（入站 401），显式告警把「黑洞」变显式状态；切 on 的 fail-closed 在控制台端点。
+  if (config.mode !== 'off' && (serviceRegistry?.consumers().length ?? 0) === 0) {
+    logger('警告：GATEWAY_DATA_PLANE=' + config.mode + ' 但登记目录没有消费端——消息面空转，'
+      + '控制台注册消费端（或 npm run secrets:gen）后热加载即自动生效');
+  }
+
+  const gateway = createGatewayServer({
+    config, logger, runtime, services: serviceRegistry, pipeline, memoryIngest: sessionSave,
+    turns: runtime?.turns ?? null,
+    // 模式开关的持久化目标：启动时实际装载的 env 文件（GATEWAY_ENV_FILE 或包根 .env）。
+    envFile,
+  });
   // 装配顺序：registry 先于 ws-hub 建（ws-hub 握手要合并服务身份），这里回挂
-  // 连接面——service.call 的 WS 通道由它提供（HTTP 备用不依赖 ws-hub）。
+  // 连接面——tool.call 的 WS 通道由它提供（HTTP 备用不依赖 ws-hub）。
   serviceRegistry?.attachWs(gateway.ws);
   // 动作下行同理：executor 装配早于 ws-hub，晚绑定引用在这里补上（listen 之后
   // 才会有连接，因此不存在「装配完成前漏投」的窗口）。

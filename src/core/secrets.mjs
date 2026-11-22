@@ -81,7 +81,6 @@ export function writeSecretFile({ dir, id, secret, force = false }) {
  * @param {string} [options.platform]   adapter/wx 用；wx kind 缺省 'wx'
  * @param {string} options.secret
  * @param {string} [options.callbackBase] 适配器 /v1/actions 基址（片段展示用）
- * @param {string[]|null} [options.capabilities] 投递能力提示（来自 config.DELIVERABLE_ACTIONS）
  * @param {string} [options.gatewayUrl]
  */
 export function buildConfigSnippets({
@@ -90,7 +89,6 @@ export function buildConfigSnippets({
   platform,
   secret,
   callbackBase,
-  capabilities = null,
   gatewayUrl = 'http://127.0.0.1:7190',
 } = {}) {
   if (typeof secret !== 'string' || secret.length < MIN_SECRET_LENGTH) {
@@ -99,16 +97,18 @@ export function buildConfigSnippets({
 
   if (kind === 'mcp-bus') {
     return {
-      adaptersEntry: null,
-      bridgeGateway: null,
+      consumerEntry: null,
+      handoff: null,
       mcpToken: {
-        env: 'GATEWAY_MCP_TOKEN',
+        // 文件单源：env 通道（GATEWAY_MCP_BUS_TOKEN 及旧名）已退役——网关与
+        // 薄壳读同一份 state/gateway/mcp-bus.secret（npm run env:init 生成维护）。
+        file: 'state/gateway/mcp-bus.secret',
         value: secret,
-        note: 'mcp-bus 不进 adapters.json；setup-dsh.mjs 以 --token-file 指向 state/gateway/mcp-bus.secret，网关侧用 GATEWAY_MCP_TOKEN 或同一文件。',
+        note: 'mcp-bus 不进 adapters.json；npm run setup:dsh 写入的 DSH 条目以 --token-file 指向 state/gateway/mcp-bus.secret，网关侧读同一份文件。',
       },
       notes: [
-        `设置环境变量：$env:GATEWAY_MCP_TOKEN='${secret}'`,
-        `或在接入侧：$env:GATEWAY_MCP_TOKEN_FILE='<网关 state/gateway>/${id}.secret'（宿主 setup 脚本默认即此路径）`,
+        `写入网关侧密钥文件：Set-Content state/gateway/mcp-bus.secret '${secret}'（或 npm run env:init 生成）`,
+        '然后运行 npm run setup:dsh 把 mcp-bus 注册进 DSH（幂等，需重启 DSH 生效）',
       ],
     };
   }
@@ -118,31 +118,38 @@ export function buildConfigSnippets({
     ? 'http://127.0.0.1:7192'
     : 'http://127.0.0.1:3100');
 
-  const adaptersEntry = {
+  // 消费端登记条目（登记目录 = 唯一事实源；adapters.json 已退役，读到即拒载）：
+  // id 用 svc-<hash>（与平台解耦，同平台多账号互不冲突），url = callbackBase，
+  // platform 必填（动作会话定位 + 入站验签）。
+  const consumerEntry = {
+    v: 1,
     id,
+    name: id,
+    kind: 'consumer',
+    transport: 'auto',
+    url: resolvedCallbackBase,
     platform: resolvedPlatform,
     secretFile: `${id}.secret`,
-    callbackBase: resolvedCallbackBase,
-    ...(capabilities ? { capabilities: [...capabilities] } : {}),
     ...(kind === 'wx' ? { enabled: false } : {}),
   };
 
-  const bridgeGateway = {
-    mode: 'on',
-    url: gatewayUrl,
-    adapterId: id,
-    platform: resolvedPlatform,
-    secret,
-    conversations: [],
+  // 对端不再把网关段抄进自己的 config.json：改由 gen-secret 生成交接文件
+  // （state/gateway/handoff/<id>.gateway.json），复制到目标仓库根目录即可。
+  const handoff = {
+    fileName: 'gateway.json',
+    copyFrom: `handoff/${id}.gateway.json`,
+    note: '已生成交接文件（含 id、网关地址、secretFile 绝对路径）；复制到目标仓库根目录并保持文件名 gateway.json。'
+      + '目标侧不再从 config.json / 环境变量读网关连接信息。',
   };
 
   const notes = [
-    'adapters.json 片段放入 agent-gateway/state/gateway/adapters.json 的 adapters 数组（secretFile 相对 state/gateway 目录）。',
-    '桥接侧 gateway 段含密钥明文，粘贴进 config.json 后建议删除本密钥文件副本（保留 adapters.json 侧的 secretFile 即可）。',
+    `消费端登记条目写入 state/gateway/services/${id}.json（登记目录 = 唯一事实源，热加载生效；secretFile 相对 state/gateway 目录）。`,
+    `交接文件：state/gateway/handoff/${id}.gateway.json → 复制到目标仓库根目录并命名为 gateway.json（跨机用 npm run secrets:gen -- --inline-secret）。`,
+    '同平台多账号：重复运行本脚本（不传 --id，每次生成新的 svc- hash）+ 各自登记文件即可，互不冲突。',
   ];
   if (kind === 'wx') {
     notes.push('wx 条目默认 enabled:false 灰度：先以禁用状态登记，验证 /v1/health 可见后再翻转。');
-    notes.push('微信适配器侧不经 config.json，用等价环境变量/配置方式填入同一 secret。');
+    notes.push('微信适配器侧同样只读 gateway.json，不再使用等价环境变量。');
   }
-  return { adaptersEntry, bridgeGateway, mcpToken: null, notes };
+  return { consumerEntry, handoff, mcpToken: null, notes };
 }

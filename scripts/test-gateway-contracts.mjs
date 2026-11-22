@@ -29,6 +29,9 @@ const { createIdempotency } = await import(new URL('../src/core/idempotency.mjs'
 const { loadConfig } = await import(new URL('../src/core/config.mjs', import.meta.url).href);
 const { createGatewayServer } = await import(new URL('../src/core/server.mjs', import.meta.url).href);
 const { createGatewayClient } = await import(new URL('../../qq-bridge/src/gateway/gateway-client.js', import.meta.url).href);
+const { seedConsumer, createConsumerRegistry } = await import(
+  new URL('./support/consumer-registration.mjs', import.meta.url).href
+);
 
 const SECRET = 'test-secret-0123456789abcdef';
 const NOW = 1_762_300_000_000;
@@ -96,6 +99,9 @@ test('inbound: 合成唤醒事件（kind=event + wake）通过，坏标记被拒
   assert.equal(inboundIdempotencyKey(event), 'qq:group:123456:wait-1');
   // 普通入站也可以带 wake（例如「这条消息正好满足了等待」），kind 不必是 event。
   assert.equal(parseInbound(baseEnvelope({ wake: { kind: 'wait' } })).wake.status, undefined);
+
+  // 2026-11-18：user 类别（用户消息触发的唤醒），bridge 按 TIMER_WAKE_REASONS 分流。
+  assert.equal(parseInbound(baseEnvelope({ wake: { kind: 'user', status: 'arrived' } })).wake.kind, 'user');
 
   assert.throws(() => parseInbound(baseEnvelope({ kind: 'event', wake: { kind: 'timer' } })), ContractError);
   assert.throws(() => parseInbound(baseEnvelope({ wake: { kind: 'wait', extra: 1 } })), ContractError);
@@ -191,16 +197,20 @@ test('idempotency: 命中、TTL 过期与跨进程恢复', () => {
 
 // ----------------------------------------------------------------- server
 
-async function startServer({ mode = 'shadow', stateDir = tmpStateDir(), adapters, runtime } = {}) {
+async function startServer({ mode = 'shadow', stateDir = tmpStateDir(), consumers, runtime } = {}) {
+  // 消费端身份唯一来源 = 登记目录（env 三元组 / adapters.json 已退役）。
+  const seeded = consumers ?? [seedConsumer(stateDir, { id: 'qq-test', platform: 'qq', secret: SECRET })];
   const config = loadConfig({
     env: { GATEWAY_MODE: mode, GATEWAY_PORT: '0', GATEWAY_HOST: '127.0.0.1' },
     stateDir,
-    adapters: adapters ?? [{ id: 'qq-test', platform: 'qq', secret: SECRET }],
   });
-  const gateway = createGatewayServer({ config, logger: () => {}, ...(runtime ? { runtime } : {}) });
+  const services = mode === 'off' ? null : createConsumerRegistry({ stateDir });
+  const gateway = createGatewayServer({
+    config, logger: () => {}, services, ...(runtime ? { runtime } : {}),
+  });
   await gateway.listen();
   const { port } = gateway.server.address();
-  return { gateway, port, stateDir };
+  return { gateway, port, stateDir, consumers: seeded };
 }
 
 async function postInbound(port, envelope, { adapterId = 'qq-test', secret = SECRET, platform } = {}) {
@@ -224,13 +234,13 @@ test('server: health 免鉴权、inbound 落盘且幂等', async () => {
     const health = await (await fetch(`http://127.0.0.1:${port}/v1/health`)).json();
     assert.equal(health.ok, true);
     assert.equal(health.mode, 'shadow');
-    // 详细面（适配器能力/回投地址）需要凭据：公开面只回存活事实。
+    // 详细面（回投地址）需要凭据：公开面只回存活事实。
     const detail = await getWithAuth(port, '/v1/health?detail=1');
     assert.equal(detail.status, 200);
-    // P5 起 health 带上能力与回投地址（未声明 capabilities 的旧适配器显示 "all"）。
-    // V2 消费者抽象：kind/transport 缺省值（platform / auto）对旧配置透明。
+    // 能力清单不在 health 里：它随运行时 actions-manifest 变化，静态快照会骗人。
+    // 消费端身份来自登记目录（source 恒为 registry）。
     assert.deepEqual(detail.body.adapters, [{
-      id: 'qq-test', kind: 'platform', transport: 'auto', platform: 'qq', capabilities: 'all', actionsEndpoint: null,
+      id: 'qq-test', platform: 'qq', transport: 'auto', source: 'registry', actionsEndpoint: null,
     }]);
 
     const first = await postInbound(port, baseEnvelope());
@@ -244,10 +254,11 @@ test('server: health 免鉴权、inbound 落盘且幂等', async () => {
     assert.equal(second.body.deduped, true);
     assert.equal(second.body.turnId, first.body.turnId);
 
-    // 落盘可读。
+    // 落盘可读（会话键带消费端维度：4 段 `platform:consumerId:kind:id`）。
     const turn = await getWithAuth(port, `/v1/turns/${first.body.turnId}`);
     assert.equal(turn.status, 200);
-    assert.equal(turn.body.record.sessionKey, 'qq:group:123456');
+    assert.equal(turn.body.record.sessionKey, 'qq:qq-test:group:123456');
+    assert.equal(turn.body.record.adapterId, 'qq-test', 'turn 记录顶层带消费端 id');
 
     // 未知 turn → 404。
     const missing = await getWithAuth(port, '/v1/turns/turn_nope');

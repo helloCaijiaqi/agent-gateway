@@ -10,26 +10,38 @@ import test from 'node:test';
 const { loadConfig } = await import(new URL('../src/core/config.mjs', import.meta.url).href);
 const { createGatewayServer } = await import(new URL('../src/core/server.mjs', import.meta.url).href);
 const { issueOperatorSession } = await import(new URL('../src/core/auth.mjs', import.meta.url).href);
+const { seedConsumer, seedOperatorToken, createConsumerRegistry } = await import(
+  new URL('./support/consumer-registration.mjs', import.meta.url).href
+);
 
 const TOKEN = 'test-operator-token-0123456789';
 const SECRET = 'adapter-secret-0123456789';
 const ADAPTERS = [{ id: 'qq-main', platform: 'qq', secret: SECRET }];
 
-async function startServer(envExtra = {}, adapters = ADAPTERS) {
+async function startServer(envExtra = {}, adapters = ADAPTERS, seedOperator = true) {
   const stateDir = mkdtempSync(path.join(os.tmpdir(), 'gw-console-test-'));
+  // 消费端身份只认登记目录：把夹具条目落成 services/<id>.json。
+  for (const adapter of adapters) {
+    seedConsumer(stateDir, {
+      id: adapter.id, platform: adapter.platform, secret: adapter.secret, url: 'http://127.0.0.1:3100',
+    });
+  }
+  // 控制台凭据是文件单源（env 通道已退役）：预置 state/operator-token。
+  // seedOperator=false 用于「文件缺失 → config 自动生成」路径。
+  if (seedOperator) seedOperatorToken(stateDir, TOKEN);
   const config = loadConfig({
     // GATEWAY_PORT=0：node --test 并发跑多个文件，别的测试文件也可能监听默认端口。
-    env: { GATEWAY_MODE: 'shadow', GATEWAY_CONSOLE: 'on', GATEWAY_OPERATOR_TOKEN: TOKEN, GATEWAY_PORT: '0', ...envExtra },
-    adapters,
+    env: { GATEWAY_MODE: 'shadow', GATEWAY_CONSOLE: 'on', GATEWAY_PORT: '0', ...envExtra },
     stateDir,
   });
-  const gateway = createGatewayServer({ config, logger: () => {} });
+  const gateway = createGatewayServer({ config, logger: () => {}, services: createConsumerRegistry({ stateDir }) });
   await gateway.listen();
   return { gateway, config, stateDir, base: `http://127.0.0.1:${gateway.server.address().port}` };
 }
 
-test('console auth: 自动生成并持久化 operator token（fail-closed 的替代路径）', async () => {
-  const { gateway, stateDir } = await startServer({ GATEWAY_OPERATOR_TOKEN: '' });
+test('console auth: 无凭据文件时自动生成并持久化 operator token（fail-closed 的替代路径）', async () => {
+  // env 通道已退役：不预置 operator-token 文件，config 应自动生成（绝不无凭据开放）。
+  const { gateway, stateDir } = await startServer({}, ADAPTERS, false);
   try {
     const tokenFile = path.join(stateDir, 'operator-token');
     assert.ok(existsSync(tokenFile), 'token 应自动持久化到 state/operator-token');
@@ -42,6 +54,16 @@ test('console auth: 自动生成并持久化 operator token（fail-closed 的替
   } finally {
     await gateway.close();
   }
+});
+
+test('console auth: GATEWAY_OPERATOR_TOKEN env 已退役（读到即拒载）', () => {
+  const stateDir = mkdtempSync(path.join(os.tmpdir(), 'gw-console-retired-'));
+  seedConsumer(stateDir, { id: 'qq-main', platform: 'qq', secret: SECRET, url: 'http://127.0.0.1:3100' });
+  seedOperatorToken(stateDir, TOKEN);
+  assert.throws(() => loadConfig({
+    env: { GATEWAY_MODE: 'shadow', GATEWAY_PORT: '0', GATEWAY_OPERATOR_TOKEN: TOKEN },
+    stateDir,
+  }), /retired: the console credential now lives ONLY in/);
 });
 
 test('console auth: 登录换发 Cookie（HttpOnly/SameSite）与双凭据自检', async () => {
@@ -224,12 +246,13 @@ test('console auth: /v1/turns 双通道——仅持 operator 凭据可读（无�
 
 test('console auth: GATEWAY_CONSOLE=off 时控制面 503 且不要求凭据', async () => {
   const stateDir = mkdtempSync(path.join(os.tmpdir(), 'gw-console-off-'));
+  seedConsumer(stateDir, { id: 'qq-main', platform: 'qq', secret: SECRET, url: 'http://127.0.0.1:3100' });
+  seedOperatorToken(stateDir, TOKEN);
   const config = loadConfig({
-    env: { GATEWAY_MODE: 'shadow', GATEWAY_CONSOLE: 'off', GATEWAY_OPERATOR_TOKEN: TOKEN, GATEWAY_PORT: '0' },
-    adapters: ADAPTERS,
+    env: { GATEWAY_MODE: 'shadow', GATEWAY_CONSOLE: 'off', GATEWAY_PORT: '0' },
     stateDir,
   });
-  const gateway = createGatewayServer({ config, logger: () => {} });
+  const gateway = createGatewayServer({ config, logger: () => {}, services: createConsumerRegistry({ stateDir }) });
   await gateway.listen();
   try {
     const res = await fetch(`http://127.0.0.1:${gateway.server.address().port}/v1/console/session`);

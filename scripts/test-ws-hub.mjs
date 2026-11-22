@@ -11,6 +11,9 @@ import test from 'node:test';
 
 const { loadConfig } = await import(new URL('../src/core/config.mjs', import.meta.url).href);
 const { createGatewayServer } = await import(new URL('../src/core/server.mjs', import.meta.url).href);
+const { seedConsumer, createConsumerRegistry } = await import(
+  new URL('./support/consumer-registration.mjs', import.meta.url).href
+);
 
 const SECRET = 'adapter-secret-0123456789';
 
@@ -130,23 +133,31 @@ function makeEnvelope(platform, adapterId, messageId) {
   };
 }
 
-async function startServer(mode, adapters, extraEnv = {}) {
+async function startServer(mode, consumers, extraEnv = {}) {
   // 临时 stateDir：幂等账本/turn 落盘默认在仓库 state/ 下且跨进程持久，
   // 不隔离的话上一次运行的幂等键会让「首次提交」直接 deduped=true。
   const stateDir = mkdtempSync(path.join(os.tmpdir(), 'gw-ws-test-'));
+  // 消费端身份只认登记目录（WS 握手身份表与 HTTP 验签同源）。
+  for (const consumer of consumers) {
+    seedConsumer(stateDir, { id: consumer.id, platform: consumer.platform, secret: consumer.secret });
+  }
   const config = loadConfig({
-    env: { GATEWAY_MODE: mode, GATEWAY_WS: 'on', GATEWAY_WS_HEARTBEAT_MS: '5000', ...extraEnv },
-    adapters,
+    // GATEWAY_PORT=0：现网网关可能占用默认 7190，测试必须用临时端口。
+    env: { GATEWAY_DATA_PLANE: mode, GATEWAY_WS_HEARTBEAT_MS: '5000', GATEWAY_PORT: '0', ...extraEnv },
     stateDir,
   });
-  const gateway = createGatewayServer({ config, logger: () => {} });
+  const gateway = createGatewayServer({
+    config, logger: () => {}, services: createConsumerRegistry({ stateDir }),
+  });
   await gateway.listen();
   return { gateway, port: gateway.server.address().port };
 }
 
+// 同平台多消费端合法（QQ 多开 = 多份 kind=consumer 登记，各自 svc- 身份与密钥）。
+// 旧的 route 消费端（platform=null）随 adapters.json 一起退役。
 const ADAPTERS = [
   { id: 'qq-main', platform: 'qq', secret: SECRET },
-  { id: 'route-main', kind: 'route', secret: SECRET },
+  { id: 'qq-alt', platform: 'qq', secret: SECRET },
 ];
 
 // ---------------------------------------------------------------- 端到端
@@ -171,6 +182,13 @@ test('ws hub: 握手 + inbound ack + 幂等去重 + ping/pong + 未知帧 + 主�
     send(conn, { v: 1, type: 'ping' });
     assert.equal((await waitFor(conn, 'pong')).type, 'pong');
 
+    // 消费端对网关心跳的回执（type:'pong'）必须被静默吸收：不产生 error 帧
+    // （此前会落到 unknown frame type 分支，每 30s 刷一次 E_SCHEMA 噪音）。
+    const beforePong = conn.frames.length;
+    send(conn, { v: 1, type: 'pong', at: Date.now() });
+    await new Promise((r) => setTimeout(r, 80));
+    assert.equal(conn.frames.length, beforePong, 'pong 回执不产生任何下行帧');
+
     send(conn, { v: 1, type: 'nonsense' });
     assert.equal((await waitFor(conn, 'error')).error.code, 'E_SCHEMA');
 
@@ -187,21 +205,21 @@ test('ws hub: 握手 + inbound ack + 幂等去重 + ping/pong + 未知帧 + 主�
   }
 });
 
-test('ws hub: route 消费者不受平台绑定；platform 客户端跨平台声明帧级被拒', async () => {
+test('ws hub: 同平台多消费端各自独立；跨平台声明在帧级被拒', async () => {
   const { gateway, port } = await startServer('shadow', ADAPTERS);
   try {
-    // route 消费者没有平台，可提交任意平台的信封。
-    const route = await connectWs(port, `/v1/ws?${handshakeQuery(SECRET, 'route-main')}`);
-    send(route, { v: 1, type: 'inbound', envelope: makeEnvelope('qq', 'route-main', 'r1') });
-    assert.equal((await waitFor(route, 'inbound/ack')).ok, true);
+    // 同平台第二个消费端（qq-alt）合法，可独立提交 qq 信封。
+    const alt = await connectWs(port, `/v1/ws?${handshakeQuery(SECRET, 'qq-alt')}`);
+    send(alt, { v: 1, type: 'inbound', envelope: makeEnvelope('qq', 'qq-alt', 'r1') });
+    assert.equal((await waitFor(alt, 'inbound/ack')).ok, true);
 
-    // platform 客户端提交别的平台：ack 带回 E_AUTH（不断连接，帧级拒绝）。
+    // 平台绑定仍在：qq 消费端提交 wx 信封 → ack 带回 E_AUTH（不断连接，帧级拒绝）。
     const bound = await connectWs(port, `/v1/ws?${handshakeQuery(SECRET, 'qq-main')}`);
     send(bound, { v: 1, type: 'inbound', envelope: makeEnvelope('wx', 'qq-main', 'w1') });
     const refused = await waitFor(bound, 'inbound/ack');
     assert.equal(refused.ok, false);
     assert.equal(refused.error.code, 'E_AUTH');
-    for (const conn of [route, bound]) conn.socket.destroy();
+    for (const conn of [alt, bound]) conn.socket.destroy();
   } finally {
     await gateway.close();
   }
@@ -300,9 +318,9 @@ test('ws hub: inbound ack 回带 callId/adapterId，幂等键按消费者隔离'
   const { gateway, port } = await startServer('shadow', ADAPTERS);
   try {
     const a = await connectWs(port, `/v1/ws?${handshakeQuery(SECRET, 'qq-main')}`);
-    // route 消费者（platform=null）：与 qq-main 同一条消息，用于验证幂等键隔离
-    // （config 不允许同平台两个消息适配器，route 是唯一可共存身份）。
-    const b = await connectWs(port, `/v1/ws?${handshakeQuery(SECRET, 'route-main')}`);
+    // 同平台第二个消费端（qq-alt）：与 qq-main 上报同一条消息，用于验证幂等键隔离
+    // （多账号并存，幂等键必须按 consumerId 分段）。
+    const b = await connectWs(port, `/v1/ws?${handshakeQuery(SECRET, 'qq-alt')}`);
 
     // 1) ack 原样回带 callId 与握手身份（客户端据此精确关联 + 发现串号）。
     send(a, { v: 1, type: 'inbound', callId: 'c-1', envelope: makeEnvelope('qq', 'qq-main', 'm-1') });
@@ -313,10 +331,10 @@ test('ws hub: inbound ack 回带 callId/adapterId，幂等键按消费者隔离'
     assert.equal(ack.deduped, false);
 
     // 2) 另一个消费者上报同一条消息：不能被 A 的幂等键吞掉。
-    send(b, { v: 1, type: 'inbound', callId: 'c-2', envelope: makeEnvelope('qq', 'route-main', 'm-1') });
+    send(b, { v: 1, type: 'inbound', callId: 'c-2', envelope: makeEnvelope('qq', 'qq-alt', 'm-1') });
     const ackAlt = await waitFor(b, 'inbound/ack');
     assert.equal(ackAlt.callId, 'c-2');
-    assert.equal(ackAlt.adapterId, 'route-main');
+    assert.equal(ackAlt.adapterId, 'qq-alt');
     assert.equal(ackAlt.deduped, false, '不同消费者同名消息不得互相去重');
 
     // 3) 同一消费者重发：仍然 deduped（幂等语义未被放宽）。
