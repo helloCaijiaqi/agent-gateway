@@ -162,6 +162,7 @@ export async function main() {
       { createDshGateway }, { createTurnRunner }, { createToolHost }, { createMailbox },
       { createExecutorRegistry },
       { createWebSearchExecutor },
+      { createMediaSendExecutor },
       { createAdapterToolsExecutor, fetchAdapterManifest },
       { createSessionSave }] = await Promise.all([
       import('./runtime/dsh-client.mjs'),
@@ -173,6 +174,7 @@ export async function main() {
       import('./runtime/mailbox.mjs'),
       import('./executors/executor-interface.mjs'),
       import('./executors/web-search.mjs'),
+      import('./executors/media-send.mjs'),
       import('./executors/adapter-tools/index.mjs'),
       import('./runtime/memory-ingest.mjs'), // createSessionSave：会话缓冲管理器
     ]);
@@ -225,7 +227,7 @@ export async function main() {
       if (config.memorySave.retired?.length) {
         logger(`警告：${config.memorySave.retired.join(' / ')} 已退役（配置更名为 GATEWAY_MEMORY_SAVE*），当前值被忽略`);
       }
-      // 目标服务选路（selectMemoryService 三级）：显式 GATEWAY_MEMORY_SERVICE >
+      // 目标服务选路（selectMemoryService 二级，2026-11-22 env 显式指定退役）：
       // 唯一声明 memoryService 的登记服务 > 多声明取字典序首个 + 一次性告警。
       // saveTool 按登记能力对象声明动态调用（权威形态 {"saveTool": "..."}）；
       // 布尔旧形态按存量缺省工具处理（LEGACY_MEMORY_SAVE_TOOL，一次性迁移告警）
@@ -234,16 +236,28 @@ export async function main() {
       let warnedMissing = false;
       const resolveMemoryRoute = () => {
         const route = selectMemoryService(serviceRegistry?.services?.() ?? [], {
-          explicit: config.memorySave.serviceId,
           defaultSaveTool: LEGACY_MEMORY_SAVE_TOOL,
           warn: (message) => logger(`警告：${message}`),
         });
         if ((!route?.id || !route?.saveTool) && !warnedMissing) {
           warnedMissing = true;
-          logger('警告：未找到可用的记忆登记服务（无 memoryService 声明，且未显式指定 GATEWAY_MEMORY_SERVICE），save 进入退避重试');
+          logger('警告：未找到可用的记忆登记服务（无 memoryService 声明——在控制台编辑登记声明 memoryService），save 进入退避重试');
         }
         if (route?.id && route?.saveTool) warnedMissing = false;
         return route;
+      };
+      // 实时媒体登记旁路（媒体管道 v2）：收到含占位符的消息时立即把指导清单
+      // 推给 memory 的 chat_media_record（id 幂等 + 三源落盘），让当轮检索可用。
+      // 失败静默——save 时 ensureAssets 兜底重试。未装配 memory 服务时 no-op。
+      const mediaRecorderRoute = () => resolveMemoryRoute();
+      const recordMediaManifest = async (sessionKey, media) => {
+        const route = mediaRecorderRoute();
+        if (!route?.id) throw new Error('memory service unavailable');
+        await serviceRegistry.callServiceTool(route.id, {
+          tool: 'chat_media_record',
+          args: { sessionId: sessionKey, media },
+          sessionKey,
+        });
       };
       sessionSave = createSessionSave({
         deliver: async (payload) => {
@@ -261,6 +275,7 @@ export async function main() {
             sessionKey: payload.sessionKey,
           });
         },
+        mediaRecorder: recordMediaManifest,
         bufferDir: config.memorySave.bufferDir,
         idleMs: config.memorySave.idleMs,
         maxMessages: config.memorySave.maxMessages,
@@ -268,7 +283,7 @@ export async function main() {
         logger,
       });
       sessionSave.start();
-      const target = config.memorySave.serviceId ?? 'auto(memoryService)';
+      const target = 'auto(memoryService 声明)';
       logger(`session-save ready: service=${target} bufferDir=${config.memorySave.bufferDir} `
         + `idleMs=${config.memorySave.idleMs} maxMessages=${config.memorySave.maxMessages} maxChars=${config.memorySave.maxChars}`);
     }
@@ -343,16 +358,40 @@ export async function main() {
           logger(`web-search skipped: ${error?.message ?? error}`);
         }
       }
+      // 多媒体记忆层发送适配（2026-11-24）：chat_media_send 内置工具——平台无关的
+      // 媒体引用 → qq 格式转换器（resId 收藏通道/send_image 段/send_voice）→ deliver。
+      // memory 未装配 chat_media_get 时跳过注册（宁可缺工具，不放必然失败的占位）。
+      {
+        const resolveMemoryService = () => {
+          const tool = serviceRegistry?.registeredTools?.().find((item) => item.name === 'chat_media_get');
+          return tool?.serviceId ?? null;
+        };
+        if (resolveMemoryService()) {
+          const mediaSendExecutor = createMediaSendExecutor({
+            adapters: fetched ?? [],
+            deliver: deliverActionWithWs,
+            resolveMemoryService,
+            callServiceTool: (serviceId, request) => serviceRegistry.callServiceTool(serviceId, request),
+            logger,
+          });
+          executorRegistry.add(mediaSendExecutor);
+          logger('media-send ready: chat_media_send (built-in adapter)');
+        } else {
+          logger('media-send skipped: memory-mcp 未装配 chat_media_get');
+        }
+      }
       // V2 P3 服务执行器：登记工具（chat_memory_* 等）按登记路由到所属服务。
       // 每次调用现读登记表（不缓存）——热加载注册/卸载即刻生效，无需重启。
       const serviceTools = serviceRegistry
         ? {
           resolveTool: (name) => serviceRegistry.registeredTools().find((tool) => tool.name === name) ?? null,
-          listTools: () => serviceRegistry.registeredTools().map(({ serviceId, name, description, inputSchema, role }) => ({
+          listTools: () => serviceRegistry.registeredTools().map(({ serviceId, name, description, inputSchema, role, isAgentTool }) => ({
             serviceId, name, description, inputSchema,
             // 2026-11-22 修复：role 必须透传——tool-host 的模型面要按角色过滤
             //（decorator 是管线内部步骤，出现在模型面只会诱发探索式死循环）。
             role,
+            // isAgentTool 白名单透传：true 才进 /v1/tools 模型清单，缺省仅网关本地。
+            isAgentTool,
           })),
           call: (serviceId, request) => serviceRegistry.callServiceTool(serviceId, request),
         }
@@ -529,6 +568,14 @@ export async function main() {
     }
     logger(`runtime assembled: presets=${presetMap} fallback=${FALLBACK_PRESET}`
       + ` model=${config.chat.provider}/${config.chat.model}`);
+    // DSH 侧孤儿会话墓碑 drain（2026-11-23）：上次退役失败/手动编辑遗留的
+    // sessionId 在这里统一 retireSession（清 inbox->cancel->archive）。DSH 未
+    // 就绪时 registry 内部按墓碑保留重试，不阻塞启动。
+    registry.drainTombstones().then(({ drained, remaining }) => {
+      if (drained > 0 || remaining > 0) {
+        logger(`session-registry: 启动墓碑 drain 完成 — 清理 ${drained}，保留 ${remaining}`);
+      }
+    }).catch((error) => logger(`session-registry: 启动墓碑 drain 异常：${error?.message ?? error}`));
   }
 
   // 常驻装配下的可见性：mode≠off 但零消费端 = 消息面武装了也没人能进来

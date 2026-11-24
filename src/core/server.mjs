@@ -1318,7 +1318,18 @@ export function createGatewayServer({
             return;
           }
           logger(`console: manifest fetched: ${id} (${result.tools.length} tools${result.truncated ? ', truncated' : ''})`);
-          sendJson(res, 200, { ok: true, id: result.id, tools: result.tools, truncated: result.truncated });
+          // 登记已有声明合并（2026-11-25）：服务实时清单只有 name/description/
+          // inputSchema（role、isAgentTool 是网关登记侧的编辑面，服务不知道）。
+          // 预填以登记声明为权威覆盖——否则编辑器默认 role=tool、isAgentTool=false，
+          // 写回一次就会把 decorator 步骤和白名单标志静默冲掉（数据丢失路径）。
+          // 新工具（登记里没有的）按服务清单原样出现，供 operator 勾选加入。
+          const declaredByName = new Map((services.registrationToolDeclarations(id) ?? [])
+            .map((decl) => [decl.name, decl]));
+          const mergedTools = result.tools.map((tool) => {
+            const decl = declaredByName.get(tool?.name);
+            return decl ? { ...tool, ...decl } : tool;
+          });
+          sendJson(res, 200, { ok: true, id: result.id, tools: mergedTools, truncated: result.truncated });
           return;
         }
 
@@ -1339,13 +1350,22 @@ export function createGatewayServer({
             throw new ContractError('E_SCHEMA', 'body is not valid JSON');
           }
           const id = /^\/v1\/console\/services\/([a-z0-9][a-z0-9-]{1,62})\/tools$/.exec(pathname)[1];
-          const result = services.updateRegistrationTools(id, body?.tools);
+          // 记忆服务声明顺带编辑（2026-11-22）：body.memoryService 存在时才处理，
+          // 与 tools 清单写回同一端点（PUT /v1/console/services/<id>/tools），
+          // UI 的记忆服务声明控件与工具清单编辑器共用一次保存。
+          if (body?.memoryService !== undefined) {
+            const memResult = services.updateRegistrationMemory(id, body.memoryService);
+            if (!memResult.ok) {
+              sendError(res, memResult.status, 'E_SCHEMA', memResult.error);
+              return;
+            }
+          }          const result = services.updateRegistrationTools(id, body?.tools);
           if (!result.ok) {
             sendError(res, result.status, 'E_SCHEMA', result.error);
             return;
           }
           logger(`console: tools updated: ${id} -> ${result.tools.map((tool) => `${tool.name}(${tool.role})`).join(', ')}`);
-          sendJson(res, 200, { ok: true, id: result.id, tools: result.tools });
+          sendJson(res, 200, { ok: true, id: result.id, tools: result.tools, memoryService: services.registrations().find((entry) => entry.id === result.id)?.memoryService || null });
           return;
         }
 

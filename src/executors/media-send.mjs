@@ -1,0 +1,197 @@
+/**
+ * media-send executor（多媒体记忆层发送适配，2026-11-24）：
+ * 模型面唯一的媒体发送工具 chat_media_send——平台无关的媒体引用（mediaId/query）
+ * → 按「当前会话平台」选格式转换器 → 调对应平台发送动作。
+ *
+ * 适配层语义（用户定案）：适配的是**不同平台发送媒体文件格式不同**，不是媒体
+ * 类型路由。memory 层的 media_asset 完全平台无关（kind: image|voice|video|file，
+ * ref/sendHints 存平台发送凭据），平台差异被这里的转换器吃掉；新增平台 = 新增
+ * 一个 convertSend 分支，工具主体零改动。
+ *
+ * qq 平台转换规则：
+ *   image + sourcePath（memory 侧落盘）  → send_image { fileRef }（同机路径）
+ *   image + ref 是 URL                   → send_image { url }
+ *   voice + ref（语音库相对路径）        → send_voice { voice }
+ *   video / file                          → 显式 unsupported（bridge 无发送通道）
+ *
+ * 旧的 image+resId 收藏通道（send_sticker）已随 sticker 工具族物理删除
+ * （2026-11-24）：发送统一走 send_image 的 fileRef/URL 通道。
+ *
+ * 查询链路：mediaId 直查 chat_media_get；query 走 chat_media_search 取最佳
+ * （只认 ready 且有描述的资产）。发送成功回写 chat_media_mark_used（学习信号，
+ * 【多媒体】注入排序依据）。memory-mcp 未装配/查询失败 → 结构化降级（模型看到
+ * 明确错误），绝不静默。
+ */
+import { registerExecutor } from './executor-interface.mjs';
+
+const MEDIA_ID_RE = /^ma_[0-9a-f]{12}$/;
+const SEND_TIMEOUT_MS = 25000;
+
+/**
+ * @param {object} options
+ * @param {Array<{adapter: object, manifest: object}>} options.adapters
+ *        已拉取清单的适配器（与 createAdapterToolsExecutor 同结构，main.mjs 传入）
+ * @param {Function} options.deliver
+ *        投递载体 deliverActionWithWs（{adapter, action, entry, ctx, timeoutMs}）
+ * @param {Function} options.resolveMemoryService
+ *        () => 登记视图里媒体工具所属 serviceId（找不到 = null，memory 未装配）
+ * @param {Function} options.callServiceTool
+ *        (serviceId, request) => Promise<result>（serviceRegistry.callServiceTool）
+ * @param {(line: string) => void} [options.logger]
+ */
+export function createMediaSendExecutor({
+  adapters,
+  deliver,
+  resolveMemoryService,
+  callServiceTool,
+  logger = () => {},
+} = {}) {
+  const pool = (Array.isArray(adapters) ? adapters : []).filter(
+    (item) => item?.adapter && item?.manifest,
+  );
+
+  /** manifest 里找动作条目（entry：adapter-tools 同款 routing 形态）。 */
+  function findEntry(platform, action) {
+    for (const { adapter, manifest } of pool) {
+      if ((adapter.platform ?? '').toLowerCase() !== platform) continue;
+      const actions = Array.isArray(manifest?.actions) ? manifest.actions : [];
+      const entry = actions.find((item) => (item.type ?? item.name ?? item.id) === action);
+      if (entry) return { adapter, entry };
+    }
+    return null;
+  }
+
+  // ── 平台格式转换器（适配层核心）──────────────────────────────────────────
+  /**
+   * convertSend(asset, platform) → { action, args } | { unsupported, reason }
+   * asset 是 memory-mcp 认知面形状（chat_media_get/search 返回）。
+   */
+  function convertSend(asset, platform) {
+    if (platform !== 'qq') return { unsupported: true, reason: `platform "${platform}" has no media converter yet` };
+    const kind = String(asset?.kind ?? 'image');
+    const ref = String(asset?.ref ?? '');
+    const sourcePath = String(asset?.sourcePath ?? '');
+    if (kind === 'image') {
+      // 发送凭据三级回退（2026-11-25 修集成错位）：显式 sourcePath > http URL >
+      // ref 同机路径。memory 认知面（chat_media_get/search）把 memory 侧落盘
+      // 路径放在 ref（sendHints 之外的通用凭据位），bridge 与 memory 同机部署
+      // 时路径可直接读——旧实现只认 sourcePath 字段名，导致所有落盘资产都
+      // E_UNSUPPORTED（发图链路端到端失败）。
+      if (sourcePath) return { action: 'send_image', args: { fileRef: sourcePath } };
+      if (/^https?:\/\//.test(ref)) return { action: 'send_image', args: { url: ref } };
+      if (ref) return { action: 'send_image', args: { fileRef: ref } };
+      return { unsupported: true, reason: 'image asset has no sourcePath/url to send from' };
+    }
+    if (kind === 'voice') {
+      if (ref) return { action: 'send_voice', args: { voice: ref } };
+      return { unsupported: true, reason: 'voice asset has no library ref' };
+    }
+    return { unsupported: true, reason: `kind "${kind}" has no send channel on ${platform}` };
+  }
+
+  // ── memory 认知面查询 ───────────────────────────────────────────────────
+  async function fetchAsset({ mediaId, query, ctx }) {
+    const serviceId = resolveMemoryService?.();
+    if (!serviceId) {
+      return { error: 'E_SERVICE', message: 'memory-mcp 未装配媒体工具面（检查登记与 memory 服务）' };
+    }
+    const tool = mediaId ? 'chat_media_get' : 'chat_media_search';
+    const args = mediaId
+      ? { mediaId }
+      : { query: String(query ?? '').trim(), limit: 5 };
+    const result = await callServiceTool(serviceId, { tool, args, ctx: { sessionKey: ctx.sessionKey } });
+    // toolResult 信封解包（2026-11-25 修正形状错位）：callServiceTool 返回
+    // {v, callId, ok, data}，业务载荷在 data 层——旧实现直读 result.found /
+    // result.media 恒 undefined，ready 资产被误报 E_NOT_FOUND（发图链路假失败）。
+    const payload = result?.data ?? {};
+    if (tool === 'chat_media_get') {
+      if (!payload?.found) return { error: 'E_NOT_FOUND', message: `媒体 ${mediaId} 不存在或未就绪` };
+      const media = payload.media ?? {};
+      if (media.status && media.status !== 'ready') {
+        return { error: 'E_NOT_READY', message: `媒体 ${mediaId} 尚未解析完成（status=${media.status}），稍后再试` };
+      }
+      return { asset: media };
+    }
+    const items = Array.isArray(payload?.media) ? payload.media : [];
+    if (items.length === 0) {
+      return { error: 'E_NOT_FOUND', message: `没有匹配「${query}」的已识别媒体（换个更具体的描述词试试）` };
+    }
+    // search 已在 memory 侧过滤 ready；取第一个（收藏池评分序）。
+    return { asset: items[0], candidates: items };
+  }
+
+  return registerExecutor({
+    name: 'media-send',
+    actions: ['chat_media_send'],
+    tools: [{
+      name: 'chat_media_send',
+      description: '[写] 发送多媒体内容：按 mediaId 或含义描述（query）从记忆里找到图片/表情/语音并发送；caption 是随图文字（可选）',
+      action: 'chat_media_send',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          mediaId: { type: 'string', pattern: '^ma_[0-9a-f]{12}$', description: '媒体资产 id（chat_media_search 或记忆文本里 [图片|ma_xxx] 占位符的 id；媒体占位符语义由记忆服务指引维护）' },
+          query: { type: 'string', maxLength: 120, description: '按含义检索（如「橘猫梗图」「开心表情」）；与 mediaId 二选一' },
+          caption: { type: 'string', maxLength: 300, description: '随图发送的文字说明（可选）' },
+        },
+      },
+    }],
+    call: async ({ action, ctx }) => {
+      if (action !== 'chat_media_send') {
+        return { ok: false, degraded: true, code: 'E_UNSUPPORTED', message: `media-send does not own action "${action}"` };
+      }
+      const mediaId = String(ctx.payload?.mediaId ?? '').trim();
+      const query = String(ctx.payload?.query ?? '').trim();
+      if (!mediaId && !query) {
+        return { ok: false, degraded: true, code: 'E_ACTION', message: 'mediaId 与 query 必居其一' };
+      }
+      if (mediaId && !MEDIA_ID_RE.test(mediaId)) {
+        return { ok: false, degraded: true, code: 'E_ACTION', message: `mediaId 格式非法（应形如 ma_0123456789ab）：${mediaId.slice(0, 40)}` };
+      }
+      try {
+        const fetched = await fetchAsset({ mediaId, query, ctx });
+        if (fetched.error) {
+          return { ok: false, degraded: true, code: fetched.error, message: fetched.message };
+        }
+        const asset = fetched.asset;
+        // 平台判定：sessionKey 首段（qq:group:xxx → qq）。未知平台显式报错。
+        const platform = String(ctx.sessionKey ?? '').split(':')[0] || '';
+        const converted = convertSend(asset, platform);
+        if (converted.unsupported) {
+          return { ok: false, degraded: true, code: 'E_UNSUPPORTED', message: converted.reason };
+        }
+        const routed = findEntry(platform, converted.action);
+        if (!routed) {
+          return { ok: false, degraded: true, code: 'E_PLATFORM', message: `${platform} 平台清单里没有 ${converted.action} 动作（bridge 未启用或未拉到清单）` };
+        }
+        // caption 只对图片类有意义：塞进 args 由 bridge send_image 拼段；其它动作忽略。
+        const args = { ...converted.args };
+        if (converted.action === 'send_image' && ctx.payload?.caption) args.caption = String(ctx.payload.caption).slice(0, 300);
+        const delivery = await deliver({
+          adapter: routed.adapter,
+          action: converted.action,
+          entry: routed.entry,
+          ctx: { ...ctx, payload: args },
+          timeoutMs: SEND_TIMEOUT_MS,
+        });
+        if (!delivery?.ok) {
+          return {
+            ok: false, degraded: true, code: delivery?.code ?? 'E_PLATFORM',
+            message: `发送失败（${converted.action}）：${delivery?.message ?? '未知错误'}`,
+          };
+        }
+        // 发送成功 → 学习信号（best-effort，失败不影响回执）。
+        try {
+          const serviceId = resolveMemoryService?.();
+          if (serviceId && asset.mediaId) {
+            await callServiceTool(serviceId, { tool: 'chat_media_mark_used', args: { mediaId: asset.mediaId }, ctx: { sessionKey: ctx.sessionKey } });
+          }
+        } catch { /* 学习信号失败不阻断 */ }
+        logger(`media-send: ${asset.mediaId ?? mediaId} (${asset.kind}) -> ${converted.action} via ${routed.adapter.id}`);
+        return { ok: true, receipt: { sent: converted.action, mediaId: asset.mediaId ?? mediaId, kind: asset.kind, desc: String(asset.desc ?? '').slice(0, 80), ...(fetched.candidates && fetched.candidates.length > 1 ? { alternatives: fetched.candidates.slice(1, 4).map((c) => ({ mediaId: c.mediaId, desc: c.desc })) } : {}) } };
+      } catch (error) {
+        return { ok: false, degraded: true, code: 'E_PLATFORM', message: String(error?.message ?? 'media send failed') };
+      }
+    },
+  });
+}

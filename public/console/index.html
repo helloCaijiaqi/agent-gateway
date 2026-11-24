@@ -130,6 +130,24 @@
                 <div id="tools-editor" class="d-flex flex-column gap-2"></div>
                 <button type="button" class="btn btn-outline-secondary btn-sm mt-2" id="btn-add-tool">+ 添加工具</button>
 
+                <!-- 记忆服务声明（2026-11-22）：session-save 缓冲批量落地的目标。
+                     注册时服务尚未接入（manifest 拉不到），saveTool 用预置选项 +
+                     datalist 可手输；编辑已注册服务时由登记 tools 清单填充选项。 -->
+                <div class="form-check mt-3" id="memory-service-block">
+                  <input class="form-check-input" type="checkbox" id="reg-memory-service">
+                  <label class="form-check-label" for="reg-memory-service">
+                    声明为记忆服务（接收会话缓冲批量落地）
+                  </label>
+                </div>
+                <div class="mb-2 mt-2 hidden" id="memory-save-tool-row">
+                  <label class="form-label" for="reg-memory-save-tool">saveTool（落库工具名；注册时服务未接入，可手输）</label>
+                  <input class="form-control" id="reg-memory-save-tool" list="memory-save-tool-options" value="chat_memory_save" placeholder="chat_memory_save">
+                  <datalist id="memory-save-tool-options">
+                    <option value="chat_memory_save"></option>
+                  </datalist>
+                  <p class="muted small mb-0 mt-1">勾选后网关的会话缓冲（空闲/触顶/关停分段）将整段调用该工具落地；幂等由服务端 raw UNIQUE(session_id, msg_id) 裁决。</p>
+                </div>
+
                 <div class="d-flex gap-2 mt-3">
                   <button type="submit" class="btn btn-primary">注册</button>
                   <button type="reset" class="btn btn-outline-secondary">清空</button>
@@ -428,6 +446,20 @@
   </div>
 </div>
 
+<!-- 长内容详情弹窗（Bootstrap Modal），app.js 的 showDetailDialog() 使用：
+     配合 .cell-clamp 截断，所有内容过多的列表/卡片统一「钳 3 行 + 详情按钮 → 此弹窗」 -->
+<div class="modal fade" id="detail-modal" tabindex="-1" aria-labelledby="detail-title" aria-hidden="true">
+  <div class="modal-dialog modal-dialog-centered modal-lg modal-dialog-scrollable">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h5 class="modal-title" id="detail-title">详情</h5>
+        <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="关闭"></button>
+      </div>
+      <div class="modal-body"><div id="detail-body"></div></div>
+    </div>
+  </div>
+</div>
+
 <!-- 工具清单编辑器（Bootstrap Modal），app.js 的 manifestEditorDialog() 使用 -->
 <div class="modal fade" id="manifest-modal" tabindex="-1" aria-labelledby="manifest-title" aria-hidden="true">
   <div class="modal-dialog modal-dialog-centered modal-lg">
@@ -437,7 +469,7 @@
         <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="关闭"></button>
       </div>
       <div class="modal-body">
-        <p class="muted small mb-2">name 由服务定义（只读）；role 与 description 可改，写回后热生效。role 语义：tool=被动调用、decorator=可进管线改写 prompt、filter=可改写或丢弃消息。</p>
+        <p class="muted small mb-2">name 由服务定义（只读）；role 与 description 可改，写回后热生效。role 语义：tool=被动调用、decorator=可进管线改写 prompt、filter=可改写或丢弃消息。「DSH 可见」= isAgentTool 白名单：勾选才经 mcp-bus 暴露给 DSH 模型面，不勾则仅网关本地可用（内部调用通道照常）。</p>
         <div id="manifest-rows"></div>
       </div>
       <div class="modal-footer">

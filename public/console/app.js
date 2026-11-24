@@ -78,10 +78,20 @@ function confirmDialog(text, { okText = '确认', danger = true } = {}) {
   });
 }
 
+/** 长内容截断通则（2026-11-25）：列表/卡片里的超长说明只钳到 3 行（.cell-clamp），
+ *  完整内容经「详情」按钮在此弹窗展示——以后所有内容过多的场景一律走这个模式。 */
+function showDetailDialog(title, bodyHtml) {
+  $('#detail-title').textContent = title;
+  $('#detail-body').innerHTML = bodyHtml;
+  bootstrap.Modal.getOrCreateInstance($('#detail-modal')).show();
+}
+
 /**
  * 工具清单编辑模态（Bootstrap Modal）：每行 name 只读 + role 三选一下拉 +
- * description 可编辑；返回 Promise<tools|null>（确认=编辑后的数组，取消=null）。
- * 行值以服务清单预填；role 非法/缺省落 tool（与服务端 schema 缺省一致）。
+ * isAgentTool 复选框（DSH 可见白名单）+ description 可编辑；
+ * 返回 Promise<tools|null>（确认=编辑后的数组，取消=null）。
+ * 行值以服务清单+登记声明合并预填（服务端 manifest 端点已做权威合并）；
+ * role 非法/缺省落 tool（与服务端 schema 缺省一致）。
  * name 由服务定义只读——改名等于指向不存在的工具，服务端会拒绝。
  */
 function manifestEditorDialog(tools) {
@@ -99,6 +109,10 @@ function manifestEditorDialog(tools) {
       <select class="form-select form-select-sm manifest-role" style="max-width:130px" aria-label="role">
         ${ROLES.map((r) => `<option value="${r}"${r === role ? ' selected' : ''}>${r}</option>`).join('')}
       </select>
+      <label class="form-check form-check-inline flex-shrink-0 pt-1 mb-0" title="勾选后经 mcp-bus 暴露给 DSH 模型面；不勾 = 仅网关本地可用">
+        <input class="form-check-input manifest-agent" type="checkbox" ${tool.isAgentTool ? 'checked' : ''}>
+        <span class="form-check-label">DSH 可见</span>
+      </label>
       <input class="form-control form-control-sm manifest-desc" maxlength="500"
              value="${escapeHtml(tool.description ?? '')}" placeholder="工具描述（1-500 字）" aria-label="description">`;
     rowsEl.append(row);
@@ -122,6 +136,9 @@ function manifestEditorDialog(tools) {
           // 服务清单带过来的 inputSchema 透传不动（网关只挡「不是对象」）。
           inputSchema: source.inputSchema ?? {},
           role: row.querySelector('.manifest-role').value,
+          // isAgentTool 白名单（2026-11-25）：显式写回布尔——漏掉等于把已暴露
+          // 的工具悄悄从 DSH 面下架（schema 缺省 false）。
+          isAgentTool: row.querySelector('.manifest-agent').checked,
           description: desc || '（无描述）',
         };
       });
@@ -308,6 +325,10 @@ function addToolRow(tool = {}) {
           <input class="form-check-input tool-role" type="radio" name="tool-role-${Math.random().toString(36).slice(2)}" value="${role}" ${role === 'tool' ? 'checked' : ''}>
           <span class="form-check-label">${role}</span>
         </label>`).join('')}
+      <label class="form-check form-check-inline muted mb-0" title="勾选后经 mcp-bus 暴露给 DSH 模型面；不勾 = 仅网关本地可用（sessionSave/旁路等内部通道照常）">
+        <input class="form-check-input tool-isAgent" type="checkbox" ${tool.isAgentTool ? 'checked' : ''}>
+        <span class="form-check-label">DSH 可见（isAgentTool）</span>
+      </label>
       <button type="button" class="btn btn-outline-danger btn-sm ms-auto">移除</button>
     </div>`;
   row.querySelector('button').addEventListener('click', () => row.remove());
@@ -327,6 +348,7 @@ function collectTools() {
       name,
       description: row.querySelector('.tool-desc').value.trim() || name,
       role: row.querySelector('.tool-role:checked')?.value ?? 'tool',
+      isAgentTool: row.querySelector('.tool-isAgent')?.checked ?? false,
     });
   }
   return tools;
@@ -365,7 +387,18 @@ function syncRegistrationForm() {
     }
     if (!hasChecked) row.querySelector('.tool-role[value="tool"]').checked = true;
   }
+  // 记忆服务声明联动（2026-11-22）：仅 resource 显示；切 kind 复位勾选。
+  const memoryBlock = $('#memory-service-block');
+  const memoryRow = $('#memory-save-tool-row');
+  if (memoryBlock) memoryBlock.classList.toggle('hidden', !isResource);
+  if (memoryRow) memoryRow.classList.toggle('hidden', !(isResource && $('#reg-memory-service').checked));
+  if (!isResource && $('#reg-memory-service')) $('#reg-memory-service').checked = false;
 }
+
+// checkbox 勾选 → saveTool 行显隐（与 syncRegistrationForm 解耦的轻量联动）。
+$('#reg-memory-service').addEventListener('change', () => {
+  $('#memory-save-tool-row').classList.toggle('hidden', !$('#reg-memory-service').checked);
+});
 
 // ── 角色卡视图（2026-11-20）：人格唯一来源的管理面 ─────────────────────────
 // 数据面：GET /v1/console/rolecards（列表+当前）、GET/PUT …/:name（读/写）、
@@ -447,10 +480,13 @@ function svcCard({ id, name, kind, transport, url, enabled, memoryService, conne
     `<span class="badge text-bg-${enabled === false ? 'danger' : 'success'}">${enabled === false ? '停用' : '启用'}</span>`,
     `<span class="badge text-bg-secondary">${kind}</span>`,
     `<span class="badge text-bg-secondary">${transport ?? '—'}</span>`,
-    // 记忆服务徽标：memoryService:true 是 session-save 的 save 目标选路依据。
+    // 记忆服务徽标（2026-11-22）：支持布尔旧形态与 {saveTool} 对象形态——
+    // 对象形态展示实际 saveTool 值（session-save 缓冲批量落地的目标工具）。
     memoryService === true
-      ? '<span class="badge text-bg-primary" title="声明 memoryService —— 会话缓冲 chat_memory_save 的落地目标">记忆服务</span>'
-      : '',
+      ? '<span class="badge text-bg-primary" title="声明 memoryService（旧布尔形态，saveTool 走网关缺省）">记忆服务</span>'
+      : (memoryService && typeof memoryService === 'object' && memoryService.saveTool
+        ? `<span class="badge text-bg-primary" title="会话缓冲经该工具批量落地">${escapeHtml(memoryService.saveTool)}</span>`
+        : ''),
     // 预设声明徽标（consumer）：只是名字，内容在 qq-bridge 编辑安装。
     presetLabel && kind === 'consumer'
       ? `<span class="badge text-bg-info" title="DSH 预设声明（仅名字；内容编辑/安装在 qq-bridge）">预设 ${presetLabel}</span>`
@@ -469,6 +505,11 @@ function svcCard({ id, name, kind, transport, url, enabled, memoryService, conne
   const consoleOnlyCount = (tools ?? []).length - visibleTools.length;
   const chips = visibleTools.map((t) => `<span class="badge text-bg-dark border fw-normal">${t}</span>`).join('')
     + (consoleOnlyCount > 0 ? `<span class="badge text-bg-light border fw-normal" title="控制台专用（角色卡管理面），不进入模型/适配器工具面">另有 ${consoleOnlyCount} 个控制台专用工具</span>` : '');
+  // 记忆服务声明行内编辑（2026-11-22，resource 卡）：checkbox + saveTool。
+  // 注册时服务未接入（manifest 拉不到）→ 预置选项 + 可手输；此处编辑时
+  // 工具清单已可得，datalist 额外并入登记声明的工具名。
+  //（注意：以上是 JS 注释——曾误写进下方模板字符串里，`//` 行被当纯文本
+  // 渲染进 UI（2026-11-25 修复）；模板内禁放 `//` 注释。）
   card.innerHTML = `<div class="card-body p-3">
     <div class="d-flex align-items-center gap-2 flex-wrap"><strong>${name ?? id}</strong>${badges}</div>
     <div class="muted small d-flex gap-2 flex-wrap mt-1"><span>${id}</span>${file ? `<span>${file}</span>` : ''}</div>
@@ -482,6 +523,13 @@ function svcCard({ id, name, kind, transport, url, enabled, memoryService, conne
     ${kind !== 'consumer' && removable ? `<div class="mt-2 d-flex gap-2 align-items-center flex-wrap">
       <button class="btn btn-outline-secondary btn-sm manifest-fetch">从服务拉取工具清单</button>
       <span class="muted small">凭据用登记自身（url+secret）；写回后热生效，role 可在登记文件微调</span>
+    </div>` : ''}
+    ${kind !== 'consumer' && removable ? `<div class="mt-2 d-flex gap-2 align-items-center flex-wrap">
+      <label class="d-flex align-items-center gap-1"><input type="checkbox" class="form-check-input svc-mem-check"> 声明为记忆服务</label>
+      <input class="form-control form-control-sm svc-mem-tool" list="svc-mem-options-${id}" style="max-width:220px" placeholder="chat_memory_save" title="saveTool：会话缓冲批量落地的工具">
+      <datalist id="svc-mem-options-${id}"><option value="chat_memory_save"></option>${(tools ?? []).map((t) => `<option value="${t}"></option>`).join('')}</datalist>
+      <button class="btn btn-outline-primary btn-sm svc-mem-save">保存声明</button>
+      <span class="muted small">当前：${memoryService === true ? 'true（旧形态，saveTool 走网关缺省）' : (memoryService?.saveTool ?? '未声明')}</span>
     </div>` : ''}
     ${removable ? '<div class="mt-2"><button class="btn btn-outline-danger btn-sm">卸载</button></div>' : ''}
   </div>`;
@@ -507,6 +555,26 @@ function svcCard({ id, name, kind, transport, url, enabled, memoryService, conne
           toast(result.presets
             ? `预设声明已更新：${Object.entries(result.presets).map(([p, v]) => `${p}=${v}`).join(', ')}（下一回合生效；会话人设变化时会自动退役重建）`
             : '已清除预设声明（会话将改用内置 minimal）');
+          loadServices();
+        } catch (error) { toast(`保存声明失败：${error.message}`, 'bad'); }
+      });
+    }
+    // 记忆服务声明保存（2026-11-22）：PUT tools 端点顺带接受 memoryService
+    //（三态：勾选={saveTool}；取消=null 移除）。tools 原样回传（该端点要求
+    // tools 数组同场校验，避免单独调用被 400 拒绝）。
+    const memSave = card.querySelector('.svc-mem-save');
+    if (memSave) {
+      const memCheck = card.querySelector('.svc-mem-check');
+      const memTool = card.querySelector('.svc-mem-tool');
+      if (memoryService === true) memCheck.checked = true;
+      else if (memoryService && typeof memoryService === 'object' && memoryService.saveTool) { memCheck.checked = true; memTool.value = memoryService.saveTool; }
+      memTool.disabled = !memCheck.checked;
+      memCheck.addEventListener('change', () => { memTool.disabled = !memCheck.checked; });
+      memSave.addEventListener('click', async () => {
+        const memoryServiceDecl = memCheck.checked ? { saveTool: memTool.value.trim() || 'chat_memory_save' } : null;
+        try {
+          await api(`/v1/console/services/${id}/tools`, { method: 'PUT', body: { tools: tools ?? [], memoryService: memoryServiceDecl } });
+          toast('记忆服务声明已保存（热生效）');
           loadServices();
         } catch (error) { toast(`保存声明失败：${error.message}`, 'bad'); }
       });
@@ -618,6 +686,12 @@ $('#register-form').addEventListener('submit', async (event) => {
   if (Number.isFinite(timeoutMs) && timeoutMs > 0) body.timeoutMs = timeoutMs;
   if (secret) body.secret = secret;
   if (secretEnv) body.secretEnv = secretEnv;
+  // 记忆服务声明（2026-11-22）：勾选才提交；saveTool 空值回退预置 chat_memory_save。
+  // 注册时服务尚未接入（manifest 拉不到），选项靠预置 datalist + 手输。
+  if ($('#reg-memory-service').checked) {
+    const saveTool = $('#reg-memory-save-tool').value.trim() || 'chat_memory_save';
+    body.memoryService = { saveTool };
+  }
   try {
     const result = await api('/v1/console/services', { method: 'POST', body });
     renderRegisterResult(result);
@@ -995,13 +1069,22 @@ function renderLedger() {
   tbody.innerHTML = '';
   for (const event of events) {
     const tr = document.createElement('tr');
-    const snapshot = event.snapshot ? `<code>${JSON.stringify(event.snapshot)}</code>` : '';
+    // 说明/快照钳 3 行省略（cell-clamp），完整内容走「详情」弹窗（长内容通则）。
+    const hasDetail = Boolean(event.reason || event.snapshot);
+    const detailBody = `${event.reason ? `<p class="mb-2">${escapeHtml(event.reason)}</p>` : ''}${event.snapshot ? `<pre class="mb-0"><code>${escapeHtml(JSON.stringify(event.snapshot, null, 2))}</code></pre>` : ''}`;
     tr.innerHTML = `
       <td>${fmtTime(event.at)}</td>
       <td><code>${event.serviceId ?? '—'}</code></td>
       <td><span class="badge text-bg-${ACTION_BADGE[event.action] ?? 'secondary'}">${event.action}</span></td>
       <td>${event.source ?? '—'}</td>
-      <td class="text-break">${event.reason ? `⚠ ${event.reason}<br>` : ''}${snapshot}</td>`;
+      <td class="text-break">${hasDetail ? `
+        <div class="cell-clamp">${event.reason ? `⚠ ${escapeHtml(event.reason)}` : ''}${event.snapshot ? `<code class="d-block">${escapeHtml(JSON.stringify(event.snapshot))}</code>` : ''}</div>
+        <button type="button" class="btn btn-outline-secondary btn-sm mt-1 detail-btn">详情</button>` : '—'}</td>`;
+    if (hasDetail) {
+      tr.querySelector('.detail-btn').addEventListener('click', () => {
+        showDetailDialog(`台账详情 · ${event.serviceId ?? ''} · ${event.action}`, detailBody);
+      });
+    }
     tbody.appendChild(tr);
   }
   if (tbody.children.length === 0) {

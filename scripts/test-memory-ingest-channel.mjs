@@ -60,27 +60,14 @@ test('选择：多个候选 = 歧义，按 id 字典序取首个 + 一次性告�
   selectMemoryService([MEMORY_SERVICE, twin], { warn: (msg) => warnings.push(msg), defaultSaveTool: 'chat_memory_save' });
   assert.equal(warnings.length, 1);
 
-  // 显式指定后歧义消失（也不告警）；saveTool 仍按声明解析。
-  assert.deepEqual(
-    selectMemoryService([MEMORY_SERVICE, twin], { explicit: twin.id, defaultSaveTool: 'chat_memory_save' }),
-    { id: twin.id, saveTool: 'chat_memory_save' },
-  );
   // onAmbiguous='error'：宁报错也不猜。
   assert.throws(
     () => selectMemoryService([MEMORY_SERVICE, twin], { onAmbiguous: 'error', defaultSaveTool: 'chat_memory_save' }),
-    /GATEWAY_MEMORY_SERVICE/,
+    /只保留一个服务的声明/,
   );
 });
 
-test('选择：显式 id 未登记/已禁用直接报错（不退回自动识别）', () => {
-  assert.throws(
-    () => selectMemoryService([MEMORY_SERVICE], { explicit: 'd'.repeat(32) }),
-    /未登记或已禁用/,
-  );
-  assert.throws(
-    () => selectMemoryService([{ ...MEMORY_SERVICE, enabled: false }], { explicit: MEMORY_SERVICE.id }),
-    /未登记或已禁用/,
-  );
+test('选择：禁用的登记服务不参与自动识别', () => {
   // 禁用的服务即使声明了 memoryService 也不参与自动识别。
   assert.equal(selectMemoryService([{ ...MEMORY_SERVICE, enabled: false }]), null);
 });

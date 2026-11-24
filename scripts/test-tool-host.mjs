@@ -158,6 +158,12 @@ test('contracts: toolCall/toolResult schema', () => {
   const ok = parseToolResult({ v: 1, callId: 'c1', ok: true, data: { a: 1 } });
   assert.equal(ok.ok, true);
   assert.throws(() => parseToolResult({ v: 1, callId: 'c1', ok: false }), /must carry error/);
+  // 执行器业务降级码（2026-11-25 补录）必须是合法 toolResult——否则网关序列化
+  // 自身失败（400 E_SCHEMA），模型拿到误导性的 E_DSH_DOWN 而非真实错误。
+  for (const code of ['E_NOT_FOUND', 'E_NOT_READY', 'E_SERVICE']) {
+    parseToolResult({ v: 1, callId: 'c1', ok: false, error: { code, message: '降级' } });
+  }
+  assert.throws(() => parseToolResult({ v: 1, callId: 'c1', ok: false, error: { code: 'E_NOT_IN_ENUM', message: 'x' } }), /toolResult invalid/);
 });
 
 // ------------------------------------------------------- executor：假上游
@@ -268,9 +274,34 @@ test('tool-host: 登记工具经服务执行器路由；业务失败透传；内
   host2.registerTurn({ turnId: 'turn_2', turnToken: 'tok-2', sessionKey: 'qq:group:1' });
   const builtinWins = await host2.handle({ callId: 'c3', tool: 'chat_fake_echo', args: {}, turnToken: 'tok-2' });
   assert.deepEqual(builtinWins.data, { from: 'builtin' });
-  // 清单合并：内置 ∪ 登记（同名去重，内置在前）。
+  // 清单合并：内置 ∪ 显式 isAgentTool 的登记（同名去重，内置在前）。
+  // 白名单式（2026-11-25）：登记工具缺省不进清单——chat_fake_echo 未声明
+  // isAgentTool，只剩内置 chat_fake_echo；chat_memory_recall 同样未声明。
   assert.deepEqual(host2.listTools().map((tool) => tool.name), ['chat_fake_echo']);
-  assert.deepEqual(host.listTools().map((tool) => tool.name).sort(), ['chat_fake_echo', 'chat_memory_recall']);
+  assert.deepEqual(host.listTools().map((tool) => tool.name).sort(), ['chat_fake_echo']);
+
+  // isAgentTool 白名单：登记工具缺省不进 /v1/tools 模型清单（网关本地工具），
+  // 但 handle 调用路径照常路由（sessionSave/媒体旁路等内部通道可达）。
+  const hostLocal = createToolHost({
+    executorRegistry: createExecutorRegistry(),
+    serviceTools: {
+      resolveTool: (name) => (name === 'chat_memory_save' ? { serviceId: 'svc', name } : null),
+      listTools: () => [
+        { name: 'chat_memory_recall', description: '模型面', inputSchema: { type: 'object' }, serviceId: 'svc', isAgentTool: true },
+        { name: 'chat_memory_save', description: '网关本地（缺省不暴露）', inputSchema: { type: 'object' }, serviceId: 'svc' },
+      ],
+      call: async () => ({ callId: 'x', ok: true, data: { saved: true } }),
+    },
+    logger: () => {},
+  });
+  assert.deepEqual(
+    hostLocal.listTools().map((tool) => tool.name),
+    ['chat_memory_recall'],
+    '缺省 isAgentTool 不进模型清单（白名单式）',
+  );
+  hostLocal.registerTurn({ turnId: 'turn_l', turnToken: 'tok-l', sessionKey: 'qq:group:1' });
+  const localCall = await hostLocal.handle({ callId: 'c4', tool: 'chat_memory_save', args: {}, turnToken: 'tok-l' });
+  assert.equal(localCall.ok, true, '缺省工具仍可经内部通道调用');
 });
 
 // ---------------------------------------------------------- HTTP 契约路由
@@ -353,21 +384,29 @@ test('server: tools=off 时 /v1/tools 与 /v1/tools/call 返回 503', async () =
 
 // ------------------------------------------------------------- mcp-bus 薄壳
 
-test('mcp-bus: initialize/tools/list/tools/call 全链路（经假网关）', async () => {
-  const calls = [];
-  const server = http.createServer((req, res) => {
+// 假网关：/v1/tools/call 可按开关返回 400 错误（供错误详情透传用例复用）。
+function createBusFakeGateway({ calls, failWith = null } = {}) {
+  return http.createServer((req, res) => {
     let body = '';
     req.on('data', (c) => { body += c; });
     req.on('end', () => {
       calls.push({ url: req.url, headers: req.headers, body: body ? JSON.parse(body) : null });
-      res.writeHead(200, { 'content-type': 'application/json' });
+      if (failWith) res.writeHead(failWith.status, { 'content-type': 'application/json' });
+      else res.writeHead(200, { 'content-type': 'application/json' });
       if (req.url === '/v1/tools') {
         res.end(JSON.stringify({ ok: true, tools: [{ name: 'chat_memory_recall', description: '查记忆', action: 'memory.query', inputSchema: { type: 'object', properties: { limit: { type: 'integer' } } } }] }));
+      } else if (failWith) {
+        res.end(JSON.stringify({ ok: false, error: { code: failWith.code, message: failWith.message } }));
       } else {
         res.end(JSON.stringify({ v: 1, callId: calls.at(-1).body.callId, ok: true, data: { memories: [] } }));
       }
     });
   });
+}
+
+test('mcp-bus: initialize/tools/list/tools/call 全链路（经假网关）', async () => {
+  const calls = [];
+  const server = createBusFakeGateway({ calls });
   const baseUrl = await listen(server);
   try {
     const bus = createMcpBus({ gatewayUrl: baseUrl, secret: SECRET, logger: () => {} });
@@ -399,6 +438,40 @@ test('mcp-bus: initialize/tools/list/tools/call 全链路（经假网关）', as
     // 未知方法 → -32601。
     const unknown = await bus.handleMessage({ jsonrpc: '2.0', id: 5, method: 'resources/list' });
     assert.equal(unknown.error.code, -32601);
+  } finally {
+    server.close();
+  }
+});
+
+test('mcp-bus: 模型漏传 turnToken → 请求体省略字段（2026-11-25 防呆）', async () => {
+  const calls = [];
+  const server = createBusFakeGateway({ calls });
+  const baseUrl = await listen(server);
+  try {
+    const bus = createMcpBus({ gatewayUrl: baseUrl, secret: SECRET, logger: () => {} });
+    await bus.handleMessage({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'chat_media_send', arguments: { mediaId: 'ma_0123456789ab' } } });
+    const forwarded = calls.at(-1);
+    assert.equal('turnToken' in forwarded.body, false, '漏传令牌时不应带空串字段（空串会被网关拒成 400 E_SCHEMA，模型拿不到 E_FORBIDDEN 自纠指引）');
+    assert.equal(forwarded.body.args.mediaId, 'ma_0123456789ab');
+    // 显式传空串同样按「缺失」处理。
+    await bus.handleMessage({ jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'chat_media_send', arguments: { mediaId: 'ma_0123456789ab', turnToken: '' } } });
+    assert.equal('turnToken' in calls.at(-1).body, false, '显式空串也按缺失省略');
+  } finally {
+    server.close();
+  }
+});
+
+test('mcp-bus: 网关 4xx 错误详情透传（E_SCHEMA 等不再丢失）', async () => {
+  const calls = [];
+  const server = createBusFakeGateway({ calls, failWith: { status: 400, code: 'E_SCHEMA', message: 'toolCall invalid: turnToken Too small' } });
+  const baseUrl = await listen(server);
+  try {
+    const bus = createMcpBus({ gatewayUrl: baseUrl, secret: SECRET, logger: () => {} });
+    const resp = await bus.handleMessage({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'chat_media_send', arguments: { turnToken: 'x' } } });
+    assert.equal(resp.result.isError, true);
+    const parsed = JSON.parse(resp.result.content[0].text);
+    assert.equal(parsed.error.code, 'E_DSH_DOWN');
+    assert.match(parsed.error.message, /\(E_SCHEMA: toolCall invalid: turnToken Too small\)/, '错误详情应含 (错误码: 消息)，不得静默丢失');
   } finally {
     server.close();
   }

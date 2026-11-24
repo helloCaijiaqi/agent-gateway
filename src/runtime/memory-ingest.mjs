@@ -16,7 +16,11 @@
  *    observe* 永不抛错、永不 await 主链路。
  *
  * 消息记录（save args 的 messages 条目）：
- *   { msgId, senderId?, name?, nickname?, card?, text, createdAt?, kind? }
+ *   { msgId, senderId?, name?, nickname?, card?, text, createdAt?, kind?, media? }
+ * 媒体项（2026-11-24 多媒体记忆层）：envelope.message.media 存在时，observe 为每个
+ * 媒体项生成确定性占位符 id（ma_<sha1(sessionKey|msgId|index) 前 12 位>，重放幂等），
+ * text 组装为「文字 + [media:<id>] 占位符」，media 元数据随记录进 save payload——
+ * memory-mcp 落 raw 时按占位符自动建 media_asset 详情（pending），异步解析回写。
  * 入站来自 envelope.message.sender（names = {nickname, card}，桥接契约 V2 新增；
  * name 保留兼容 = card||nickname）；出站为机器人自己发的文本（无 senderId）。
  *
@@ -29,6 +33,14 @@ import path from 'node:path';
 import { createHash } from 'node:crypto';
 
 const RETRY_BACKOFF_CAP_MS = 10 * 60_000;
+// 公用占位符正则（媒体管道 v3，与 bridge media-placeholder / memory-mcp store-api 同源）：
+// 唯一格式 [<中文类型>|ma_<12hex>]（可选第三段容忍描述形态，提取只取 id）；
+// hashId 由 bridge 按内容 sha256 生成（跨消息同图同 id）；不做双格式兼容——
+// 历史 [media:ma_xxx] 已由 memory-mcp 迁移脚本全量改写。
+const MEDIA_ID_RE = /^ma_[0-9a-f]{12}$/;
+const MEDIA_PLACEHOLDER_RE = /\[(图片|语音|视频|文件|表情|媒体)\|(ma_[0-9a-f]{12})(?:\|[^\]]*)?\]/g;
+/** 清单 kind → 占位符中文类型（补挂时用）。 */
+const ZH_KIND = { image: '图片', voice: '语音', video: '视频', file: '文件' };
 
 /** sessionKey（如 `qq:group:123`）→ 文件安全名：非 [A-Za-z0-9._-] 字符转 `_xx`。 */
 export function encodeSessionKey(sessionKey) {
@@ -45,6 +57,10 @@ export function createSessionSave({
   maxChars = 20_000,
   /** 单条文本截断阈值（独立于总量触顶阈值；缺省随 maxChars）。 */
   maxMessageChars,
+  /** 实时媒体登记旁路（媒体管道 v2）：(sessionKey, manifestItems) => Promise。
+   *  main.mjs 注入：经 serviceRegistry 调 memory 的 chat_media_record。失败静默——
+   *  save 时 ensureAssets 兜底重试，绝不阻塞入站流转。 */
+  mediaRecorder = null,
   logger = () => {},
   now = Date.now,
 } = {}) {
@@ -125,7 +141,42 @@ export function createSessionSave({
   }
 
   /** 观察一条候选（双向通用）。同步入缓冲 + 落盘，永不抛错。msgId 必填。 */
-  function observe({ sessionKey, msgId, text, senderId, name, nickname, card, kind = 'episodic', createdAt }) {
+  /** 媒体项的确定性占位符 id：同一 (sessionKey, msgId, index) 无论重放多少次同 id。 */
+  function mediaPlaceholderId(sessionKey, msgId, index) {
+    const digest = createHash('sha1').update(`${sessionKey}|${msgId}|${index}`).digest('hex');
+    return `ma_${digest.slice(0, 12)}`;
+  }
+
+  /** 媒体项规范化：过滤合法项 + 生成占位符 id（无效项丢弃，绝不产生裸占位符）。 */
+  function normalizeMedia(sessionKey, msgId, rawMedia) {
+    if (!Array.isArray(rawMedia)) return null;
+    const items = [];
+    let index = 0;
+    for (const item of rawMedia) {
+      if (!item || typeof item !== 'object') continue;
+      const kind = ['image', 'voice', 'video', 'file'].includes(item.kind) ? item.kind : 'image';
+      const ref = String(item.ref ?? '').slice(0, 512);
+      const fileRef = String(item.fileRef ?? '').slice(0, 1024);
+      if (!ref && !item.url && !fileRef) continue; // 无引用的媒体项没法登记详情
+      // 媒体管道 v2：清单项自带公用 hashId（内容唯一）就用它——跨消息同图同 id
+      // 聚合 use_count/认知；旧格式（无 id）退回确定性生成。
+      const id = typeof item.id === 'string' && MEDIA_ID_RE.test(item.id)
+        ? item.id
+        : mediaPlaceholderId(sessionKey, msgId, index);
+      items.push({
+        id,
+        kind,
+        ...(ref ? { ref } : {}),
+        ...(fileRef ? { fileRef } : {}),
+        ...(item.url ? { url: String(item.url).slice(0, 512) } : {}),
+        ...(Number.isFinite(item.durationMs) ? { durationMs: Math.round(item.durationMs) } : {}),
+      });
+      index += 1;
+    }
+    return items.length ? items : null;
+  }
+
+  function observe({ sessionKey, msgId, text, senderId, name, nickname, card, kind = 'episodic', createdAt, media }) {
     if (!sessionKey || typeof msgId !== 'string' || !msgId) {
       logger(`session-save skipped: missing msgId (sessionKey=${sessionKey ?? ''})`);
       return;
@@ -133,6 +184,27 @@ export function createSessionSave({
     if (typeof text !== 'string') return;
     const normalized = text.replace(/\s+/g, ' ').trim();
     if (!normalized) return;
+    // 占位符调和（媒体管道 v3）：bridge 已把占位符**原位**写进 text——这里只做
+    // 三件事：①已登记的占位符原位保留（不重复追加）；②孤儿占位符（无清单项
+    // 对应，如 bridge 落盘失败的漏网）剥除替换为 [媒体]——绝不裸占位符；
+    // ③清单项有 id 但 text 里没有对应占位符（bridge 降级漏网）→ 尾部补挂新格式
+    // [图片|ma_xxx]（kind 中文映射）。media 元数据随 record 走（id/fileRef 供
+    // save 时 ensureAssets 三源落盘）。
+    const mediaItems = normalizeMedia(sessionKey, msgId, media);
+    let withPlaceholders = normalized;
+    if (mediaItems?.length) {
+      const knownIds = new Set(mediaItems.map((item) => item.id));
+      withPlaceholders = withPlaceholders.replace(MEDIA_PLACEHOLDER_RE, (whole, _zh, id) =>
+        knownIds.has(id) ? whole : '[媒体]');
+      const presentIds = new Set([...withPlaceholders.matchAll(MEDIA_PLACEHOLDER_RE)].map((m) => m[2]));
+      const missing = mediaItems.filter((item) => !presentIds.has(item.id));
+      if (missing.length) {
+        withPlaceholders = `${withPlaceholders} ${missing.map((item) => `[${ZH_KIND[item.kind] ?? '媒体'}|${item.id}]`).join(' ')}`;
+      }
+    } else {
+      // 无清单项但 text 里已有占位符：可能是快照重放的孤儿——剥除。
+      withPlaceholders = withPlaceholders.replace(MEDIA_PLACEHOLDER_RE, '[媒体]');
+    }
     const entry = entryOf(sessionKey, true);
     if (entry.messages.some((item) => item.msgId === msgId)) return; // 缓冲内去重（重放/多拦截点）
     const record = {
@@ -141,9 +213,10 @@ export function createSessionSave({
       ...(name ? { name: String(name).slice(0, 64) } : {}),
       ...(nickname ? { nickname: String(nickname).slice(0, 64) } : {}),
       ...(card ? { card: String(card).slice(0, 64) } : {}),
-      text: normalized.length > perMessageCap ? `${normalized.slice(0, perMessageCap)}…` : normalized,
+      text: withPlaceholders.length > perMessageCap ? `${withPlaceholders.slice(0, perMessageCap)}…` : withPlaceholders,
       ...(Number.isFinite(createdAt) ? { createdAt } : {}),
       kind,
+      ...(mediaItems ? { media: mediaItems } : {}),
     };
     entry.messages.push(record);
     entry.bytes += record.text.length;
@@ -339,8 +412,17 @@ export function createSessionSave({
       const isSyntheticEvent = envelope?.wake != null
         || /^(wake|wait)-/.test(String(message?.id ?? ''));
       if (isSyntheticEvent) {
-        // 快照补录：真实对话逐条观察（占位 message 本体不再入缓冲）。
+        // 快照补录：真实对话逐条观察（占位 message 本体不再入缓冲）。快照条目 text
+        // 已由 bridge 原位写入 [media:ma_xxx] 占位符（媒体管道 v2）——占位符对应媒体
+        // 从信封顶层 media 指导清单（hashId→fileRef/url）映射，随记录进 save payload。
         const snapshot = Array.isArray(envelope?.snapshot) ? envelope.snapshot : [];
+        const manifest = Array.isArray(envelope?.media) ? envelope.media : [];
+        const manifestById = new Map();
+        for (const m of manifest) {
+          if (m?.id && typeof m.id === 'string' && MEDIA_ID_RE.test(m.id)) {
+            manifestById.set(m.id, m);
+          }
+        }
         for (const item of snapshot) {
           if (!item || typeof item !== 'object' || item.isSelf === true) continue;
           const text = String(item.text ?? item.plain ?? '').trim();
@@ -358,7 +440,27 @@ export function createSessionSave({
             name: typeof item.sender === 'string' ? item.sender : item.sender?.name,
             kind: 'episodic',
             createdAt: Number.isFinite(parsedAt) ? parsedAt : undefined,
+            // 快照条目的媒体：text 中出现的占位符 id → 信封清单项（id/kind/fileRef/url）
+            ...(() => {
+              const ids = [...text.matchAll(MEDIA_PLACEHOLDER_RE)].map((m) => m[2]);
+              const mapped = ids.map((id) => manifestById.get(id)).filter(Boolean)
+                .map((m) => ({
+                  id: m.id,
+                  kind: ['image', 'voice', 'video', 'file'].includes(m.kind) ? m.kind : 'image',
+                  ...(m.fileRef ? { fileRef: String(m.fileRef).slice(0, 1024) } : {}),
+                  ...(m.url ? { url: String(m.url).slice(0, 512) } : {}),
+                }));
+              return mapped.length ? { media: mapped } : {};
+            })(),
           });
+        }
+        // 实时媒体登记旁路（fire-and-forget）：整个信封清单一次 record（记忆层
+        // 按 id 幂等补元数据 + 三源落盘），失败静默——save 时 ensureAssets 兜底。
+        if (manifest.length && typeof mediaRecorder === 'function') {
+          try {
+            const rec = mediaRecorder(sessionKey, manifest);
+            if (rec && typeof rec.catch === 'function') rec.catch(() => {});
+          } catch {}
         }
         return;
       }
@@ -374,6 +476,7 @@ export function createSessionSave({
         card: sender.names?.card,
         kind: 'episodic',
         createdAt: Number.isFinite(message.createdAt) ? message.createdAt : envelope?.receivedAt,
+        media: message.media,
       });
     },
     /** 出站观察：tool-host 发送成功点（真正发出去的文本才算）。

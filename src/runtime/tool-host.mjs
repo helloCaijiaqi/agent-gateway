@@ -47,7 +47,7 @@ const CONSOLE_ONLY_TOOLS = new Set(['chat_role_list', 'chat_role_switch']);
  */
 const SEND_ACTIONS = new Set([
   'send_text', 'reply', 'send_message', 'send_burst',
-  'send_sticker', 'send_voice', 'send_group_message', 'send_private_message', 'poke',
+  'send_voice', 'send_group_message', 'send_private_message', 'poke',
 ]);
 
 /**
@@ -246,7 +246,11 @@ export function createToolHost({
     const builtin = executorRegistry.listTools();
     const registered = serviceTools?.listTools?.() ?? [];
     const seen = new Set(builtin.map((tool) => tool.name));
-    return [...builtin, ...registered.filter((tool) => !seen.has(tool.name))]
+    // isAgentTool 白名单只作用于登记工具（2026-11-25）：登记工具缺省不进模型
+    // 清单（网关本地工具——sessionSave 落库、媒体旁路、学习信号回写等，内部
+    // 通道照常可达），显式 isAgentTool=true 才经 /v1/tools 暴露给 DSH；内置
+    // executors 是网关自有工具面，永远在清单、不受白名单影响。
+    return [...builtin, ...registered.filter((tool) => !seen.has(tool.name) && tool.isAgentTool === true)]
       .filter((tool) => !CONSOLE_ONLY_TOOLS.has(tool.name))
       // decorator/filter 是管线步骤：不进模型清单（handle 侧同样拒绝直调）。
       .filter((tool) => tool.role === undefined || tool.role === 'tool');

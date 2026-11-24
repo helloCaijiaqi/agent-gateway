@@ -28,7 +28,7 @@ const { AuthError, createNonceCache, signRequest, verifyRequest } = await import
 const { createIdempotency } = await import(new URL('../src/core/idempotency.mjs', import.meta.url).href);
 const { loadConfig } = await import(new URL('../src/core/config.mjs', import.meta.url).href);
 const { createGatewayServer } = await import(new URL('../src/core/server.mjs', import.meta.url).href);
-const { createGatewayClient } = await import(new URL('../../qq-bridge/src/gateway/gateway-client.js', import.meta.url).href);
+const { createGatewayClient } = await import(new URL('../../qq-bridge/bridge/src/gateway/gateway-client.js', import.meta.url).href);
 const { seedConsumer, createConsumerRegistry } = await import(
   new URL('./support/consumer-registration.mjs', import.meta.url).href
 );

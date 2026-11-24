@@ -264,3 +264,25 @@ svg.chart rect { transition: fill 0.15s; }
   opacity: 0.5;
   cursor: not-allowed;
 }
+
+/* ── 长内容截断通则（2026-11-25）─────────────────────────────────────────
+   表格/卡片里的超长说明钳到 3 行省略；完整内容走「详情」按钮 →
+   #detail-modal 弹窗（app.js showDetailDialog）。 */
+.cell-clamp {
+  display: -webkit-box;
+  -webkit-line-clamp: 3;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  max-width: 560px;
+}
+.cell-clamp code {
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+#detail-body pre {
+  max-height: 55vh;
+  overflow: auto;
+  background: var(--bs-tertiary-bg, #f8f9fa);
+  padding: 0.75rem;
+  border-radius: 0.375rem;
+}

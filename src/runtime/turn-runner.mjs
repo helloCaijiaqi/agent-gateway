@@ -288,6 +288,24 @@ export function createTurnRunner({
       logger(`turn ${turnId} failed (${code}): ${error?.message ?? error}`);
     }
 
+    // DSH 会话流污染自愈（2026-11-23）：gateway 重启/重连会打断进行中的
+    // 工具调用，DSH 内部 MCP client 会把不完整的 tool/result 写进会话流
+    // （format v4 校验：toolCallId 与 tool 源不匹配）——该会话从此每次调
+    // 工具都在同一处 error，永远无法自愈。识别到这类 error 时退役会话
+    // （含 DSH 侧 retireSession 清理），下回合自动开全新干净会话。
+    // （no-send fallback 已移除：error 回合本就不外发任何文本。）
+    if (
+      turnResult.status === 'error' &&
+      /format v4|toolCallId matching/i.test(String(turnResult.error?.message ?? turnResult.error ?? ''))
+    ) {
+      try {
+        await registry.retire(sessionKey, `DSH 会话流格式污染自愈：${String(turnResult.error?.message ?? turnResult.error).slice(0, 100)}`);
+        metrics?.inc('gateway_session_retire_total', { result: 'format-poison' });
+      } catch (error) {
+        logger(`turn ${turnId} 会话污染自愈失败：${error?.message ?? error}`);
+      }
+    }
+
     turns.put(turnId, {
       ...record,
       status: turnResult.status === 'completed' ? 'completed' : turnResult.status,
@@ -302,7 +320,9 @@ export function createTurnRunner({
         // token 用量（provider 原始桶）：GET /v1/usage 的唯一数据源。
         usage: turnResult.usage ?? null,
         // 工具调用账：calls=本轮工具调用数，sent=成功的发送类动作数。
-        // 删除自动投递后，「模型忘了发」只能靠这两个数字 + 下面这行日志定位。
+        // no-send fallback 已于 2026-11-25 彻底移除（hy4flash 把内心独白写成
+        // 回合文本被兜底原样发到 QQ，2026-11-24 私聊实测）——模型要发言必须
+        // 真实调用发送工具，回合文本永远只是思考。
         tools: toolStats ?? { calls: 0, sent: 0 },
       },
       finishedAt: now(),
@@ -332,9 +352,6 @@ export function createTurnRunner({
         });
       }
     } catch { /* 尽力而为 */ }
-    if (typeof turnResult.text === 'string' && turnResult.text.length > 0 && !(toolStats?.sent > 0)) {
-      logger(`turn ${turnId} no-send: 回合文本 ${turnResult.text.length} 字，但没有任何成功的发送工具调用（文本不会自动发到平台）`);
-    }
     return turnResult;
   }
 

@@ -376,8 +376,9 @@ export function loadConfig({ env = process.env, stateDir } = {}) {
   // （_MAX_MESSAGES / _MAX_CHARS）/进程关停时经 tool.call chat_memory_save
   // 整段落地。落地时机完全由网关裁决，记忆侧不再有内部调度器。
   //
-  // 目标服务仍由登记目录解析：GATEWAY_MEMORY_SERVICE 显式指定 id；缺省走
-  // selectMemoryService（登记声明 memoryService:true 的服务，多声明取字典序
+  // 目标服务由登记目录声明解析（selectMemoryService 自动选路；2026-11-22 起
+  // GATEWAY_MEMORY_SERVICE env 已退役入 retired 警告，声明是唯一选路事实源）：
+  // selectMemoryService（登记声明 memoryService 的服务，多声明取字典序
   // 首个 + 一次性告警；不再看 chat_memory_record 工具标记）。鉴权复用登记
   // HMAC 密钥——同一份身份、同一套 transport（WS 优先 / HTTP 兜底）。
   // 旧 GATEWAY_MEMORY_INGEST* 全家已退役：仍设置时只记告警（retired 数组，
@@ -387,6 +388,7 @@ export function loadConfig({ env = process.env, stateDir } = {}) {
     throw new Error(`GATEWAY_MEMORY_SAVE must be off|on, got "${env.GATEWAY_MEMORY_SAVE}"`);
   }
   const retiredMemoryEnv = [
+    'GATEWAY_MEMORY_SERVICE', // 2026-11-22 退役：选路完全走登记声明（selectMemoryService），env 显式指定不再生效。
     'GATEWAY_MEMORY_INGEST',
     'GATEWAY_MEMORY_INGEST_WINDOW_MS',
     'GATEWAY_MEMORY_INGEST_BATCH',
@@ -397,8 +399,8 @@ export function loadConfig({ env = process.env, stateDir } = {}) {
   ].filter((key) => env[key] !== undefined && String(env[key]).trim() !== '');
   const memorySave = {
     mode: memorySaveModeRaw,
-    // 显式指定登记服务 id（可空 = selectMemoryService 自动选路）。id 口径与登记文件一致。
-    serviceId: String(env.GATEWAY_MEMORY_SERVICE ?? '').trim() || null,
+    // 目标服务由登记声明解析（selectMemoryService 唯一声明自动选路）；
+    // env 显式指定（GATEWAY_MEMORY_SERVICE）已退役——仍被设置时进 retired 警告。
     // 缓冲持久化目录（JSONL 逐条追加；崩溃恢复的事实源）。
     bufferDir: path.join(dir, 'session-buffer'),
     // 空闲超时（会话收尾 save）与触顶分段阈值。
@@ -407,9 +409,6 @@ export function loadConfig({ env = process.env, stateDir } = {}) {
     maxChars: Number(env.GATEWAY_MEMORY_SAVE_MAX_CHARS ?? 20_000),
     retired: retiredMemoryEnv,
   };
-  if (memorySave.serviceId !== null && !/^[a-z0-9][a-z0-9-]{0,63}$/.test(memorySave.serviceId)) {
-    throw new Error(`GATEWAY_MEMORY_SERVICE must match /^[a-z0-9][a-z0-9-]{0,63}$/, got "${env.GATEWAY_MEMORY_SERVICE}"`);
-  }
   if (!Number.isSafeInteger(memorySave.idleMs) || memorySave.idleMs < 1000 || memorySave.idleMs > 86_400_000) {
     throw new Error(`GATEWAY_MEMORY_SAVE_IDLE_MS must be an integer in [1000, 86400000], got "${env.GATEWAY_MEMORY_SAVE_IDLE_MS}"`);
   }

@@ -58,25 +58,32 @@ export const MEDIA_KINDS = Object.freeze(['image', 'voice', 'video', 'file', 'st
  * 网关对新类型只做信封级校验——避免同一份 schema 在两仓各维护一份。
  */
 export const ACTION_TYPES = Object.freeze([
-  'send_text', 'reply', 'send_media', 'send_sticker', 'send_voice',
+  'send_text', 'reply', 'send_media', 'send_voice',
   'send_file', 'poke', 'mark_read', 'wait', 'set_wake', 'noop',
   // 适配器清单驱动扩容（能力事实源在适配器仓 src/actions-manifest.json）
   'send_message', 'send_burst', 'send_group_message', 'send_private_message',
   'get_prompt', 'get_unread', 'get_recent', 'get_my_recent', 'social_state',
-  'get_message_detail', 'get_message_images', 'get_forward_msg',
+  'get_message_detail', 'get_forward_msg',
   'get_active_members', 'get_group_members', 'list_groups', 'get_history',
-  'list_stickers', 'get_sticker_image', 'get_self_image',
-  'collect_sticker', 'sticker_note', 'set_sticker_remark', 'list_voices',
+  'list_voices',
   'memory_append', 'memory_query', 'memory_remove', 'memory_clear',
+  // 多媒体记忆层发送适配（2026-11-24）：chat_media_send 转换后的 qq 图片发送
+  'send_image',
   // pending 平台转发（docs/console/dsh-pending/PLAN.md 第二阶段）：
   // ask 把 DSH 提问转达给会话；approve 转达工具审批请求（均通知性质、不自动应答）。
   'ask', 'approve',
+  // sticker 8 件套与 get_message_images 已随多媒体迁移物理删除（2026-11-24）：
+  // 发送统一走 send_image / chat_media_send 的适配层，媒体认知归记忆资源服务。
 ]);
 
 export const ERROR_CODES = Object.freeze([
   'E_AUTH', 'E_REPLAY', 'E_SCHEMA', 'E_DUP', 'E_BUSY', 'E_POLICY',
   'E_DSH_DOWN', 'E_TIMEOUT', 'E_ACTION', 'E_PLATFORM', 'E_EXPIRED',
   'E_UNSUPPORTED', 'E_DISABLED', 'E_INTERNAL', 'E_FORBIDDEN', 'E_RATE_LIMITED',
+  // 执行器业务语义码（2026-11-25 补录）：media-send 等执行器以这些码做结构化
+  // 降级，却不在枚举里 → toolResult 自校验失败（400 E_SCHEMA），模型拿到的是
+  // 误导性的 E_DSH_DOWN 而非真实错误。补进枚举让降级语义直达模型。
+  'E_NOT_FOUND', 'E_NOT_READY', 'E_SERVICE',
 ]);
 
 /** 契约错误：带稳定 code，调用方可据此决定重试还是告警。 */
@@ -116,10 +123,14 @@ const senderSchema = z.strictObject({
 
 const mediaSchema = z.strictObject({
   kind: z.enum(MEDIA_KINDS),
-  ref: compactText(2048),
+  // ref（旧格式）与 id/fileRef/url（媒体管道 v2 清单项）并存；至少要有一种引用。
+  ref: compactText(2048).optional(),
+  id: idText(64).optional(),
+  fileRef: z.string().max(1024).optional(),
+  url: compactText(2048).optional(),
   mime: z.string().max(128).optional(),
   size: z.number().int().nonnegative().optional(),
-});
+}).refine((m) => Boolean(m.ref || m.fileRef || m.url), { message: 'media item needs ref/fileRef/url' });
 
 const quoteSchema = z.strictObject({
   messageId: idText(128),
@@ -163,6 +174,17 @@ const wakeSchema = z.strictObject({
   satisfiedSeq: z.number().int().nonnegative().optional(),
 });
 
+// 媒体管道 v2（2026-11-24）：bridge 侧指导清单（hashId→fileRef/url 去重映射）。
+// bridge 组装时把媒体落盘共享目录并按内容 sha256 算 hashId，文本里原位嵌入
+// [media:<id>] 占位符；网关扫描占位符后按此清单实时登记记忆层（record 旁路）。
+// 同图多张同 id 同占位符——bridge 已去重，网关/记忆层再兜底两层。
+const mediaGuideSchema = z.strictObject({
+  id: idText(64),
+  kind: z.enum(MEDIA_KINDS),
+  fileRef: z.string().max(1024).optional(),
+  url: compactText(2048).optional(),
+});
+
 export const inboundSchema = z.strictObject({
   v: z.literal(PROTOCOL_VERSION),
   platform: z.enum(PLATFORMS),
@@ -181,6 +203,8 @@ export const inboundSchema = z.strictObject({
   // P2：唤醒快照的结构化载荷（供 snapshot-section 渲染）。loose 是刻意的：
   // 快照条目形状由适配器演进，网关只消费 sender/text/at 等少数已知键。
   snapshot: z.array(z.looseObject({})).max(50).optional(),
+  // 媒体指导清单（媒体管道 v2）：与 message.media（旧格式）并存，顶层清单是登记依据。
+  media: z.array(mediaGuideSchema).max(64).optional(),
   // 兼容草案；网关以 HTTP 头为准（见文件头第 2 条）。
   auth: authSchema.optional(),
 });
@@ -364,6 +388,12 @@ export const serviceToolDeclarationSchema = z.strictObject({
   inputSchema: z.record(z.string(), z.unknown()).default({}),
   // 单值角色（三选一）；缺省纯工具面。
   role: z.enum(SERVICE_TOOL_ROLES).default('tool'),
+  // DSH 模型面暴露开关（2026-11-25，白名单式，与 role 正交）：true = 经 mcp-bus
+  // /v1/tools 暴露给 DSH 会话；缺省/false = 仅网关本地可用——/v1/tools/call
+  // 内部通道（sessionSave 落库、媒体旁路登记、学习信号回写等）照常可达，只是
+  // 不进模型清单。fail-closed：登记工具默认不泄漏给模型面，需要模型调用的
+  // 工具必须显式声明 isAgentTool=true。
+  isAgentTool: z.boolean().default(false),
 });
 
 export const serviceRegistrationSchema = z.strictObject({
@@ -535,7 +565,6 @@ const ACTION_PAYLOAD_RULES = Object.freeze({
   reply: (p) => requireText(p, 'messageId', 128) ?? requireText(p, 'text', 4000),
   send_media: (p) => requireEnum(p, 'kind', ['image', 'voice', 'video', 'file'])
     ?? requireText(p, 'ref', 2048),
-  send_sticker: (p) => requireText(p, 'id', 128),
   send_voice: (p) => requireText(p, 'ref', 2048),
   send_file: (p) => requireText(p, 'ref', 2048) ?? requireText(p, 'name', 255),
   poke: (p) => requireText(p, 'userId', 128),
@@ -560,18 +589,11 @@ const ACTION_PAYLOAD_RULES = Object.freeze({
   get_recent: () => null,
   get_my_recent: () => null,
   get_message_detail: () => null,
-  get_message_images: () => null,
   get_forward_msg: () => null,
   get_active_members: () => null,
   get_group_members: () => null,
   list_groups: () => null,
   get_history: () => null,
-  list_stickers: () => null,
-  get_sticker_image: () => null,
-  get_self_image: () => null,
-  collect_sticker: () => null,
-  sticker_note: () => null,
-  set_sticker_remark: () => null,
   list_voices: () => null,
   memory_append: () => null,
   memory_query: () => null,

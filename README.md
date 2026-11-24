@@ -254,10 +254,11 @@ id 与密钥），一个平台允许多个 enabled 消费端。会话键为 4 �
   并恢复空闲定时器继续补发。
 - **失败退避重试**：save 失败缓冲保留（内存 + 磁盘），指数退避封顶 10 分钟无限重试；
   真正的幂等裁决在服务端 raw 表 `UNIQUE(session_id, msg_id)` + 摘要窗口哈希。
-- **不需要额外地址或 token**：`GATEWAY_MEMORY_INGEST*` 全家已退役（更名
-  `GATEWAY_MEMORY_SAVE*`）——仍设置时启动只打一行告警并忽略（存量 `.env` 不会升级即挂）。
-- **目标服务识别**：`selectMemoryService` 三级选路——显式 `GATEWAY_MEMORY_SERVICE` >
-  唯一声明 `memoryService: true` 的登记服务 > 多声明按 id 字典序取首个 + 一次性告警。
+- **不需要额外地址或 token**：`GATEWAY_MEMORY_INGEST*` 全家与 `GATEWAY_MEMORY_SERVICE`
+  已退役（2026-11-22）——仍设置时启动只打一行告警并忽略（存量 `.env` 不会升级即挂）。
+- **目标服务识别**：`selectMemoryService` 二级选路（声明是唯一事实源，与控制台
+  声明编辑闭环）——唯一声明 `memoryService: {saveTool}` 的登记服务自动选路 >
+  多声明按 id 字典序取首个 + 一次性告警（可在控制台删多余声明消歧）。
   不再看 `chat_memory_record` 工具标记。没有候选时 save 进退避重试、只告警一次，不阻断启动。
 - save payload：`{sessionKey, messages:[{msgId, senderId?, name?, nickname?, card?, text, createdAt?, kind?}], partial?}`——
   `sender.names = {nickname, card}`（桥接入站契约新增；`name` 保留兼容 = card||nickname），

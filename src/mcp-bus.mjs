@@ -84,7 +84,10 @@ export function createMcpBus({ gatewayUrl, secret, requestTimeoutMs = REQUEST_TI
     if (!res.ok) {
       throw new Error(res.status === 0
         ? `gateway ${pathname} (${res.error})`
-        : `gateway ${pathname} -> HTTP ${res.status}${res.body?.error ? ` (${res.body.error.code}: ${res.body.error.message})` : ''}`);
+        // parse() 非 2xx 返回顶层 {code, error}（error 为字符串消息）——从这里取
+        // 详情（2026-11-25 修正：旧模板取 res.body.error.code 永远 undefined，
+        // 报错丢掉 (E_SCHEMA: ...) 详情，误导排查方向）。
+        : `gateway ${pathname} -> HTTP ${res.status}${res.code ? ` (${res.code}: ${res.error})` : ` (${res.error ?? 'no body'})`}`);
     }
     return res.body;
   }
@@ -93,6 +96,19 @@ export function createMcpBus({ gatewayUrl, secret, requestTimeoutMs = REQUEST_TI
     if (toolsCache.tools && Date.now() - toolsCache.at < TOOLS_CACHE_TTL_MS) return toolsCache.tools;
     const data = await gatewayRequest('GET', '/v1/tools');
     const tools = (Array.isArray(data?.tools) ? data.tools : []).map(withTurnToken);
+    // inputSchema 归一化（2026-11-25）：DSH 的 dsh-mcp-client 对每个工具强校验
+    // `inputSchema.type === 'object'`，一个不合格就把**整批** tools/list 判失败
+    // → 重连 10 次放弃 → 全部工具从模型面消失（2026-11-24 实测根因：登记声明
+    // 的三个 chat_media_* 工具漏写 inputSchema）。这里兜底：缺 schema/缺 type
+    // 一律补成合法 object schema，上游声明漂移不再能炸掉整个工具面。
+    for (const tool of tools) {
+      const schema = tool.inputSchema;
+      if (!schema || typeof schema !== 'object' || Array.isArray(schema)) {
+        tool.inputSchema = { type: 'object', properties: {} };
+      } else if (schema.type !== 'object') {
+        tool.inputSchema = { ...schema, type: 'object' };
+      }
+    }
     toolsCache = { tools, at: Date.now() };
     return tools;
   }
@@ -104,7 +120,10 @@ export function createMcpBus({ gatewayUrl, secret, requestTimeoutMs = REQUEST_TI
       callId: `call_${randomUUID()}`,
       tool: name,
       args: rest,
-      turnToken: String(turnToken ?? ''),
+      // 漏传即省略（2026-11-25 防呆）：模型没带令牌时强转空串会被 toolCallSchema
+      // 拒成 400 E_SCHEMA（模型拿到的是无指引的 E_DSH_DOWN 400）；缺省字段时
+      // tool-host 给出 E_FORBIDDEN「取最新提示中的【会话令牌】」——模型可自纠。
+      ...(turnToken ? { turnToken: String(turnToken) } : {}),
     };
     return gatewayRequest('POST', '/v1/tools/call', body);
   }

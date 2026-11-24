@@ -212,10 +212,10 @@ export function parsePipelineStepResult(role, data) {
 /**
  * 记忆服务选路（session-save 缓冲的 save 目标）。
  *
- * 三级优先：
- *   1. 显式 `GATEWAY_MEMORY_SERVICE`（必须已登记且未禁用，否则报错）；
- *   2. 唯一声明 `memoryService` 的登记服务；
- *   3. 多个声明 = 配置歧义：按 id 字典序取首个 + 一次性告警（onAmbiguous
+ * 二级优先（2026-11-22 起：GATEWAY_MEMORY_SERVICE env 显式指定已退役，声明
+ * 是唯一选路事实源——与控制台 UI 的声明编辑闭环）：
+ *   1. 唯一声明 `memoryService` 的登记服务；
+ *   2. 多个声明 = 配置歧义：按 id 字典序取首个 + 一次性告警（onAmbiguous
  *      缺省 'first-warn'；'error' 则改为抛错——宁可报错也不猜）。
  *
  * saveTool 解耦（登记能力对象）：声明形态 `memoryService: { saveTool }` 为
@@ -224,33 +224,31 @@ export function parsePipelineStepResult(role, data) {
  *
  * @param {Array<{id: string, enabled?: boolean, memoryService?: boolean|{saveTool: string}}> } services
  *        registry.services() 形状
- * @param {{explicit?: string|null, defaultSaveTool?: string|null,
+ * @param {{defaultSaveTool?: string|null,
  *          onAmbiguous?: 'first-warn'|'error', warn?: Function}} [options]
  * @returns {{id: string, saveTool: string|null}|null} 选路结果；null = 没有候选
  *          （服务未上线，调用方可重试）。saveTool null = 布尔旧形态且未提供缺省。
  */
-export function selectMemoryService(services, { explicit = null, defaultSaveTool = null, onAmbiguous = 'first-warn', warn = () => {} } = {}) {
+export function selectMemoryService(services, { defaultSaveTool = null, onAmbiguous = 'first-warn', warn = () => {} } = {}) {
   const visible = (services ?? []).filter((service) => service.enabled !== false);
   const declared = visible.filter((service) => Boolean(service.memoryService));
   const pick = (service) => {
     const declaration = service.memoryService;
     if (declaration && typeof declaration === 'object') return declaration.saveTool ?? null;
     // 布尔旧形态：saveTool 交给组合根的存量缺省，一次性告警提示迁移。
-    if (!memoryServiceLegacyFormWarned.has(service.id)) {
-      memoryServiceLegacyFormWarned.add(service.id);
-      warn(`服务 ${service.id} 的 memoryService 仍是旧布尔形态——请迁移为对象形态 `
-        + `{"saveTool": "<chat_* 工具名>"}（旧形态按网关内置缺省工具处理，即将退役）`);
+    if (declaration === true) {
+      if (!memoryServiceLegacyFormWarned.has(service.id)) {
+        memoryServiceLegacyFormWarned.add(service.id);
+        warn(`服务 ${service.id} 的 memoryService 仍是旧布尔形态——请迁移为对象形态 `
+          + `{"saveTool": "<chat_* 工具名>"}（旧形态按网关内置缺省工具处理，即将退役）`);
+      }
+      return defaultSaveTool;
     }
+    // 未声明（undefined/null）：自动选路命中时按缺省工具兜底——这不是旧布尔
+    // 形态，不打迁移告警（2026-11-22 修正：旧实现把「无声明」也误报成旧布尔，
+    // 文案误导排查方向）。
     return defaultSaveTool;
   };
-  if (explicit) {
-    const service = visible.find((entry) => entry.id === explicit);
-    if (!service) {
-      const known = visible.map((entry) => entry.id).join(', ') || '无';
-      throw new Error(`GATEWAY_MEMORY_SERVICE=${explicit} 未登记或已禁用（可用登记：${known}）`);
-    }
-    return { id: explicit, saveTool: pick(service) };
-  }
   const candidates = [...declared].sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
   if (candidates.length <= 1) {
     const picked = candidates[0];
@@ -259,7 +257,7 @@ export function selectMemoryService(services, { explicit = null, defaultSaveTool
   const ids = candidates.map((service) => service.id);
   if (onAmbiguous === 'error') {
     throw new Error(
-      `多个登记服务声明了 memoryService（${ids.join(', ')}）：请用 GATEWAY_MEMORY_SERVICE 指定其一`,
+      `多个登记服务声明了 memoryService（${ids.join(', ')}）：请只保留一个服务的声明`,
     );
   }
   // first-warn：字典序首个 + 一次性告警（同一候选集合只告警一次）。
@@ -268,7 +266,7 @@ export function selectMemoryService(services, { explicit = null, defaultSaveTool
     memoryServiceAmbiguityWarned.add(dedupeKey);
     warn(
       `多个登记服务声明了 memoryService（${ids.join(', ')}）：按 id 字典序取 ${ids[0]}；`
-      + '请用 GATEWAY_MEMORY_SERVICE 显式指定其一',
+        + '请只保留一个服务的声明（在控制台编辑各登记的 memoryService）',
     );
   }
   const winner = candidates[0];
@@ -732,6 +730,43 @@ export function createServiceRegistry({
      * @returns {{ok:true, id:string, presets:(object|null)}|
      *           {ok:false, status:number, error:string}}
      */
+    // updateRegistrationMemory（2026-11-22）：记忆服务声明三态编辑——
+    // {saveTool}（权威对象形态）/ true（旧布尔兼容）/ null（移除）。
+    // 写登记文件 + 立即重扫（热加载生效），与 presets/tools 编辑同模式。
+    updateRegistrationMemory(id, decl) {
+      const entry = registeredById.get(String(id ?? ''));
+      if (!entry) return { ok: false, status: 404, error: `登记不存在：${id}` };
+      let normalized;
+      if ([null, undefined].includes(decl)) {
+        normalized = null;
+      } else if (decl === true) {
+        normalized = true;
+      } else if (typeof decl === 'object') {
+        if (Array.isArray(decl)) return { ok: false, status: 400, error: 'memoryService 必须是 {saveTool} / true / null' };
+        const saveTool = typeof decl.saveTool === 'string' ? decl.saveTool.trim() : '';
+        if (!/^chat_[a-z0-9_]{1,240}$/.test(saveTool)) return { ok: false, status: 400, error: 'saveTool 必须形如 chat_memory_save（chat_ 前缀 + 小写/数字/下划线）' };
+        normalized = { saveTool };
+      } else {
+        return { ok: false, status: 400, error: 'memoryService 必须是 {saveTool} / true / null' };
+      }
+      if (!entry.file) return { ok: false, status: 500, error: '登记记录缺少 file 字段，无法写回' };
+      let raw;
+      try {
+        raw = JSON.parse(fs.readFileSync(entry.file, 'utf8'));
+      } catch (error) {
+        return { ok: false, status: 500, error: `登记文件不可读：${error?.message ?? error}` };
+      }
+      if (normalized === null) delete raw.memoryService;
+      else raw.memoryService = normalized;
+      try {
+        fs.writeFileSync(entry.file, JSON.stringify(raw, null, 2) + '\n', { encoding: 'utf8', mode: 0o600 });
+      } catch (error) {
+        return { ok: false, status: 500, error: `登记文件写入失败：${error?.message ?? error}` };
+      }
+      scanRegistrations('operator');
+      return { ok: true, id: entry.id, memoryService: normalized };
+    },
+
     updateRegistrationPresets(id, presets) {
       const entry = registeredById.get(String(id ?? ''));
       if (!entry) return { ok: false, status: 404, error: `登记不存在：${id}` };
@@ -797,11 +832,19 @@ export function createServiceRegistry({
         url: url ?? null,
         platform: platform ?? null,
         enabled,
-        memoryService: Boolean(memoryService),
+        memoryService: memoryService ?? null, // 2026-11-22：原样透出（boolean|{saveTool}）——Boolean() 会把 {saveTool} 压成 true，PUT 响应/徽标丢失 saveTool
         file: path.basename(file),
         tools: tools.map((tool) => tool.name),
         presets: presets ?? null,
       }));
+    },
+
+    /** 单服务登记的工具声明全文（控制台清单编辑合并用；未登记返回 null）。
+     *  服务实时清单不含 role/isAgentTool/inputSchema 编辑面——预填必须以登记
+     *  声明为权威合并，否则编辑一次写回就会把 decorator 角色与白名单标志冲掉。 */
+    registrationToolDeclarations(id) {
+      const entry = registeredById.get(String(id ?? ''));
+      return entry ? entry.tools.map((tool) => ({ ...tool })) : null;
     },
 
     /** 已登记且启用的工具面（tool-routing 的 /v1/tools 合并源）。 */
@@ -817,6 +860,8 @@ export function createServiceRegistry({
             inputSchema: tool.inputSchema,
             // 单值角色随声明透出：tool-host 只关心 tool，管线解析看 decorator/filter。
             role: tool.role,
+            // DSH 模型面暴露开关随声明透出：tool-host 清单按 isAgentTool=true 过滤（白名单式）。
+            isAgentTool: tool.isAgentTool,
           });
         }
       }

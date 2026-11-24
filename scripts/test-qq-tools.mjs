@@ -280,7 +280,7 @@ test('集成：registry 路由 + tool-host（chat_qq_* 工具调用返回 {ok, d
 test('跨仓：真实 qq-bridge 清单可直接装配（工具名合规、投递让位、敏感默认关闭）', async () => {
   // 与 test-actions-manifest.mjs 同一跨仓驱动方式：清单是唯一事实源，
   // 网关必须能吃下桥接仓的真实清单——结构漂移会在这里先炸，而不是等上线。
-  const { loadActionsManifest } = await import('../../qq-bridge/src/gateway/actions-manifest.js');
+  const { loadActionsManifest } = await import('../../qq-bridge/bridge/src/gateway/actions-manifest.js');
   const { manifest, error } = loadActionsManifest();
   assert.equal(error, null, error ?? '');
   const executor = makeExecutor({
@@ -294,8 +294,14 @@ test('跨仓：真实 qq-bridge 清单可直接装配（工具名合规、投递
     assert.match(name, /^chat_qq_[a-z0-9_]{1,55}$/);
   }
   // 发送类动作必须在工具面里：删掉回合文本自动投递后，这是模型唯一的发言通道。
-  for (const action of ['send_text', 'reply', 'send_message', 'send_sticker', 'send_voice', 'poke']) {
+  // （send_sticker 已随媒体管道 v2 从模型面退役——chat_media_send 统一发送；
+  //   send_image 是新加入的发送通道落点。）
+  for (const action of ['send_text', 'reply', 'send_message', 'send_image', 'send_voice', 'poke']) {
     assert.ok(names.includes(`chat_qq_${action}`), `${action} must be exposed`);
+  }
+  // 退役的读取/认知类动作不得再出现在模型工具面（媒体管道 v2）。
+  for (const retired of ['send_sticker', 'list_stickers', 'get_sticker_image', 'collect_sticker', 'sticker_note', 'set_sticker_remark', 'get_message_images', 'get_self_image']) {
+    assert.ok(!names.includes(`chat_qq_${retired}`), `${retired} must be retired from the tool surface`);
   }
   assert.ok(names.includes('chat_qq_set_wake'));
   assert.ok(names.includes('chat_qq_get_unread'));
@@ -391,7 +397,7 @@ test('多消费端共享：同平台两账号装配成功，调用按会话绑�
 test('覆盖完整性：孤儿条目 / 孤儿模块都拒绝装配（决策 12 的 1:1 硬标准）', async () => {
   const adapter = { id: 'qq-main', platform: 'qq', secret: SECRET, callbackBase: 'http://127.0.0.1:9' };
   // 清单有条目、平台目录没模块 → 拒绝装配（用真实清单，条目是全集）。
-  const { loadActionsManifest } = await import('../../qq-bridge/src/gateway/actions-manifest.js');
+  const { loadActionsManifest } = await import('../../qq-bridge/bridge/src/gateway/actions-manifest.js');
   const realManifest = loadActionsManifest().manifest;
   assert.throws(
     () => makeExecutor({

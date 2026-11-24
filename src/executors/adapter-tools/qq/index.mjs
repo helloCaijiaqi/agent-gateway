@@ -25,19 +25,12 @@ import getUnread from './get-unread.mjs';
 import getRecent from './get-recent.mjs';
 import getMyRecent from './get-my-recent.mjs';
 import getMessageDetail from './get-message-detail.mjs';
-import getMessageImages from './get-message-images.mjs';
 import getForwardMsg from './get-forward-msg.mjs';
 import getActiveMembers from './get-active-members.mjs';
 import getGroupMembers from './get-group-members.mjs';
 import listGroups from './list-groups.mjs';
 import getHistory from './get-history.mjs';
-import listStickers from './list-stickers.mjs';
-import getStickerImage from './get-sticker-image.mjs';
-import getSelfImage from './get-self-image.mjs';
-import sendSticker from './send-sticker.mjs';
-import collectSticker from './collect-sticker.mjs';
-import stickerNote from './sticker-note.mjs';
-import setStickerRemark from './set-sticker-remark.mjs';
+import sendImage from './send-image.mjs';
 import sendVoice from './send-voice.mjs';
 import listVoices from './list-voices.mjs';
 import ask from './ask.mjs';
@@ -46,11 +39,12 @@ import approve from './approve.mjs';
 export const CAPABILITIES = Object.freeze([
   sendText, reply, markRead, sendMessage, sendBurst, sendGroupMessage, sendPrivateMessage,
   poke, wait, setWake, socialState, getPrompt, getUnread, getRecent, getMyRecent,
-  getMessageDetail, getMessageImages, getForwardMsg, getActiveMembers, getGroupMembers,
-  listGroups, getHistory, listStickers, getStickerImage, getSelfImage, sendSticker,
-  collectSticker, stickerNote, setStickerRemark, sendVoice, listVoices,
-  // memory_* 已从桥接清单剥离（记忆能力收编到 memory-mcp 资源服务），
-  // agent-gateway 侧同步删除对应桩模块——"目录与清单 1:1" 的不变量不允许孤儿。
+  getMessageDetail, getForwardMsg, getActiveMembers, getGroupMembers,
+  listGroups, getHistory, sendVoice, listVoices,
+  sendImage,
+  // sticker 8 件套与 get_message_images 已随多媒体迁移退役（chat_media_send +
+  // chat_qq_send_image + memory-mcp 媒体资产层），清单与桩模块同步物理删除——
+  // "目录与清单 1:1" 的不变量不允许孤儿。
   ask, approve,
 ]);
 

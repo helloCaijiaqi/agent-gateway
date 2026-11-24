@@ -29,8 +29,8 @@ const { seedConsumer, createConsumerRegistry } = await import(
 );
 const { buildEnvelope, postAdapterAction } = await import(new URL('./helpers/adapter-wire.mjs', import.meta.url).href);
 
-const { createGatewayClient: createQqClient } = await import('../../qq-bridge/src/gateway/gateway-client.js');
-const { createGatewayActionsHandler: createQqActions } = await import('../../qq-bridge/src/gateway/gateway-actions.js');
+const { createGatewayClient: createQqClient } = await import('../../qq-bridge/bridge/src/gateway/gateway-client.js');
+const { createGatewayActionsHandler: createQqActions } = await import('../../qq-bridge/bridge/src/gateway/gateway-actions.js');
 const { createGatewayClient: createWxClient } = await import('../../wx-adapter/src/gateway-client.mjs');
 const { createWxActionsHandler } = await import('../../wx-adapter/src/actions-server.mjs');
 const { createDryRunDriver } = await import('../../wx-adapter/src/platform-io.mjs');

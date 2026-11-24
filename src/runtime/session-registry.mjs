@@ -92,6 +92,64 @@ export function createSessionRegistry({
 
   if (file) load();
 
+  // ---- tombstones（2026-11-23）：DSH 侧孤儿会话的最终清理队列 ----
+  // 本地映射退役 ≠ DSH 侧会话消失：retireSession（清 inbox→cancel→archive）
+  // 失败、手动编辑 sessions.json、历史 retireAll 都会留孤儿（follow 还挂着、
+  // 坏格式历史还在）。墓碑文件（sessions.json.tombstones.json）记下待清的
+  // sessionId，drainTombstones() 逐个退役，成功才移除——最终一致，不靠人工。
+
+  const tombstoneFile = file ? `${file}.tombstones.json` : null;
+  /** @type {Map<string, {sessionId: string, reason: string, at: number}>} */
+  const tombstones = new Map();
+  if (tombstoneFile) loadTombstones();
+
+  function loadTombstones() {
+    try {
+      if (!fs.existsSync(tombstoneFile)) return;
+      const parsed = JSON.parse(fs.readFileSync(tombstoneFile, 'utf8'));
+      for (const item of parsed?.tombstones ?? []) {
+        if (item && typeof item.sessionId === 'string') tombstones.set(item.sessionId, item);
+      }
+    } catch (error) {
+      logger(`session-registry: tombstones 加载失败（按空队列启动）：${error?.message ?? error}`);
+    }
+  }
+
+  function persistTombstones() {
+    if (!tombstoneFile) return;
+    const payload = { version: 1, tombstones: [...tombstones.values()] };
+    const tmp = `${tombstoneFile}.tmp-${process.pid}`;
+    try {
+      fs.mkdirSync(path.dirname(tombstoneFile), { recursive: true });
+      fs.writeFileSync(tmp, JSON.stringify(payload, null, 2), 'utf8');
+      fs.renameSync(tmp, tombstoneFile);
+    } catch (error) {
+      logger(`session-registry: tombstones 落盘失败：${error?.message ?? error}`);
+    }
+  }
+
+  function markTombstone(sessionId, reason = '') {
+    if (!sessionId) return;
+    tombstones.set(sessionId, { sessionId, reason: String(reason).slice(0, 120), at: now() });
+    persistTombstones();
+  }
+
+  async function drainTombstones() {
+    let drained = 0;
+    for (const [sessionId] of tombstones) {
+      try {
+        await dsh.retireSession(sessionId);
+        tombstones.delete(sessionId);
+        persistTombstones();
+        drained += 1;
+        logger(`session-registry: tombstone drained — DSH 侧会话 ${sessionId} 已退役`);
+      } catch (error) {
+        logger(`session-registry: tombstone ${sessionId} 退役失败（保留重试）：${error?.message ?? error}`);
+      }
+    }
+    return { drained, remaining: tombstones.size };
+  }
+
   function load() {
     try {
       if (!fs.existsSync(file)) return;
@@ -157,15 +215,35 @@ export function createSessionRegistry({
     // not-found 是终态信号：DSH 侧会话已不存在，本地映射必须退役重建。
     for (let attempt = 1; attempt <= 2; attempt += 1) {
       try {
-        await dsh.selectModel(sessionId, {
-          provider: chat.provider, model: chat.model, reasoningEffort: chat.reasoningEffort,
-        }, signal);
+        // dsh-client.selectModel 不 unwrap（返回原始 RPC 信封）：result.ok=false
+        // （如 session/model-unavailable——模型不在 DSH 清单）必须显式识别，
+        // 否则会被误判为 'applied'，会话继续留在旧模型上无声跑空（2026-11-24 实测）。
+        // reasoningEffort 空串 = 省略：部分模型（实测 wb2api/cn:hy4flash）不支持任何
+        // 强度参数，传了直接 session/model-unavailable。
+        const selectArgs = { provider: chat.provider, model: chat.model };
+        if (chat.reasoningEffort) selectArgs.reasoningEffort = chat.reasoningEffort;
+        const response = await dsh.selectModel(sessionId, selectArgs, signal);
+        if (response?.result?.ok === false) {
+          const { code, message, details } = response.result.error ?? {};
+          logger(`applyModel rejected by DSH: session=${sessionId} provider=${chat.provider}`
+            + ` model=${chat.model} code=${code ?? '?'} details=${JSON.stringify(details ?? {})} ${message ?? ''}；`
+            + '本轮继续用 DSH 会话现有模型，请检查模型是否在 DSH 清单（cordis.patch.yml providers.models）');
+          return 'failed';
+        }
         return 'applied';
       } catch (error) {
         if (/not[- ]?found/i.test(String(error?.code ?? '')) || /not[- ]?found/i.test(String(error?.message ?? ''))) {
           return 'not-found';
         }
         if (attempt < 2) await new Promise((r) => setTimeout(r, 1000));
+        else {
+          // 2026-11-24 根因修复：曾因 provider 名不在 DSH 目录（deepseek-official vs
+          // deepseek-account）连续 selectModel 失败被无声吞掉，会话悄悄留在 DSH 默认
+          // 模型上跑（zhipu-chat 429 却查不到原因）。重试耗尽必须显式告警留痕。
+          logger(`applyModel failed: session=${sessionId} provider=${chat.provider} model=${chat.model}`
+            + `（重试 2 次）error=${error?.code ?? ''} ${error?.message ?? error}；`
+            + '本轮继续用 DSH 会话现有模型，请检查 provider/model 是否在 DSH modelCatalog 内');
+        }
       }
     }
     return 'failed';
@@ -250,8 +328,7 @@ export function createSessionRegistry({
         if ((existing.presetDeclared ?? null) !== declaredNowValue) {
           logger(`session ${sessionKey} 的 preset 声明已变更`
             + `（${existing.presetDeclared ?? '(未声明)'} -> ${declaredNowValue ?? '(未声明)'}），退役重建`);
-          sessions.delete(sessionKey);
-          persist();
+          void this.retire(sessionKey, "preset-decl-changed");
           return this.getOrCreate(sessionKey, signal);
         }
         // 预设被移除/改名时（qq-chat-v2 → qq-chat 就是这种情况），DSH 侧旧会话仍绑着
@@ -261,8 +338,7 @@ export function createSessionRegistry({
           const ids = await ensurePresetAllowed(signal);
           if (!ids.includes(existing.preset)) {
             logger(`session ${sessionKey} 绑定的 preset "${existing.preset}" 已不在 DSH 清单，退役重建`);
-            sessions.delete(sessionKey);
-            persist();
+            void this.retire(sessionKey, "preset-removed-from-dsh");
             return this.getOrCreate(sessionKey, signal);
           }
         }
@@ -290,12 +366,36 @@ export function createSessionRegistry({
       return promise;
     },
 
-    retire(sessionKey) {
+    /**
+     * 退役单个会话（2026-11-23 升级）：除删本地映射外，同步清理 DSH 侧——
+     * retireSession（清 pending inbox + cancel + archiveSession + forget）。
+     * 不清理的话旧 DSH 会话成孤儿（follow 还挂着、坏格式历史还在），污染
+     * 自愈场景下尤其必须（format v4 校验失败的会话要整体废弃）。
+     * DSH 侧清理失败不阻断退役（孤儿可容忍，日志留痕）。
+     * @returns {Promise<{sessionId: string|null, dshRetired: boolean}>}
+     */
+    async retire(sessionKey, reason = '') {
       const record = sessions.get(sessionKey);
-      if (!record) return null;
+      if (!record) return { sessionId: null, dshRetired: false };
       sessions.delete(sessionKey);
       persist();
-      return record.sessionId;
+      let dshRetired = false;
+      if (record.sessionId) {
+        try {
+          await dsh.retireSession(record.sessionId);
+          dshRetired = true;
+        } catch (error) {
+          logger(`session-registry: ${sessionKey} 的 DSH 侧会话 ${record.sessionId} 归档失败（入墓碑重试）：${error?.message ?? error}`);
+        }
+      }
+      if (dshRetired) {
+        tombstones.delete(record.sessionId);
+        persistTombstones();
+      } else {
+        markTombstone(record.sessionId, reason || 'retire 失败重试');
+      }
+      logger(`session-registry: retired ${sessionKey} (${record.sessionId})${reason ? ` — ${reason}` : ''}${dshRetired ? ' + DSH 侧已清理' : ' + DSH 侧入墓碑待清'}`);
+      return { sessionId: record.sessionId, dshRetired };
     },
 
     /**
@@ -307,12 +407,38 @@ export function createSessionRegistry({
     retireAll() {
       const count = sessions.size;
       if (count > 0) {
+        for (const [key, record] of sessions) {
+          // DSH 侧逐个清理（fire-and-forget；失败入墓碑，启动 drain 兜底）
+          markTombstone(record.sessionId, `retireAll(${key})`);
+          dsh.retireSession(record.sessionId)
+            .then(() => { tombstones.delete(record.sessionId); persistTombstones(); })
+            .catch((error) => logger(`session-registry: retireAll 的 DSH 清理 ${record.sessionId} 失败（墓碑保留）：${error?.message ?? error}`));
+        }
         sessions.clear();
         persist();
-        logger(`session-registry: retired all ${count} session(s)`);
+        logger(`session-registry: retired all ${count} session(s) + DSH 侧墓碑待清`);
       }
       return count;
     },
+
+    /**
+     * 退役未知映射关系的孤儿会话（2026-11-23）：直接按 sessionId 入墓碑并
+     * 立即 drain——供控制台/运维清理 DSH 侧没有本地映射的会话（手动编辑
+     * sessions.json、历史版本遗留的孤儿）。
+     */
+    async retireOrphan(sessionId, reason = 'orphan') {
+      if (!sessionId || typeof sessionId !== 'string') {
+        return { drained: 0, remaining: tombstones.size };
+      }
+      markTombstone(sessionId, reason);
+      return drainTombstones();
+    },
+
+    async drainTombstones() {
+      return drainTombstones();
+    },
+
+    tombstoneCount() { return tombstones.size; },
 
     get(sessionKey) { return sessions.get(sessionKey) ?? null; },
     get size() { return sessions.size; },

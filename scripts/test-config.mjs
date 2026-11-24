@@ -121,10 +121,10 @@ test('memory save：退役的 GATEWAY_MEMORY_INGEST* 只记录告警，不致命
   assert.equal('token' in cfg.memorySave, false);
 });
 
-test('memory save：默认 off、serviceId 空 = selectMemoryService 自动选路；缓冲阈值有默认值', () => {
+test('memory save：默认 off = selectMemoryService 声明自动选路；缓冲阈值有默认值', () => {
   const cfg = load();
   assert.equal(cfg.memorySave.mode, 'off');
-  assert.equal(cfg.memorySave.serviceId, null);
+  assert.equal(cfg.memorySave.serviceId, undefined); // 2026-11-22 env 显式指定退役，字段不复存在
   assert.deepEqual(cfg.memorySave.retired, []);
   assert.equal(cfg.memorySave.idleMs, 3_600_000);
   assert.equal(cfg.memorySave.maxMessages, 200);
@@ -134,15 +134,17 @@ test('memory save：默认 off、serviceId 空 = selectMemoryService 自动选�
   assert.equal(load({ GATEWAY_MEMORY_SAVE: 'on' }).memorySave.mode, 'on');
 });
 
-test('memory save：阈值与 serviceId 的边界校验', () => {
+test('memory save：阈值边界校验 + GATEWAY_MEMORY_SERVICE 退役警告', () => {
   assert.equal(load({ GATEWAY_MEMORY_SAVE_IDLE_MS: '5000' }).memorySave.idleMs, 5000);
   assert.equal(load({ GATEWAY_MEMORY_SAVE_MAX_MESSAGES: '50' }).memorySave.maxMessages, 50);
   assert.equal(load({ GATEWAY_MEMORY_SAVE_MAX_CHARS: '5000' }).memorySave.maxChars, 5000);
   assert.throws(() => load({ GATEWAY_MEMORY_SAVE_IDLE_MS: '500' }), /GATEWAY_MEMORY_SAVE_IDLE_MS/);
   assert.throws(() => load({ GATEWAY_MEMORY_SAVE_MAX_MESSAGES: '0' }), /GATEWAY_MEMORY_SAVE_MAX_MESSAGES/);
   assert.throws(() => load({ GATEWAY_MEMORY_SAVE: 'maybe' }), /GATEWAY_MEMORY_SAVE/);
-  assert.equal(load({ GATEWAY_MEMORY_SERVICE: 'a1b2c3d4' }).memorySave.serviceId, 'a1b2c3d4');
-  assert.throws(() => load({ GATEWAY_MEMORY_SERVICE: 'Bad Id' }), /GATEWAY_MEMORY_SERVICE/);
+  // 2026-11-22 退役：env 显式指定不再生效——仍被设置时进 retired 警告（不 fail-closed）。
+  const retiredLoad = load({ GATEWAY_MEMORY_SERVICE: 'a1b2c3d4' });
+  assert.equal(retiredLoad.memorySave.serviceId, undefined);
+  assert.ok(retiredLoad.memorySave.retired.includes('GATEWAY_MEMORY_SERVICE'));
 });
 
 test('消费端身份：env 单适配器三元组已退役，读到即拒载并给登记目录迁移文案', () => {

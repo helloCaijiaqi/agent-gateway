@@ -76,6 +76,7 @@ function createFakeDsh() {
     },
     async listPresets() { return state.presetList ?? ['qq-chat', 'minimal']; },
     async ensureWorkspace() { return 'ws-1'; },
+    async retireSession(sessionId) { state.retired = state.retired || []; state.retired.push(sessionId); },
     async createSession() {
       const sessionId = `sess-${++seq}`;
       state.sessions.set(sessionId, { turns: 0 });
@@ -495,15 +496,18 @@ test('server: submit 同步抛错 → 幂等回滚，重试不被判 deduped', a
 
 // ------------------------------------------------- 回合文本不再自动投递
 
-test('turn-runner: 回合文本不产生出站动作，turns.result.tools 记录工具统计并留 no-send 日志', async () => {
+test('turn-runner: 回合文本不产生出站动作，turns.result.tools 记录工具统计', async () => {
   const dsh = createFakeDsh();
   const registry = createSessionRegistry({ presetsFor: PRESETS_FOR, dsh, chat: CHAT, file: null });
   const gateway = createDshGateway({ dsh, turnTimeoutMs: CHAT.turnTimeoutMs });
   const queue = createPromptQueue({});
   const turns = createTurnStore({ file: null });
+  let executorCalled = 0;
+  const executorRegistry = { call: async () => { executorCalled += 1; return { ok: true }; } };
   const logs = [];
   const runner = createTurnRunner({
     config: { chat: CHAT }, dsh, registry, gateway, queue, turns,
+    executorRegistry,
     toolHost: {
       registerTurn: () => {},
       // 这一轮调了 2 次工具，但都不是发送类：文本不会被自动发出去。
@@ -522,7 +526,72 @@ test('turn-runner: 回合文本不产生出站动作，turns.result.tools 记录
   assert.equal(result.status, 'completed');
   const stored = turns.get('turn_nosend');
   assert.deepEqual(stored.result.tools, { calls: 2, sent: 0 });
-  assert.ok(logs.some((line) => line.includes('no-send')), 'no-send 必须留日志');
+  // no-send fallback 已彻底移除（2026-11-25）：回合文本不再有任何代发通道，
+  // executor 一次都不能被调（独白泄漏即由已删除的兜底造成）。
+  assert.equal(executorCalled, 0, '回合文本绝不触发任何出站动作');
+  assert.equal(stored.result.fallback, undefined, 'fallback 字段已移除');
+  gateway.stop();
+});
+
+// --------------------------------- DSH 会话流污染自愈（format v4 校验失败 → 退役重建）
+
+test('turn-runner: format v4 污染 error → 会话退役（含 DSH 侧 retireSession）', async () => {
+  const dsh = createFakeDsh();
+  const logs = [];
+  const registry = createSessionRegistry({ presetsFor: PRESETS_FOR, dsh, chat: CHAT, file: null, logger: (line) => logs.push(line) });
+  const gateway = createDshGateway({ dsh, turnTimeoutMs: CHAT.turnTimeoutMs });
+  const queue = createPromptQueue({});
+  const turns = createTurnStore({ file: null });
+  const runner = createTurnRunner({
+    config: { chat: CHAT }, dsh, registry, gateway, queue, turns,
+    logger: (line) => logs.push(line),
+  });
+  gateway.start();
+
+  // 第一回合：正常完成，建立会话映射。
+  const doneA = runner.submit(baseRecord({ turnId: 'turn_poison_a' }));
+  await waitFor(() => dsh.state.prompts.length === 1);
+  dsh.finishTurn(dsh.state.prompts[0].sessionId, '正常回复');
+  await doneA;
+  const poisonedSessionId = registry.get('qq:group:123456').sessionId;
+
+  // 第二回合：DSH 会话流格式校验失败（gateway 重启打断工具调用的遗留污染）。
+  const doneB = runner.submit(baseRecord({ turnId: 'turn_poison_b' }));
+  await waitFor(() => dsh.state.prompts.length === 2);
+  dsh.finishTurn(dsh.state.prompts[1].sessionId, '', 'error',
+    undefined,
+    { kind: 'error', message: 'format v4 tool/result at seq 1160 requires toolCallId matching its tool source' });
+  const resultB = await doneB;
+  assert.equal(resultB.status, 'error');
+
+  // 会话已退役：映射消失 + DSH 侧 retireSession 被调用 + 留痕。
+  assert.equal(registry.get('qq:group:123456'), null);
+  assert.deepEqual(dsh.state.retired, [poisonedSessionId]);
+  assert.ok(logs.some((line) => line.includes('retired qq:group:123456')), '退役必须留日志');
+  assert.ok(logs.some((line) => line.includes('格式污染自愈')), '自愈原因必须留日志');
+  // error 回合不外发任何文本（no-send fallback 已移除）。
+  assert.equal(turns.get('turn_poison_b').result.fallback, undefined);
+  gateway.stop();
+});
+
+test('turn-runner: 普通 error（非格式污染）→ 不退役会话', async () => {
+  const dsh = createFakeDsh();
+  const registry = createSessionRegistry({ presetsFor: PRESETS_FOR, dsh, chat: CHAT, file: null });
+  const gateway = createDshGateway({ dsh, turnTimeoutMs: CHAT.turnTimeoutMs });
+  const queue = createPromptQueue({});
+  const turns = createTurnStore({ file: null });
+  const runner = createTurnRunner({
+    config: { chat: CHAT }, dsh, registry, gateway, queue, turns, logger: () => {},
+  });
+  gateway.start();
+
+  const done = runner.submit(baseRecord({ turnId: 'turn_err_normal' }));
+  await waitFor(() => dsh.state.prompts.length === 1);
+  dsh.finishTurn(dsh.state.prompts[0].sessionId, '', 'error',
+    undefined, { kind: 'error', message: 'provider timeout' });
+  const result = await done;
+  assert.equal(result.status, 'error');
+  assert.notEqual(registry.get('qq:group:123456'), null, '普通错误不退役会话');
   gateway.stop();
 });
 

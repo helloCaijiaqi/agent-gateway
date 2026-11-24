@@ -15,9 +15,9 @@ import http from 'node:http';
 import test from 'node:test';
 
 const { validateAgainstSchema, validatePayload, loadActionsManifest } =
-  await import('../../qq-bridge/src/gateway/actions-manifest.js');
-const { createGatewayActionsHandler } = await import('../../qq-bridge/src/gateway/gateway-actions.js');
-const { createWaitAction, createWaitRegistry } = await import('../../qq-bridge/src/gateway/wait-registry.js');
+  await import('../../qq-bridge/bridge/src/gateway/actions-manifest.js');
+const { createGatewayActionsHandler } = await import('../../qq-bridge/bridge/src/gateway/gateway-actions.js');
+const { createWaitAction, createWaitRegistry } = await import('../../qq-bridge/bridge/src/gateway/wait-registry.js');
 const { signRequest } = await import('../src/core/auth.mjs');
 const { ACTION_TYPES } = await import('../src/core/contracts.mjs');
 
@@ -121,7 +121,7 @@ test('qq 清单：schema + 语义校验通过，type 无重复', () => {
   assert.equal(manifest.platform, 'qq');
   const types = manifest.actions.map((entry) => entry.type);
   assert.equal(new Set(types).size, types.length, 'duplicate action types');
-  assert.ok(types.length >= 30, `expected full surface, got ${types.length}`);
+  assert.ok(types.length >= 26, `expected full surface, got ${types.length}`);
 });
 
 test('清单 type ⊆ 网关 ACTION_TYPES（两仓词汇表对齐）', () => {
@@ -248,12 +248,10 @@ test('清单条目覆盖全部 probe（无清单孤儿：每个动作都真投�
     send_group_message: { groupId: '1', message: 'x' }, send_private_message: { userId: '1', message: 'x' },
     poke: { targetUserId: '1' }, wait: {}, set_wake: { config: {} },
     social_state: {}, get_prompt: {}, get_unread: {}, get_recent: {}, get_my_recent: {},
-    get_message_detail: { messageId: '1' }, get_message_images: { messageId: '1' },
+    get_message_detail: { messageId: '1' },
     get_forward_msg: { id: '1' }, get_active_members: {}, get_group_members: {},
-    list_groups: {}, get_history: { groupId: '1' }, list_stickers: {},
-    get_sticker_image: { stickerId: '1' }, get_self_image: {}, send_sticker: { stickerId: '1' },
-    collect_sticker: { messageId: '1' }, sticker_note: { stickerId: '1' },
-    set_sticker_remark: { stickerId: '1', remark: 'r' }, send_voice: { voice: 'v' },
+    list_groups: {}, get_history: { groupId: '1' },
+    send_voice: { voice: 'v' },
     list_voices: {},
     ask: { questions: ['需要哪个选项？'] }, approve: { toolName: 'bash', reason: '列出目录' },
   };
@@ -320,7 +318,7 @@ test('GET /v1/actions/manifest：签名后返回清单；未签名 401', async (
     assert.equal(ok.status, 200);
     assert.equal(ok.body.v, 1);
     assert.equal(ok.body.platform, 'qq');
-    assert.ok(Array.isArray(ok.body.actions) && ok.body.actions.length >= 30);
+    assert.ok(Array.isArray(ok.body.actions) && ok.body.actions.length >= 26);
     assert.equal(ok.body.actions[0].type, 'send_text');
 
     const anonymous = await fetch(`http://127.0.0.1:${port}/v1/actions/manifest`);
