@@ -1,7 +1,10 @@
 /**
- * media-send executor（多媒体记忆层发送适配，2026-11-24）：
- * 模型面唯一的媒体发送工具 chat_media_send——平台无关的媒体引用（mediaId/query）
- * → 按「当前会话平台」选格式转换器 → 调对应平台发送动作。
+ * media-send executor（多媒体记忆层发送适配，2026-11-24；2026-11-25 三工具拆分）：
+ * chat_media_send 单一工具退役，拆为三个语义明确的发送工具——
+ *   chat_image_send（图片/表情）、chat_voice_send（语音）、chat_file_send（视频/ppt 等文件）。
+ * 动因：音频发送链路复杂（克隆音色/情绪参考），模型需要明确知道自己在发哪类媒体；
+ * 三工具共用同一查询/投递链，只在入口按工具语义校验 asset.kind（错 kind 显式报错，
+ * 不再让单一工具「猜」类型）。
  *
  * 适配层语义（用户定案）：适配的是**不同平台发送媒体文件格式不同**，不是媒体
  * 类型路由。memory 层的 media_asset 完全平台无关（kind: image|voice|video|file，
@@ -12,7 +15,7 @@
  *   image + sourcePath（memory 侧落盘）  → send_image { fileRef }（同机路径）
  *   image + ref 是 URL                   → send_image { url }
  *   voice + ref（语音库相对路径）        → send_voice { voice }
- *   video / file                          → 显式 unsupported（bridge 无发送通道）
+ *   file / video + 同机路径              → send_file { fileRef }（bridge 未启用该动作时 E_PLATFORM 降级）
  *
  * 旧的 image+resId 收藏通道（send_sticker）已随 sticker 工具族物理删除
  * （2026-11-24）：发送统一走 send_image 的 fileRef/URL 通道。
@@ -86,6 +89,13 @@ export function createMediaSendExecutor({
       if (ref) return { action: 'send_voice', args: { voice: ref } };
       return { unsupported: true, reason: 'voice asset has no library ref' };
     }
+    if (kind === 'file' || kind === 'video') {
+      // 视频/文件不进收藏详情表（2026-11-25）：本分支只服务历史遗留资产与新平台；
+      // bridge 未启用 send_file 动作时在路由层 E_PLATFORM 降级。
+      const fileRef = sourcePath || ref;
+      if (fileRef && !/^https?:\/\//.test(fileRef)) return { action: 'send_file', args: { fileRef } };
+      return { unsupported: true, reason: 'file asset has no local path to send from' };
+    }
     return { unsupported: true, reason: `kind "${kind}" has no send channel on ${platform}` };
   }
 
@@ -120,28 +130,68 @@ export function createMediaSendExecutor({
     return { asset: items[0], candidates: items };
   }
 
+  // ── 三工具声明（2026-11-25 拆分）：chat_media_send 退役 ──────────────────
+  // 每个工具声明自己只发哪类 kind：fetchAsset 后校验，错 kind 显式 E_UNSUPPORTED。
+  const TOOL_KINDS = {
+    chat_image_send: ['image'],
+    chat_voice_send: ['voice'],
+    chat_file_send: ['file', 'video'], // 视频/文件一类（视频等大文件已不入详情表，仅遗留资产）
+  };
+  const MEDIA_ID_DESC = '媒体资产 id（chat_media_search 或记忆文本里 [图片|ma_xxx] 占位符的 id）';
+
   return registerExecutor({
     name: 'media-send',
-    actions: ['chat_media_send'],
-    tools: [{
-      name: 'chat_media_send',
-      description: '[写] 发送多媒体内容：按 mediaId 或含义描述（query）从记忆里找到图片/表情/语音并发送；caption 是随图文字（可选）',
-      action: 'chat_media_send',
-      inputSchema: {
-        type: 'object',
-        properties: {
-          mediaId: { type: 'string', pattern: '^ma_[0-9a-f]{12}$', description: '媒体资产 id（chat_media_search 或记忆文本里 [图片|ma_xxx] 占位符的 id；媒体占位符语义由记忆服务指引维护）' },
-          query: { type: 'string', maxLength: 120, description: '按含义检索（如「橘猫梗图」「开心表情」）；与 mediaId 二选一' },
-          caption: { type: 'string', maxLength: 300, description: '随图发送的文字说明（可选）' },
+    actions: ['chat_image_send', 'chat_voice_send', 'chat_file_send'],
+    tools: [
+      {
+        name: 'chat_image_send',
+        description: '[写] 发送图片/表情：按 mediaId 或含义描述（query）从记忆里找到图片并发送；caption 是随图文字（可选）',
+        action: 'chat_image_send',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            mediaId: { type: 'string', pattern: '^ma_[0-9a-f]{12}$', description: MEDIA_ID_DESC },
+            query: { type: 'string', maxLength: 120, description: '按含义检索（如「橘猫梗图」「开心表情」）；与 mediaId 二选一' },
+            caption: { type: 'string', maxLength: 300, description: '随图发送的文字说明（可选）' },
+          },
         },
       },
-    }],
+      {
+        name: 'chat_voice_send',
+        description: '[写] 发送语音：发送语音库里的语音资产（克隆合成的产物或归档语音）。要主动开口说话时先用 chat_voice_synthesize 合成，ready 后用本工具发送',
+        action: 'chat_voice_send',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            mediaId: { type: 'string', pattern: '^ma_[0-9a-f]{12}$', description: '语音资产 id（chat_voice_synthesize 返回的 mediaId 或记忆里的 [语音|ma_xxx] 占位符）' },
+          },
+        },
+      },
+      {
+        name: 'chat_file_send',
+        description: '[写] 发送文件：发送文件型资产（ppt/文档等；视频等大文件默认不入记忆库，仅限历史遗留资产）',
+        action: 'chat_file_send',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            mediaId: { type: 'string', pattern: '^ma_[0-9a-f]{12}$', description: MEDIA_ID_DESC },
+          },
+        },
+      },
+    ],
     call: async ({ action, ctx }) => {
-      if (action !== 'chat_media_send') {
-        return { ok: false, degraded: true, code: 'E_UNSUPPORTED', message: `media-send does not own action "${action}"` };
+      const expectKinds = TOOL_KINDS[action];
+      if (!expectKinds) {
+        return { ok: false, degraded: true, code: 'E_UNSUPPORTED', message: `media-send does not own action "${action}"（chat_media_send 已退役：发图片用 chat_image_send，发语音用 chat_voice_send，发文件用 chat_file_send）` };
       }
       const mediaId = String(ctx.payload?.mediaId ?? '').trim();
       const query = String(ctx.payload?.query ?? '').trim();
+      if (!mediaId && !query && action !== 'chat_voice_send') {
+        return { ok: false, degraded: true, code: 'E_ACTION', message: 'mediaId 与 query 必居其一' };
+      }
+      if (!mediaId && action === 'chat_voice_send') {
+        return { ok: false, degraded: true, code: 'E_ACTION', message: '发送语音需要 mediaId（先 chat_media_search 找语音资产，或 chat_voice_synthesize 合成）' };
+      }
       if (!mediaId && !query) {
         return { ok: false, degraded: true, code: 'E_ACTION', message: 'mediaId 与 query 必居其一' };
       }
@@ -154,6 +204,13 @@ export function createMediaSendExecutor({
           return { ok: false, degraded: true, code: fetched.error, message: fetched.message };
         }
         const asset = fetched.asset;
+        // 工具语义校验：每个发送工具只发自己声明的 kind，错配显式报错（不猜类型）
+        if (!expectKinds.includes(String(asset.kind ?? ''))) {
+          return {
+            ok: false, degraded: true, code: 'E_UNSUPPORTED',
+            message: `此工具只发 ${expectKinds.join('/')}，资产 ${asset.mediaId ?? mediaId} 的 kind 是 ${asset.kind}（选对发送工具，或用 chat_media_search 按类型检索）`,
+          };
+        }
         // 平台判定：sessionKey 首段（qq:group:xxx → qq）。未知平台显式报错。
         const platform = String(ctx.sessionKey ?? '').split(':')[0] || '';
         const converted = convertSend(asset, platform);

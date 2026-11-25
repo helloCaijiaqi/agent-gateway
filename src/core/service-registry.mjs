@@ -920,6 +920,17 @@ export function createServiceRegistry({
     registrationLedger({ limit = 100 } = {}) {
       if (!regLedger) return null;
       const { events, corrupt } = regLedger.readAll();
+      // hash-only 事件重放（2026-11-26）：写侧去重后 register 事件可能只带
+      // snapshotHash 引用——按服务继承最近一次落盘的快照，审计页展示口径与
+      // 去重前一致（事件顺序即时间序，逐条向前继承）。
+      const lastSnapshotByService = new Map();
+      for (const ev of events) {
+        if (ev.snapshot) {
+          lastSnapshotByService.set(ev.serviceId, ev.snapshot);
+        } else if (lastSnapshotByService.has(ev.serviceId)) {
+          ev.snapshot = lastSnapshotByService.get(ev.serviceId);
+        }
+      }
       return { events: events.slice(-limit).reverse(), corrupt, total: events.length };
     },
 

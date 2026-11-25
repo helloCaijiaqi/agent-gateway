@@ -479,6 +479,10 @@ export const registrationLedgerEventSchema = z.strictObject({
   reason: z.string().max(300).optional(),
   // register / unregister 时的登记内容快照（已脱敏）。
   snapshot: z.record(z.string(), z.unknown()).optional(),
+  // 写侧去重（2026-11-26）：register 的 snapshot 与该服务上一条相同时，省略
+  // snapshot 只落本摘要（sha256 十六进制 64 位）；读侧审计视图负责按服务继承
+  // 最近已知快照重放展示。
+  snapshotHash: z.string().regex(/^[\da-f]{64}$/).optional(),
 });
 
 // ── P4：会话状态更新（适配器镜像写 → 网关 mailbox）───────────────────────────

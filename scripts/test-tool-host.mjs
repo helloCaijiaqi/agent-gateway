@@ -449,12 +449,12 @@ test('mcp-bus: 模型漏传 turnToken → 请求体省略字段（2026-11-25 防
   const baseUrl = await listen(server);
   try {
     const bus = createMcpBus({ gatewayUrl: baseUrl, secret: SECRET, logger: () => {} });
-    await bus.handleMessage({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'chat_media_send', arguments: { mediaId: 'ma_0123456789ab' } } });
+    await bus.handleMessage({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'chat_image_send', arguments: { mediaId: 'ma_0123456789ab' } } });
     const forwarded = calls.at(-1);
     assert.equal('turnToken' in forwarded.body, false, '漏传令牌时不应带空串字段（空串会被网关拒成 400 E_SCHEMA，模型拿不到 E_FORBIDDEN 自纠指引）');
     assert.equal(forwarded.body.args.mediaId, 'ma_0123456789ab');
     // 显式传空串同样按「缺失」处理。
-    await bus.handleMessage({ jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'chat_media_send', arguments: { mediaId: 'ma_0123456789ab', turnToken: '' } } });
+    await bus.handleMessage({ jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'chat_image_send', arguments: { mediaId: 'ma_0123456789ab', turnToken: '' } } });
     assert.equal('turnToken' in calls.at(-1).body, false, '显式空串也按缺失省略');
   } finally {
     server.close();
@@ -467,7 +467,7 @@ test('mcp-bus: 网关 4xx 错误详情透传（E_SCHEMA 等不再丢失）', asy
   const baseUrl = await listen(server);
   try {
     const bus = createMcpBus({ gatewayUrl: baseUrl, secret: SECRET, logger: () => {} });
-    const resp = await bus.handleMessage({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'chat_media_send', arguments: { turnToken: 'x' } } });
+    const resp = await bus.handleMessage({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'chat_image_send', arguments: { turnToken: 'x' } } });
     assert.equal(resp.result.isError, true);
     const parsed = JSON.parse(resp.result.content[0].text);
     assert.equal(parsed.error.code, 'E_DSH_DOWN');

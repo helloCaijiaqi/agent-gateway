@@ -358,8 +358,9 @@ export async function main() {
           logger(`web-search skipped: ${error?.message ?? error}`);
         }
       }
-      // 多媒体记忆层发送适配（2026-11-24）：chat_media_send 内置工具——平台无关的
-      // 媒体引用 → qq 格式转换器（resId 收藏通道/send_image 段/send_voice）→ deliver。
+      // 多媒体记忆层发送适配（2026-11-24；2026-11-25 拆分三工具）：内置发送工具
+      // chat_image_send / chat_voice_send / chat_file_send——平台无关的媒体引用
+      // → qq 格式转换器（send_image/send_voice/send_file）→ deliver。
       // memory 未装配 chat_media_get 时跳过注册（宁可缺工具，不放必然失败的占位）。
       {
         const resolveMemoryService = () => {
@@ -375,7 +376,7 @@ export async function main() {
             logger,
           });
           executorRegistry.add(mediaSendExecutor);
-          logger('media-send ready: chat_media_send (built-in adapter)');
+          logger('media-send ready: chat_image_send / chat_voice_send / chat_file_send (built-in adapter)');
         } else {
           logger('media-send skipped: memory-mcp 未装配 chat_media_get');
         }
