@@ -164,6 +164,7 @@ export async function main() {
       { createWebSearchExecutor },
       { createMediaSendExecutor },
       { createAdapterToolsExecutor, fetchAdapterManifest },
+      { createVoicePersonaProvider },
       { createSessionSave }] = await Promise.all([
       import('./runtime/dsh-client.mjs'),
       import('./runtime/session-registry.mjs'),
@@ -176,6 +177,7 @@ export async function main() {
       import('./executors/web-search.mjs'),
       import('./executors/media-send.mjs'),
       import('./executors/adapter-tools/index.mjs'),
+      import('./executors/rolecard-renderer.mjs'), // createVoicePersonaProvider：TTS 角色身份链路
       import('./runtime/memory-ingest.mjs'), // createSessionSave：会话缓冲管理器
     ]);
     const dsh = new DshClient({ ...config.dsh, logger });
@@ -400,6 +402,9 @@ export async function main() {
       toolHost = createToolHost({
         executorRegistry,
         serviceTools,
+        // TTS 角色身份链路（2026-11-26）：rolecard-mcp 当前卡名+aliases 运行时拉取，
+        // 代理 chat_voice_synthesize 时注入 personaKeywords——角色身份不写死配置。
+        voicePersonaProvider: createVoicePersonaProvider({ logger }),
         memoryIngest: sessionSave,
         logger,
         maxCallsPerTurn: config.tools.maxCallsPerTurn,

@@ -73,6 +73,11 @@ export function createToolHost({
   // V2 P3 服务执行器（动态路由）：{ resolveTool(name), listTools(), call(serviceId, request) }。
   // 由 main.mjs 从 service-registry 注入；null = 无登记工具面（纯内置 executors）。
   serviceTools = null,
+  // TTS 角色身份提供者（2026-11-26 链路传递）：async () => string[] | null。
+  // 代理 chat_voice_synthesize 且模型未显式指定 role/personaKeywords 时，把当前
+  // rolecard 卡名+aliases 注入 args.personaKeywords——角色身份沿 DSH→gateway→memory
+  // 链路流动，不写死配置。null = 不注入。由 main.mjs 从 rolecard-renderer 注入。
+  voicePersonaProvider = null,
   // §6 记忆落库调度器：出站观察点（发送成功的文本沉淀进记忆）。null = 不落库。
   memoryIngest = null,
   logger = () => {},
@@ -157,6 +162,21 @@ export function createToolHost({
     let outcome;
     try {
       if (registeredTool) {
+        // TTS 角色身份注入（2026-11-26 链路传递）：chat_voice_synthesize 且模型未
+        // 显式指定 role/personaKeywords 时，注入当前 rolecard 卡名+aliases 作为
+        // personaKeywords——音色库角色匹配锚定当前人设，防角色身份乱套。显式传参
+        // 优先（模型明确指定时尊重）；provider 失败静默跳过（rolecard-mcp 不可用
+        // 不阻塞工具调用，熔断在 provider 内）。
+        let effectiveArgs = args ?? {};
+        if (tool === 'chat_voice_synthesize' && voicePersonaProvider
+          && !effectiveArgs?.role && !effectiveArgs?.personaKeywords) {
+          try {
+            const keywords = await voicePersonaProvider();
+            if (Array.isArray(keywords) && keywords.length > 0) {
+              effectiveArgs = { ...effectiveArgs, personaKeywords: keywords };
+            }
+          } catch { /* provider 内部已静默，这里兜底不阻塞 */ }
+        }
         // 服务执行器：经 service-registry 出站（WS tool.call / HTTP 备用）。
         // 安全链不下放：turnToken 留在本层校验（上面已完成），下发的只有会话标识。
         // 结果映射回统一 outcome 形状（receipt 即 data），业务失败是正常结果，
@@ -164,7 +184,7 @@ export function createToolHost({
         outcome = await withDeadline(
           serviceTools.call(registeredTool.serviceId, {
             tool,
-            args: args ?? {},
+            args: effectiveArgs,
             sessionKey: entry.sessionKey,
             turnId: entry.turnId,
           }).then((result) => (result.ok

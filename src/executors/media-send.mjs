@@ -8,14 +8,14 @@
  *
  * 适配层语义（用户定案）：适配的是**不同平台发送媒体文件格式不同**，不是媒体
  * 类型路由。memory 层的 media_asset 完全平台无关（kind: image|voice|video|file，
- * ref/sendHints 存平台发送凭据），平台差异被这里的转换器吃掉；新增平台 = 新增
+ * source_path 是唯一源定位符），平台差异被这里的转换器吃掉；新增平台 = 新增
  * 一个 convertSend 分支，工具主体零改动。
  *
- * qq 平台转换规则：
- *   image + sourcePath（memory 侧落盘）  → send_image { fileRef }（同机路径）
- *   image + ref 是 URL                   → send_image { url }
- *   voice + ref（语音库相对路径）        → send_voice { voice }
- *   file / video + 同机路径              → send_file { fileRef }（bridge 未启用该动作时 E_PLATFORM 降级）
+ * qq 平台转换规则（2026-11-26 v8：认知面 ref = source_path，按形态分流）：
+ *   image + 本地路径 → send_image { fileRef }（同机路径）
+ *   image + URL      → send_image { url }
+ *   voice + 本地路径 → send_voice { voice: 绝对路径 }（bridge trustedRoots 白名单直达）
+ *   file / video + 本地路径 → send_file { fileRef }（bridge 未启用该动作时 E_PLATFORM 降级）
  *
  * 旧的 image+resId 收藏通道（send_sticker）已随 sticker 工具族物理删除
  * （2026-11-24）：发送统一走 send_image 的 fileRef/URL 通道。
@@ -68,32 +68,28 @@ export function createMediaSendExecutor({
   /**
    * convertSend(asset, platform) → { action, args } | { unsupported, reason }
    * asset 是 memory-mcp 认知面形状（chat_media_get/search 返回）。
+   * 认知面凭据位 ref = media_asset.source_path（v8 起 DB 唯一路径真值；
+   * 本地绝对路径或 URL），这里只按形态分流，不再有多级回退。
    */
   function convertSend(asset, platform) {
     if (platform !== 'qq') return { unsupported: true, reason: `platform "${platform}" has no media converter yet` };
     const kind = String(asset?.kind ?? 'image');
-    const ref = String(asset?.ref ?? '');
-    const sourcePath = String(asset?.sourcePath ?? '');
+    const cred = String(asset?.ref ?? '');
+    const isUrl = /^https?:\/\//.test(cred);
     if (kind === 'image') {
-      // 发送凭据三级回退（2026-11-25 修集成错位）：显式 sourcePath > http URL >
-      // ref 同机路径。memory 认知面（chat_media_get/search）把 memory 侧落盘
-      // 路径放在 ref（sendHints 之外的通用凭据位），bridge 与 memory 同机部署
-      // 时路径可直接读——旧实现只认 sourcePath 字段名，导致所有落盘资产都
-      // E_UNSUPPORTED（发图链路端到端失败）。
-      if (sourcePath) return { action: 'send_image', args: { fileRef: sourcePath } };
-      if (/^https?:\/\//.test(ref)) return { action: 'send_image', args: { url: ref } };
-      if (ref) return { action: 'send_image', args: { fileRef: ref } };
+      if (isUrl) return { action: 'send_image', args: { url: cred } };
+      if (cred) return { action: 'send_image', args: { fileRef: cred } };
       return { unsupported: true, reason: 'image asset has no sourcePath/url to send from' };
     }
     if (kind === 'voice') {
-      if (ref) return { action: 'send_voice', args: { voice: ref } };
-      return { unsupported: true, reason: 'voice asset has no library ref' };
+      // 同机绝对路径直达（bridge trustedRoots 白名单内零拷贝）；URL 型语音无通道。
+      if (cred && !isUrl) return { action: 'send_voice', args: { voice: cred } };
+      return { unsupported: true, reason: 'voice asset has no local source path' };
     }
     if (kind === 'file' || kind === 'video') {
       // 视频/文件不进收藏详情表（2026-11-25）：本分支只服务历史遗留资产与新平台；
       // bridge 未启用 send_file 动作时在路由层 E_PLATFORM 降级。
-      const fileRef = sourcePath || ref;
-      if (fileRef && !/^https?:\/\//.test(fileRef)) return { action: 'send_file', args: { fileRef } };
+      if (cred && !isUrl) return { action: 'send_file', args: { fileRef: cred } };
       return { unsupported: true, reason: 'file asset has no local path to send from' };
     }
     return { unsupported: true, reason: `kind "${kind}" has no send channel on ${platform}` };
